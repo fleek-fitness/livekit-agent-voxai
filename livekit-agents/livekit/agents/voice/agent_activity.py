@@ -51,20 +51,33 @@ def log_event(event: str, **kwargs: Any) -> None:
     debug.Tracing.log_event(event, kwargs)
 
 
-def _matches_ignore_words(text: str, ignore_words: list[str] | None) -> bool:
+def _matches_ignore_words(
+    text: str, ignore_words: list[str] | None
+) -> bool:
     """Check if the transcript exactly matches any words/phrases that should be ignored for interruption."""
+    import string
+
     if not ignore_words or not text:
         return False
-    
-    text_lower = text.lower().strip()
-    
+
+    # Remove punctuation and convert to lowercase
+    text_cleaned = (
+        text.lower()
+        .strip()
+        .translate(str.maketrans("", "", string.punctuation))
+    )
+
     for ignore_item in ignore_words:
-        ignore_item_lower = ignore_item.lower().strip()
-        
+        ignore_item_cleaned = (
+            ignore_item.lower()
+            .strip()
+            .translate(str.maketrans("", "", string.punctuation))
+        )
+
         # Check for exact match
-        if text_lower == ignore_item_lower:
+        if text_cleaned == ignore_item_cleaned:
             return True
-    
+
     return False
 
 
@@ -921,6 +934,18 @@ class AgentActivity(RecognitionHooks):
             < self._session.options.min_interruption_words
         ):
             # avoid interruption if the new_transcript is too short
+            return False
+
+        if (
+            self.stt is not None
+            and self._turn_detection_mode != "manual"
+            and self._current_speech is not None
+            and self._current_speech.allow_interruptions
+            and not self._current_speech.interrupted
+            and self._session.options.interruption_ignore_words is not None
+            and _matches_ignore_words(info.new_transcript, self._session.options.interruption_ignore_words)
+        ):
+            # avoid interruption if the new_transcript matches ignore words
             return False
 
         old_task = self._user_turn_completed_atask
