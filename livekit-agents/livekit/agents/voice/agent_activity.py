@@ -51,6 +51,23 @@ def log_event(event: str, **kwargs: Any) -> None:
     debug.Tracing.log_event(event, kwargs)
 
 
+def _matches_ignore_words(text: str, ignore_words: list[str] | None) -> bool:
+    """Check if the transcript exactly matches any words/phrases that should be ignored for interruption."""
+    if not ignore_words or not text:
+        return False
+    
+    text_lower = text.lower().strip()
+    
+    for ignore_item in ignore_words:
+        ignore_item_lower = ignore_item.lower().strip()
+        
+        # Check for exact match
+        if text_lower == ignore_item_lower:
+            return True
+    
+    return False
+
+
 if TYPE_CHECKING:
     from ..llm import mcp
     from .agent_session import AgentSession, TurnDetectionMode
@@ -831,6 +848,16 @@ class AgentActivity(RecognitionHooks):
                 len(split_words(text, split_character=True))
                 < self._session.options.min_interruption_words
             ):
+                return
+
+        # Check if the transcript matches ignore words
+        if (
+            self.stt is not None
+            and self._audio_recognition is not None
+            and self._session.options.interruption_ignore_words is not None
+        ):
+            text = self._audio_recognition.current_transcript
+            if _matches_ignore_words(text, self._session.options.interruption_ignore_words):
                 return
 
         if (

@@ -47,6 +47,7 @@ class VoiceOptions:
     max_tool_steps: int
     user_away_timeout: float | None
     min_consecutive_speech_delay: float
+    interruption_ignore_words: list[str] | None
 
 
 Userdata_T = TypeVar("Userdata_T")
@@ -120,6 +121,7 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
         video_sampler: NotGivenOr[_VideoSampler | None] = NOT_GIVEN,
         user_away_timeout: float | None = 15.0,
         min_consecutive_speech_delay: float = 0.0,
+        interruption_ignore_words: list[str] | None = None,
         loop: asyncio.AbstractEventLoop | None = None,
     ) -> None:
         """`AgentSession` is the LiveKit Agents runtime that glues together
@@ -179,6 +181,9 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
                 Default ``15.0`` s, set to ``None`` to disable.
             min_consecutive_speech_delay (float, optional): The minimum delay between
                 consecutive speech. Default ``0.0`` s.
+            interruption_ignore_words (list[str] | None, optional): List of words or 
+                phrases that should not trigger interruptions when detected in the 
+                user's speech. Default ``None``.
             loop (asyncio.AbstractEventLoop, optional): Event loop to bind the
                 session to. Falls back to :pyfunc:`asyncio.get_event_loop()`.
         """
@@ -202,6 +207,7 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
             max_tool_steps=max_tool_steps,
             user_away_timeout=user_away_timeout,
             min_consecutive_speech_delay=min_consecutive_speech_delay,
+            interruption_ignore_words=interruption_ignore_words,
         )
         self._started = False
         self._turn_detection = turn_detection or None
