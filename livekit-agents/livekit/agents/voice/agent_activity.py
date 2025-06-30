@@ -54,7 +54,7 @@ def log_event(event: str, **kwargs: Any) -> None:
 def _matches_ignore_words(
     text: str, ignore_words: list[str] | None
 ) -> bool:
-    """Check if the transcript exactly matches any words/phrases that should be ignored for interruption."""
+    """Check if the transcript is composed of repetitions of words/phrases that should be ignored for interruption."""
     import string
 
     if not ignore_words or not text:
@@ -67,6 +67,9 @@ def _matches_ignore_words(
         .translate(str.maketrans("", "", string.punctuation))
     )
 
+    if not text_cleaned:
+        return False
+
     for ignore_item in ignore_words:
         ignore_item_cleaned = (
             ignore_item.lower()
@@ -74,8 +77,26 @@ def _matches_ignore_words(
             .translate(str.maketrans("", "", string.punctuation))
         )
 
-        # Check for exact match
-        if text_cleaned == ignore_item_cleaned:
+        if not ignore_item_cleaned:
+            continue
+
+        words_in_text = text_cleaned.split()
+        if not words_in_text:
+            continue
+
+        is_repetitive_match = True
+        for word in words_in_text:
+            if not word:
+                continue
+            if len(word) % len(
+                ignore_item_cleaned
+            ) != 0 or word != ignore_item_cleaned * (
+                len(word) // len(ignore_item_cleaned)
+            ):
+                is_repetitive_match = False
+                break
+
+        if is_repetitive_match:
             return True
 
     return False
