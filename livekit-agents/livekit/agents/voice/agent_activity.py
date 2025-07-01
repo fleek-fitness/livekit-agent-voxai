@@ -51,6 +51,57 @@ def log_event(event: str, **kwargs: Any) -> None:
     debug.Tracing.log_event(event, kwargs)
 
 
+def _matches_ignore_words(
+    text: str, ignore_words: list[str] | None
+) -> bool:
+    """Check if the transcript is composed of repetitions of words/phrases that should be ignored for interruption."""
+    import string
+
+    if not ignore_words or not text:
+        return False
+
+    # Remove punctuation and convert to lowercase
+    text_cleaned = (
+        text.lower()
+        .strip()
+        .translate(str.maketrans("", "", string.punctuation))
+    )
+
+    if not text_cleaned:
+        return False
+
+    for ignore_item in ignore_words:
+        ignore_item_cleaned = (
+            ignore_item.lower()
+            .strip()
+            .translate(str.maketrans("", "", string.punctuation))
+        )
+
+        if not ignore_item_cleaned:
+            continue
+
+        words_in_text = text_cleaned.split()
+        if not words_in_text:
+            continue
+
+        is_repetitive_match = True
+        for word in words_in_text:
+            if not word:
+                continue
+            if len(word) % len(
+                ignore_item_cleaned
+            ) != 0 or word != ignore_item_cleaned * (
+                len(word) // len(ignore_item_cleaned)
+            ):
+                is_repetitive_match = False
+                break
+
+        if is_repetitive_match:
+            return True
+
+    return False
+
+
 if TYPE_CHECKING:
     from ..llm import mcp
     from .agent_session import AgentSession, TurnDetectionMode
@@ -833,6 +884,16 @@ class AgentActivity(RecognitionHooks):
             ):
                 return
 
+        # Check if the transcript matches ignore words
+        if (
+            self.stt is not None
+            and self._audio_recognition is not None
+            and self._session.options.interruption_ignore_words is not None
+        ):
+            text = self._audio_recognition.current_transcript
+            if _matches_ignore_words(text, self._session.options.interruption_ignore_words):
+                return
+
         if (
             self._current_speech is not None
             and not self._current_speech.interrupted
@@ -894,6 +955,18 @@ class AgentActivity(RecognitionHooks):
             < self._session.options.min_interruption_words
         ):
             # avoid interruption if the new_transcript is too short
+            return False
+
+        if (
+            self.stt is not None
+            and self._turn_detection_mode != "manual"
+            and self._current_speech is not None
+            and self._current_speech.allow_interruptions
+            and not self._current_speech.interrupted
+            and self._session.options.interruption_ignore_words is not None
+            and _matches_ignore_words(info.new_transcript, self._session.options.interruption_ignore_words)
+        ):
+            # avoid interruption if the new_transcript matches ignore words
             return False
 
         old_task = self._user_turn_completed_atask
