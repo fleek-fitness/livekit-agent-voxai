@@ -566,7 +566,7 @@ class LLM(llm.LLM):
             extra["parallel_tool_calls"] = parallel_tool_calls
 
         tool_choice = tool_choice if is_given(tool_choice) else self._opts.tool_choice  # type: ignore
-        if is_given(tool_choice):
+        if is_given(tool_choice) and tools:
             oai_tool_choice: ChatCompletionToolChoiceOptionParam
             if isinstance(tool_choice, dict):
                 oai_tool_choice = {
