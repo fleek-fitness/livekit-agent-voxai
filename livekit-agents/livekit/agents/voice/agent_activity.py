@@ -1217,6 +1217,7 @@ class AgentActivity(RecognitionHooks):
 
         self._session._update_agent_state("thinking")
         tasks: list[asyncio.Task[Any]] = []
+        self._agent._reply_chat_ctx = None
         llm_task, llm_gen_data = perform_llm_inference(
             node=self._agent.llm_node,
             chat_ctx=chat_ctx,
@@ -1455,7 +1456,7 @@ class AgentActivity(RecognitionHooks):
                 reply_messages.extend(tool_messages)
 
         # Call the reply callback with the chat context and messages
-        self._agent.reply_callback(reply_chat_ctx, reply_messages)
+        self._agent.reply_callback(self._agent._reply_chat_ctx or reply_chat_ctx, reply_messages)
 
     @utils.log_exceptions(logger=logger)
     async def _realtime_reply_task(
