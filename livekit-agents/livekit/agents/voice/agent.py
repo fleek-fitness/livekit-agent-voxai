@@ -53,6 +53,7 @@ class Agent:
         self._allow_interruptions = allow_interruptions
         self._min_consecutive_speech_delay = min_consecutive_speech_delay
         self._reply_chat_ctx: llm.ChatContext | None = None
+        self._reply_messages: list[llm.ChatItem] = []
         self._reply_callbacks: list[Callable] = []
 
         if isinstance(mcp_servers, list) and len(mcp_servers) == 0:
