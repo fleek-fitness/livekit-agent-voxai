@@ -70,36 +70,44 @@ def _matches_ignore_words(
     if not text_cleaned:
         return False
 
-    for ignore_item in ignore_words:
-        ignore_item_cleaned = (
-            ignore_item.lower()
+    # This handles cases like "um ah" by treating them as "umah".
+    text_cleaned = "".join(text_cleaned.split())
+
+    if not text_cleaned:
+        return False
+
+    # Clean and prepare ignore words
+    cleaned_ignore_words = []
+    for w in ignore_words:
+        if w is None or not isinstance(w, str):
+            continue
+        cleaned_word = (
+            w.lower()
             .strip()
             .translate(str.maketrans("", "", string.punctuation))
         )
+        if cleaned_word:
+            cleaned_ignore_words.append(cleaned_word)
 
-        if not ignore_item_cleaned:
-            continue
+    if not cleaned_ignore_words:
+        return False
 
-        words_in_text = text_cleaned.split()
-        if not words_in_text:
-            continue
+    # DP approach to see if text_cleaned can be segmented by ignore words
+    dp = [False] * (len(text_cleaned) + 1)
+    dp[0] = True
 
-        is_repetitive_match = True
-        for word in words_in_text:
-            if not word:
-                continue
-            if len(word) % len(
-                ignore_item_cleaned
-            ) != 0 or word != ignore_item_cleaned * (
-                len(word) // len(ignore_item_cleaned)
+    for i in range(1, len(text_cleaned) + 1):
+        for word in cleaned_ignore_words:
+            if (
+                i >= len(word)
+                and dp[i - len(word)]
+                and text_cleaned[i - len(word) : i] == word
             ):
-                is_repetitive_match = False
+                dp[i] = True
                 break
 
-        if is_repetitive_match:
-            return True
+    return dp[len(text_cleaned)]
 
-    return False
 
 
 if TYPE_CHECKING:
