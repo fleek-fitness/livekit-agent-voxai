@@ -1223,6 +1223,9 @@ class AgentActivity(RecognitionHooks):
             except ValueError:
                 logger.exception("failed to update the instructions")
 
+        self._agent._reply_chat_ctx = self._agent._chat_ctx.copy()
+        self._agent._reply_messages = []
+
         self._session._update_agent_state("thinking")
         tasks: list[asyncio.Task[Any]] = []
         llm_task, llm_gen_data = perform_llm_inference(
@@ -1304,6 +1307,7 @@ class AgentActivity(RecognitionHooks):
                 # reset the created_at to the reply start time
                 msg.created_at = reply_started_at
             self._agent._chat_ctx.insert(_tools_messages)
+            self._agent._reply_messages.extend(_tools_messages)
 
         if speech_handle.interrupted:
             await utils.aio.cancel_and_wait(*tasks)
@@ -1334,11 +1338,13 @@ class AgentActivity(RecognitionHooks):
                 created_at=reply_started_at,
             )
             self._agent._chat_ctx.insert(msg)
+            self._agent._reply_messages.append(msg)
             self._session._update_agent_state("listening")
             self._session._conversation_item_added(msg)
             speech_handle._set_chat_message(msg)
             speech_handle._mark_playout_done()
             await utils.aio.cancel_and_wait(exe_task)
+            self._agent.reply_callback(self._agent._reply_chat_ctx, self._agent._reply_messages)
             return
 
         if text_out and text_out.text:
@@ -1350,6 +1356,7 @@ class AgentActivity(RecognitionHooks):
                 created_at=reply_started_at,
             )
             self._agent._chat_ctx.insert(msg)
+            self._agent._reply_messages.append(msg)
             self._session._conversation_item_added(msg)
             speech_handle._set_chat_message(msg)
 
@@ -1454,6 +1461,10 @@ class AgentActivity(RecognitionHooks):
                 for msg in tool_messages:
                     msg.created_at = reply_started_at
                 self._agent._chat_ctx.insert(tool_messages)
+                self._agent._reply_messages.extend(tool_messages)
+
+        # Call the reply callback with the chat context and messages
+        self._agent.reply_callback(self._agent._reply_chat_ctx, self._agent._reply_messages)
 
     @utils.log_exceptions(logger=logger)
     async def _realtime_reply_task(
