@@ -48,6 +48,9 @@ class VoiceOptions:
     user_away_timeout: float | None
     min_consecutive_speech_delay: float
     interruption_ignore_words: list[str] | None
+    # Dynamic interruption settings
+    enable_dynamic_interruption: bool = True
+    conversation_continuity_threshold: float = 8.0  # seconds
 
 
 Userdata_T = TypeVar("Userdata_T")
@@ -122,6 +125,8 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
         user_away_timeout: float | None = 15.0,
         min_consecutive_speech_delay: float = 0.0,
         interruption_ignore_words: list[str] | None = None,
+        enable_dynamic_interruption: bool = True,
+        conversation_continuity_threshold: float = 8.0,
         loop: asyncio.AbstractEventLoop | None = None,
     ) -> None:
         """`AgentSession` is the LiveKit Agents runtime that glues together
@@ -184,6 +189,15 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
             interruption_ignore_words (list[str] | None, optional): List of words or 
                 phrases that should not trigger interruptions when detected in the 
                 user's speech. Default ``None``.
+            enable_dynamic_interruption (bool, optional): Enable dynamic interruption
+                behavior that adapts based on conversation flow. When enabled, the system
+                allows immediate interruption (min_interruption_words=0) during ongoing
+                conversations, but requires word confirmation for fresh starts.
+                Default ``True``.
+            conversation_continuity_threshold (float, optional): Time threshold in seconds
+                to determine if we're in conversation flow. If the user speaks within this
+                time after their last utterance, immediate interruption is allowed.
+                Default ``8.0`` s.
             loop (asyncio.AbstractEventLoop, optional): Event loop to bind the
                 session to. Falls back to :pyfunc:`asyncio.get_event_loop()`.
         """
@@ -208,6 +222,8 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
             user_away_timeout=user_away_timeout,
             min_consecutive_speech_delay=min_consecutive_speech_delay,
             interruption_ignore_words=interruption_ignore_words,
+            enable_dynamic_interruption=enable_dynamic_interruption,
+            conversation_continuity_threshold=conversation_continuity_threshold,
         )
         self._started = False
         self._turn_detection = turn_detection or None
