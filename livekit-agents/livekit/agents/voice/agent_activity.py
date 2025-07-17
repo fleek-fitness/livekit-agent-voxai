@@ -13,10 +13,13 @@ from .. import debug, llm, stt, tts, utils, vad
 from ..llm.tool_context import StopResponse
 from ..log import logger
 from ..metrics import (
+    AgentLLMMetrics,
     EOUMetrics,
     LLMMetrics,
     RealtimeModelMetrics,
+    ResponseLatencyMetrics,
     STTMetrics,
+    ToolExecutionMetrics,
     TTSMetrics,
     VADMetrics,
 )
@@ -149,6 +152,9 @@ class AgentActivity(RecognitionHooks):
         
         # Add dynamic interruption manager
         self._dynamic_interruption = DynamicInterruptionManager(sess.options)
+        
+        # Track end-to-end latency timing
+        self._last_end_of_utterance_timestamp: float | None = None
 
         if self._turn_detection_mode == "vad" and not self.vad:
             logger.warning("turn_detection is set to 'vad', but no VAD model is provided")
@@ -773,12 +779,24 @@ class AgentActivity(RecognitionHooks):
     # -- Realtime Session events --
 
     def _on_metrics_collected(
-        self, ev: STTMetrics | TTSMetrics | VADMetrics | LLMMetrics | RealtimeModelMetrics
+        self, ev: STTMetrics | TTSMetrics | VADMetrics | LLMMetrics | RealtimeModelMetrics | AgentLLMMetrics | ToolExecutionMetrics
     ) -> None:
         if (speech_handle := _SpeechHandleContextVar.get(None)) and (
-            isinstance(ev, LLMMetrics) or isinstance(ev, TTSMetrics)
+            isinstance(ev, (LLMMetrics, TTSMetrics, AgentLLMMetrics, ToolExecutionMetrics))
         ):
             ev.speech_id = speech_handle.id
+            
+        # Track timing for end-to-end latency measurement
+        if self._last_end_of_utterance_timestamp is not None and isinstance(ev, TTSMetrics) and ev.ttfb > 0:
+            # Calculate when first audio was produced
+            first_audio_timestamp = ev.timestamp - ev.duration + ev.ttfb
+            
+            self._emit_response_latency_metrics(
+                speech_handle.id if speech_handle else None,
+                self._last_end_of_utterance_timestamp,
+                first_audio_timestamp
+            )
+                
         self._session.emit("metrics_collected", MetricsCollectedEvent(metrics=ev))
 
     def _on_error(
@@ -877,6 +895,9 @@ class AgentActivity(RecognitionHooks):
         self._session._update_user_state("listening")
         # Add dynamic interruption hook - track when user stops speaking
         self._dynamic_interruption.on_user_speech_ended()
+        
+        # Capture the timestamp when user stops speaking for latency tracking
+        self._last_end_of_utterance_timestamp = time.time()
 
     def on_vad_inference_done(self, ev: vad.VADEvent) -> None:
         if self._turn_detection_mode in ("manual", "realtime_llm"):
@@ -1245,6 +1266,7 @@ class AgentActivity(RecognitionHooks):
             chat_ctx=chat_ctx,
             tool_ctx=tool_ctx,
             model_settings=model_settings,
+            session=self._session,
         )
         tasks.append(llm_task)
         tts_text_input, llm_output = utils.aio.itertools.tee(llm_gen_data.text_ch)
@@ -1783,7 +1805,30 @@ class AgentActivity(RecognitionHooks):
                     bypass_draining=True,
                 )
 
-    # move them to the end to avoid shadowing the same named modules for mypy
+    def _emit_response_latency_metrics(
+        self, 
+        speech_id: str | None, 
+        end_of_utterance_timestamp: float,
+        first_audio_timestamp: float
+    ) -> None:
+        """Emit comprehensive end-to-end latency metrics."""
+        
+        # Calculate the complete end-to-end latency
+        end_to_end_latency = first_audio_timestamp - end_of_utterance_timestamp
+        
+        response_latency_metrics = ResponseLatencyMetrics(
+            timestamp=time.time(),
+            speech_id=speech_id,
+            end_to_end_latency=end_to_end_latency,
+            end_of_utterance_timestamp=end_of_utterance_timestamp,
+            first_audio_timestamp=first_audio_timestamp,
+        )
+        
+        self._session.emit("metrics_collected", MetricsCollectedEvent(metrics=response_latency_metrics))
+        
+        # Reset tracking for next response
+        self._last_end_of_utterance_timestamp = None
+
     @property
     def vad(self) -> vad.VAD | None:
         return self._agent.vad if is_given(self._agent.vad) else self._session.vad

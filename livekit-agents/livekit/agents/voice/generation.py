@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import time
 from collections.abc import AsyncIterable
 from dataclasses import dataclass, field
 from functools import partial
@@ -24,14 +26,21 @@ from ..llm.tool_context import (
     is_raw_function_tool,
 )
 from ..log import logger
+from ..metrics import AgentLLMMetrics, ToolExecutionMetrics
 from ..types import NotGivenOr
 from ..utils import aio
 from . import io
+from .events import MetricsCollectedEvent
 from .speech_handle import SpeechHandle
 
 if TYPE_CHECKING:
     from .agent import Agent, ModelSettings
     from .agent_session import AgentSession
+
+
+# Import the speech handle context variable (defined in agent_activity.py)
+# We'll access it by importing it from there
+_SpeechHandleContextVar = contextvars.ContextVar["SpeechHandle"]("agents_speech_handle")
 
 
 @runtime_checkable
@@ -54,6 +63,7 @@ def perform_llm_inference(
     chat_ctx: ChatContext,
     tool_ctx: ToolContext,
     model_settings: ModelSettings,
+    session: AgentSession | None = None,
 ) -> tuple[asyncio.Task[bool], _LLMGenerationData]:
     text_ch = aio.Chan[str]()
     function_ch = aio.Chan[llm.FunctionCall]()
@@ -63,6 +73,11 @@ def perform_llm_inference(
     @utils.log_exceptions(logger=logger)
     async def _inference_task() -> bool:
         tools = list(tool_ctx.function_tools.values())
+        
+        # Start timing for agent LLM metrics
+        agent_llm_start_time = time.time()
+        
+        # Execute the custom llm_node (this includes any custom agent logic + LLM calls)
         llm_node = node(
             chat_ctx,
             tools,
@@ -73,6 +88,22 @@ def perform_llm_inference(
 
         # update the tool context after llm node
         tool_ctx.update_tools(tools)
+
+        # Calculate total duration for agent LLM processing
+        llm_node_duration = time.time() - agent_llm_start_time
+        
+        # Emit agent LLM metrics if session is available
+        if session is not None:
+            speech_handle = _SpeechHandleContextVar.get(None)
+            
+            agent_llm_metrics = AgentLLMMetrics(
+                timestamp=time.time(),
+                speech_id=speech_handle.id if speech_handle else None,
+                llm_node_duration=llm_node_duration,
+                request_id=data.id,
+            )
+            
+            session.emit("metrics_collected", MetricsCollectedEvent(metrics=agent_llm_metrics))
 
         if isinstance(llm_node, str):
             data.generated_text = llm_node
@@ -297,6 +328,11 @@ async def _execute_tools_task(
     from .agent import _authorize_inline_task
     from .events import RunContext
 
+    # Tool execution tracking
+    tool_execution_start_time = time.time()
+    executed_tools: list[str] = []
+    individual_durations: dict[str, float] = {}
+
     tasks: list[asyncio.Task[Any]] = []
     try:
         async for fnc_call in function_stream:
@@ -366,6 +402,7 @@ async def _execute_tools_task(
             )
 
             py_out = _PythonOutput(fnc_call=fnc_call, output=None, exception=None)
+            tool_start_time = time.time()
             try:
                 task = asyncio.create_task(
                     function_tool(*fnc_args, **fnc_kwargs),
@@ -373,6 +410,7 @@ async def _execute_tools_task(
                 )
 
                 tasks.append(task)
+                executed_tools.append(fnc_call.name)
                 _authorize_inline_task(task, function_call=fnc_call)
             except Exception:
                 # catching exceptions here because even though the function is asynchronous,
@@ -392,7 +430,12 @@ async def _execute_tools_task(
                 *,
                 py_out: _PythonOutput,
                 fnc_call: llm.FunctionCall,
+                tool_start_time: float,
             ) -> None:
+                # Calculate individual tool execution duration
+                tool_duration = time.time() - tool_start_time
+                individual_durations[fnc_call.name] = tool_duration
+                
                 if task.exception() is not None:
                     logger.error(
                         "exception occurred while executing tool",
@@ -410,7 +453,7 @@ async def _execute_tools_task(
                 tool_output.output.append(py_out)
                 tasks.remove(task)
 
-            task.add_done_callback(partial(_log_exceptions, py_out=py_out, fnc_call=fnc_call))
+            task.add_done_callback(partial(_log_exceptions, py_out=py_out, fnc_call=fnc_call, tool_start_time=tool_start_time))
 
         await asyncio.shield(asyncio.gather(*tasks, return_exceptions=True))
 
@@ -434,6 +477,20 @@ async def _execute_tools_task(
             await asyncio.gather(*tasks)
     finally:
         await utils.aio.cancel_and_wait(*tasks)
+
+        # Calculate total tool execution time
+        total_execution_time = time.time() - tool_execution_start_time
+        
+        # Emit tool execution metrics if any tools were executed
+        if len(executed_tools) > 0:
+            tool_metrics = ToolExecutionMetrics(
+                timestamp=time.time(),
+                speech_id=speech_handle.id,
+                total_execution_time=total_execution_time,
+                individual_durations=individual_durations,
+            )
+            
+            session.emit("metrics_collected", MetricsCollectedEvent(metrics=tool_metrics))
 
         if len(tool_output.output) > 0:
             logger.debug(
