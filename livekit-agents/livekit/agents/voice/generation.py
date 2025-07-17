@@ -90,7 +90,7 @@ def perform_llm_inference(
         tool_ctx.update_tools(tools)
 
         # Calculate total duration for agent LLM processing
-        llm_node_duration = time.time() - agent_llm_start_time
+        llm_node_await = time.time() - agent_llm_start_time
         
         # Emit agent LLM metrics if session is available
         if session is not None:
@@ -99,7 +99,7 @@ def perform_llm_inference(
             agent_llm_metrics = AgentLLMMetrics(
                 timestamp=time.time(),
                 speech_id=speech_handle.id if speech_handle else None,
-                llm_node_duration=llm_node_duration,
+                llm_node_await=llm_node_await,
                 request_id=data.id,
             )
             
@@ -331,7 +331,7 @@ async def _execute_tools_task(
     # Tool execution tracking
     tool_execution_start_time = time.time()
     executed_tools: list[str] = []
-    individual_durations: dict[str, float] = {}
+    tool_durations: dict[str, float] = {}
 
     tasks: list[asyncio.Task[Any]] = []
     try:
@@ -434,7 +434,7 @@ async def _execute_tools_task(
             ) -> None:
                 # Calculate individual tool execution duration
                 tool_duration = time.time() - tool_start_time
-                individual_durations[fnc_call.name] = tool_duration
+                tool_durations[fnc_call.name] = tool_duration
                 
                 if task.exception() is not None:
                     logger.error(
@@ -487,7 +487,7 @@ async def _execute_tools_task(
                 timestamp=time.time(),
                 speech_id=speech_handle.id,
                 total_execution_time=total_execution_time,
-                individual_durations=individual_durations,
+                tool_durations=tool_durations,
             )
             
             session.emit("metrics_collected", MetricsCollectedEvent(metrics=tool_metrics))

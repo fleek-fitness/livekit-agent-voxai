@@ -123,11 +123,11 @@ class ResponseLatencyMetrics(BaseModel):
     """The speech ID this latency measurement is associated with."""
     
     # Core end-to-end latency
-    end_to_end_latency: float
+    e2e_latency: float
     """Total time from end of user speech to first audio response in seconds."""
     
     # Boundary timestamps for verification
-    end_of_utterance_timestamp: float
+    eou_timestamp: float
     """Timestamp when user stopped speaking (from VAD)."""
     first_audio_timestamp: float
     """Timestamp when first audio response was generated."""
@@ -141,7 +141,7 @@ class AgentLLMMetrics(BaseModel):
     """The speech ID this LLM processing is associated with."""
     
     # Overall agent LLM processing timing
-    llm_node_duration: float
+    llm_node_await: float
     """Total time for complete agent llm_node processing including custom logic in seconds."""
     
     # Context for understanding the processing
@@ -161,7 +161,7 @@ class ToolExecutionMetrics(BaseModel):
     """Total time for all tool executions in seconds."""
     
     # Individual tool durations (detailed breakdown)
-    individual_durations: dict[str, float] = {}
+    tool_durations: dict[str, float] = {}
     """Per-tool execution durations in seconds."""
 
 

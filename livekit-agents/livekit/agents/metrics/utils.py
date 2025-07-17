@@ -40,15 +40,15 @@ def log_metrics(metrics: AgentMetrics, *, logger: logging.Logger | None = None) 
         logger.info(f"STT metrics: audio_duration={metrics.audio_duration:.2f}")
     elif isinstance(metrics, ResponseLatencyMetrics):
         logger.info(
-            f"Response Latency metrics: end_to_end={metrics.end_to_end_latency:.2f}s"
+            f"Response Latency metrics: end_to_end={metrics.e2e_latency:.2f}s"
         )
     elif isinstance(metrics, AgentLLMMetrics):
         logger.info(
-            f"Agent LLM metrics: llm_node_duration={metrics.llm_node_duration:.2f}s"  # noqa: E501
+            f"Agent LLM metrics: llm_node_await={metrics.llm_node_await:.2f}s"  # noqa: E501
         )
     elif isinstance(metrics, ToolExecutionMetrics):
-        tool_count = len(metrics.individual_durations)
-        tool_names = list(metrics.individual_durations.keys())
+        tool_count = len(metrics.tool_durations)
+        tool_names = list(metrics.tool_durations.keys())
         logger.info(
             f"Tool Execution metrics: total_time={metrics.total_execution_time:.2f}s, tools_executed={tool_count}, tools={tool_names}"  # noqa: E501
         )

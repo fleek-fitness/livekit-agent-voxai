@@ -154,7 +154,7 @@ class AgentActivity(RecognitionHooks):
         self._dynamic_interruption = DynamicInterruptionManager(sess.options)
         
         # Track end-to-end latency timing
-        self._last_end_of_utterance_timestamp: float | None = None
+        self._last_eou_timestamp: float | None = None
 
         if self._turn_detection_mode == "vad" and not self.vad:
             logger.warning("turn_detection is set to 'vad', but no VAD model is provided")
@@ -787,13 +787,13 @@ class AgentActivity(RecognitionHooks):
             ev.speech_id = speech_handle.id
             
         # Track timing for end-to-end latency measurement
-        if self._last_end_of_utterance_timestamp is not None and isinstance(ev, TTSMetrics) and ev.ttfb > 0:
+        if self._last_eou_timestamp is not None and isinstance(ev, TTSMetrics) and ev.ttfb > 0:
             # Calculate when first audio was produced
             first_audio_timestamp = ev.timestamp - ev.duration + ev.ttfb
             
             self._emit_response_latency_metrics(
                 speech_handle.id if speech_handle else None,
-                self._last_end_of_utterance_timestamp,
+                self._last_eou_timestamp,
                 first_audio_timestamp
             )
                 
@@ -897,7 +897,7 @@ class AgentActivity(RecognitionHooks):
         self._dynamic_interruption.on_user_speech_ended()
         
         # Capture the timestamp when user stops speaking for latency tracking
-        self._last_end_of_utterance_timestamp = time.time()
+        self._last_eou_timestamp = time.time()
 
     def on_vad_inference_done(self, ev: vad.VADEvent) -> None:
         if self._turn_detection_mode in ("manual", "realtime_llm"):
@@ -1808,26 +1808,26 @@ class AgentActivity(RecognitionHooks):
     def _emit_response_latency_metrics(
         self, 
         speech_id: str | None, 
-        end_of_utterance_timestamp: float,
+        eou_timestamp: float,
         first_audio_timestamp: float
     ) -> None:
         """Emit comprehensive end-to-end latency metrics."""
         
         # Calculate the complete end-to-end latency
-        end_to_end_latency = first_audio_timestamp - end_of_utterance_timestamp
+        e2e_latency = first_audio_timestamp - eou_timestamp
         
         response_latency_metrics = ResponseLatencyMetrics(
             timestamp=time.time(),
             speech_id=speech_id,
-            end_to_end_latency=end_to_end_latency,
-            end_of_utterance_timestamp=end_of_utterance_timestamp,
+            e2e_latency=e2e_latency,
+            eou_timestamp=eou_timestamp,
             first_audio_timestamp=first_audio_timestamp,
         )
         
         self._session.emit("metrics_collected", MetricsCollectedEvent(metrics=response_latency_metrics))
         
         # Reset tracking for next response
-        self._last_end_of_utterance_timestamp = None
+        self._last_eou_timestamp = None
 
     @property
     def vad(self) -> vad.VAD | None:
