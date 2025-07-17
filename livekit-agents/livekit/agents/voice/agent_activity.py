@@ -156,6 +156,7 @@ class AgentActivity(RecognitionHooks):
         # Track end-to-end latency timing
         self._last_eou_timestamp: float | None = None
         self._agent_ttft_by_speech: dict[str, float] = {}
+        self._eou_delay_by_speech: dict[str, float] = {}
 
         if self._turn_detection_mode == "vad" and not self.vad:
             logger.warning("turn_detection is set to 'vad', but no VAD model is provided")
@@ -790,21 +791,28 @@ class AgentActivity(RecognitionHooks):
         # Store agent TTFT metrics when received from AgentLLMMetrics
         if isinstance(ev, AgentLLMMetrics) and ev.speech_id and ev.agent_ttft is not None:
             self._agent_ttft_by_speech[ev.speech_id] = ev.agent_ttft
+        
+        # Store EOU delay metrics when received 
+        if isinstance(ev, EOUMetrics) and ev.speech_id:
+            self._eou_delay_by_speech[ev.speech_id] = ev.end_of_utterance_delay
             
         # Track timing for end-to-end latency measurement
         if self._last_eou_timestamp is not None and isinstance(ev, TTSMetrics) and ev.ttfb > 0:
             # Calculate when first audio was produced
             first_audio_timestamp = ev.timestamp - ev.duration + ev.ttfb
             
-            # Get agent TTFT for this speech
+            # Get collected metrics for this speech
             speech_id = speech_handle.id if speech_handle else None
             agent_ttft = self._agent_ttft_by_speech.get(speech_id) if speech_id else None
+            eou_delay = self._eou_delay_by_speech.get(speech_id) if speech_id else None
             
             self._emit_response_latency_metrics(
                 speech_id,
                 self._last_eou_timestamp,
                 first_audio_timestamp,
-                agent_ttft
+                agent_ttft,
+                eou_delay,
+                ev.ttfb
             )
                 
         self._session.emit("metrics_collected", MetricsCollectedEvent(metrics=ev))
@@ -1821,7 +1829,9 @@ class AgentActivity(RecognitionHooks):
         speech_id: str | None, 
         eou_timestamp: float,
         first_audio_timestamp: float,
-        agent_ttft: float | None = None
+        agent_ttft: float | None = None,
+        eou_delay: float | None = None,
+        tts_ttfb: float | None = None
     ) -> None:
         """Emit comprehensive end-to-end latency metrics."""
         
@@ -1838,16 +1848,58 @@ class AgentActivity(RecognitionHooks):
         
         self._session.emit("metrics_collected", MetricsCollectedEvent(metrics=response_latency_metrics))
         
-        # Log enhanced information for debugging
-        if agent_ttft:
-            logger.info(f"E2E Latency: {e2e_latency:.3f}s (Agent TTFT: {agent_ttft:.3f}s)")
+        # Enhanced diagnostic logging - compare E2E with component sum
+        logger.info(f"=== E2E Latency Analysis (Speech ID: {speech_id}) ===")
+        logger.info(f"E2E Latency: {e2e_latency:.3f}s")
+        
+        # Log individual components if available
+        components = []
+        component_sum = 0.0
+        
+        if eou_delay is not None:
+            components.append(f"EOU={eou_delay:.3f}s")
+            component_sum += eou_delay
         else:
-            logger.info(f"E2E Latency: {e2e_latency:.3f}s")
+            components.append("EOU=missing")
+            
+        if agent_ttft is not None:
+            components.append(f"Agent={agent_ttft:.3f}s")
+            component_sum += agent_ttft
+        else:
+            components.append("Agent=missing")
+            
+        if tts_ttfb is not None:
+            components.append(f"TTS={tts_ttfb:.3f}s")
+            component_sum += tts_ttfb
+        else:
+            components.append("TTS=missing")
+        
+        logger.info(f"Components: {' + '.join(components)} = {component_sum:.3f}s")
+        
+        # Calculate and log the difference (handoff latency)
+        if eou_delay is not None and agent_ttft is not None and tts_ttfb is not None:
+            handoff_latency = e2e_latency - component_sum
+            logger.info(f"Handoff Latency: {handoff_latency:.3f}s ({handoff_latency*1000:.1f}ms)")
+            
+            # Analyze the difference
+            if abs(handoff_latency) < 0.01:  # Less than 10ms
+                logger.info("✅ Components closely match E2E latency")
+            elif handoff_latency > 0.05:  # More than 50ms difference
+                logger.warning(f"⚠️  Significant handoff latency detected: {handoff_latency*1000:.1f}ms")
+            else:
+                logger.info(f"ℹ️  Normal handoff latency: {handoff_latency*1000:.1f}ms")
+        else:
+            logger.warning("❌ Cannot calculate handoff latency - missing component metrics")
+            
+        logger.info("=" * 50)
         
         # Reset tracking for next response
         self._last_eou_timestamp = None
-        if speech_id and speech_id in self._agent_ttft_by_speech:
-            del self._agent_ttft_by_speech[speech_id]
+        if speech_id:
+            if speech_id in self._agent_ttft_by_speech:
+                del self._agent_ttft_by_speech[speech_id]
+            if speech_id in self._eou_delay_by_speech:
+                del self._eou_delay_by_speech[speech_id]
 
     @property
     def vad(self) -> vad.VAD | None:

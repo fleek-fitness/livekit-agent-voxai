@@ -73,13 +73,17 @@ def perform_llm_inference(
 
     @utils.log_exceptions(logger=logger)
     async def _inference_task() -> bool:
-        tools = list(tool_ctx.function_tools.values())
-        
         # Start timing for agent LLM metrics
         agent_llm_start_time = time.time()
         ttft_captured = False
         
-        # Execute the custom llm_node (this includes any custom agent logic + LLM calls)
+        # Measure tool preparation overhead
+        tools_start = time.time()
+        tools = list(tool_ctx.function_tools.values())
+        tools_prep_time = time.time() - tools_start
+        
+        # Measure custom node execution overhead
+        node_start = time.time()
         llm_node = node(
             chat_ctx,
             tools,
@@ -87,9 +91,18 @@ def perform_llm_inference(
         )
         if asyncio.iscoroutine(llm_node):
             llm_node = await llm_node
+        node_exec_time = time.time() - node_start
 
-        # update the tool context after llm node
+        # Measure tool context update overhead
+        tool_update_start = time.time()
         tool_ctx.update_tools(tools)
+        tool_update_time = time.time() - tool_update_start
+        
+        # Log overhead breakdown
+        total_prep_overhead = tools_prep_time + node_exec_time + tool_update_time
+        logger.debug(f"Agent LLM Preparation Overhead: {total_prep_overhead*1000:.1f}ms "
+                    f"(Tools: {tools_prep_time*1000:.1f}ms, Node: {node_exec_time*1000:.1f}ms, "
+                    f"Update: {tool_update_time*1000:.1f}ms)")
 
         # Calculate total duration for agent LLM processing
         llm_node_await = time.time() - agent_llm_start_time
@@ -98,6 +111,16 @@ def perform_llm_inference(
             # For non-streaming responses, TTFT is the total time to get response
             if not ttft_captured:
                 data.agent_ttft = time.time() - agent_llm_start_time
+                
+                # Log detailed overhead breakdown for non-streaming agent TTFT
+                logger.info(f"=== Non-Streaming Agent TTFT Breakdown ===")
+                logger.info(f"Total Agent TTFT: {data.agent_ttft*1000:.1f}ms")
+                logger.info(f"  Preparation Overhead: {total_prep_overhead*1000:.1f}ms")
+                logger.info(f"    - Tools prep: {tools_prep_time*1000:.1f}ms")
+                logger.info(f"    - Node exec: {node_exec_time*1000:.1f}ms")
+                logger.info(f"    - Tool update: {tool_update_time*1000:.1f}ms")
+                logger.info(f"  (Non-streaming: TTFT = Total Time)")
+                logger.info(f"==========================================")
                 
                 # Emit AgentLLMMetrics immediately with both values for non-streaming
                 if session is not None:
@@ -131,6 +154,17 @@ def perform_llm_inference(
                             agent_ttft = time.time() - agent_llm_start_time
                             data.agent_ttft = agent_ttft
                             ttft_captured = True
+                            
+                            # Log detailed overhead breakdown for agent TTFT
+                            streaming_overhead = agent_ttft - total_prep_overhead
+                            logger.info(f"=== Agent TTFT Breakdown ===")
+                            logger.info(f"Total Agent TTFT: {agent_ttft*1000:.1f}ms")
+                            logger.info(f"  Preparation Overhead: {total_prep_overhead*1000:.1f}ms")
+                            logger.info(f"    - Tools prep: {tools_prep_time*1000:.1f}ms")
+                            logger.info(f"    - Node exec: {node_exec_time*1000:.1f}ms") 
+                            logger.info(f"    - Tool update: {tool_update_time*1000:.1f}ms")
+                            logger.info(f"  Streaming to First Token: {streaming_overhead*1000:.1f}ms")
+                            logger.info(f"==============================")
                             
                             # Emit AgentLLMMetrics immediately with agent_ttft
                             if session is not None:
