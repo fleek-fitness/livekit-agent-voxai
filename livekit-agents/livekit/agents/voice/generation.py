@@ -55,6 +55,7 @@ class _LLMGenerationData:
     generated_text: str = ""
     generated_functions: list[llm.FunctionCall] = field(default_factory=list)
     id: str = field(default_factory=lambda: utils.shortuuid("item_"))
+    agent_ttft: float | None = None
 
 
 def perform_llm_inference(
@@ -76,6 +77,7 @@ def perform_llm_inference(
         
         # Start timing for agent LLM metrics
         agent_llm_start_time = time.time()
+        ttft_captured = False
         
         # Execute the custom llm_node (this includes any custom agent logic + LLM calls)
         llm_node = node(
@@ -91,21 +93,24 @@ def perform_llm_inference(
 
         # Calculate total duration for agent LLM processing
         llm_node_await = time.time() - agent_llm_start_time
-        
-        # Emit agent LLM metrics if session is available
-        if session is not None:
-            speech_handle = _SpeechHandleContextVar.get(None)
-            
-            agent_llm_metrics = AgentLLMMetrics(
-                timestamp=time.time(),
-                speech_id=speech_handle.id if speech_handle else None,
-                llm_node_await=llm_node_await,
-                request_id=data.id,
-            )
-            
-            session.emit("metrics_collected", MetricsCollectedEvent(metrics=agent_llm_metrics))
 
         if isinstance(llm_node, str):
+            # For non-streaming responses, TTFT is the total time to get response
+            if not ttft_captured:
+                data.agent_ttft = time.time() - agent_llm_start_time
+                
+                # Emit AgentLLMMetrics immediately with both values for non-streaming
+                if session is not None:
+                    speech_handle = _SpeechHandleContextVar.get(None)
+                    agent_llm_metrics = AgentLLMMetrics(
+                        timestamp=time.time(),
+                        speech_id=speech_handle.id if speech_handle else None,
+                        llm_node_await=llm_node_await,
+                        agent_ttft=data.agent_ttft,
+                        request_id=data.id,
+                    )
+                    session.emit("metrics_collected", MetricsCollectedEvent(metrics=agent_llm_metrics))
+                    
             data.generated_text = llm_node
             text_ch.send_nowait(llm_node)
             return True
@@ -114,6 +119,31 @@ def perform_llm_inference(
             # forward llm stream to output channels
             try:
                 async for chunk in llm_node:
+                    # Capture first meaningful token for TTFT measurement
+                    if not ttft_captured:
+                        has_content = False
+                        if isinstance(chunk, str) and chunk.strip():
+                            has_content = True
+                        elif isinstance(chunk, ChatChunk) and chunk.delta and chunk.delta.content:
+                            has_content = True
+                        
+                        if has_content:
+                            agent_ttft = time.time() - agent_llm_start_time
+                            data.agent_ttft = agent_ttft
+                            ttft_captured = True
+                            
+                            # Emit AgentLLMMetrics immediately with agent_ttft
+                            if session is not None:
+                                speech_handle = _SpeechHandleContextVar.get(None)
+                                agent_llm_metrics = AgentLLMMetrics(
+                                    timestamp=time.time(),
+                                    speech_id=speech_handle.id if speech_handle else None,
+                                    llm_node_await=-1.0,  # Not available yet, will be updated later
+                                    agent_ttft=agent_ttft,
+                                    request_id=data.id,
+                                )
+                                session.emit("metrics_collected", MetricsCollectedEvent(metrics=agent_llm_metrics))
+                    
                     # io.LLMNode can either return a string or a ChatChunk
                     if isinstance(chunk, str):
                         data.generated_text += chunk

@@ -155,6 +155,7 @@ class AgentActivity(RecognitionHooks):
         
         # Track end-to-end latency timing
         self._last_eou_timestamp: float | None = None
+        self._agent_ttft_by_speech: dict[str, float] = {}
 
         if self._turn_detection_mode == "vad" and not self.vad:
             logger.warning("turn_detection is set to 'vad', but no VAD model is provided")
@@ -785,16 +786,25 @@ class AgentActivity(RecognitionHooks):
             isinstance(ev, (LLMMetrics, TTSMetrics, AgentLLMMetrics, ToolExecutionMetrics))
         ):
             ev.speech_id = speech_handle.id
+        
+        # Store agent TTFT metrics when received from AgentLLMMetrics
+        if isinstance(ev, AgentLLMMetrics) and ev.speech_id and ev.agent_ttft is not None:
+            self._agent_ttft_by_speech[ev.speech_id] = ev.agent_ttft
             
         # Track timing for end-to-end latency measurement
         if self._last_eou_timestamp is not None and isinstance(ev, TTSMetrics) and ev.ttfb > 0:
             # Calculate when first audio was produced
             first_audio_timestamp = ev.timestamp - ev.duration + ev.ttfb
             
+            # Get agent TTFT for this speech
+            speech_id = speech_handle.id if speech_handle else None
+            agent_ttft = self._agent_ttft_by_speech.get(speech_id) if speech_id else None
+            
             self._emit_response_latency_metrics(
-                speech_handle.id if speech_handle else None,
+                speech_id,
                 self._last_eou_timestamp,
-                first_audio_timestamp
+                first_audio_timestamp,
+                agent_ttft
             )
                 
         self._session.emit("metrics_collected", MetricsCollectedEvent(metrics=ev))
@@ -896,8 +906,9 @@ class AgentActivity(RecognitionHooks):
         # Add dynamic interruption hook - track when user stops speaking
         self._dynamic_interruption.on_user_speech_ended()
         
-        # Capture the timestamp when user stops speaking for latency tracking
-        self._last_eou_timestamp = time.time()
+        # FIX: Use actual speech end time, accounting for VAD silence duration
+        actual_speech_end_time = time.time() - ev.silence_duration
+        self._last_eou_timestamp = actual_speech_end_time
 
     def on_vad_inference_done(self, ev: vad.VADEvent) -> None:
         if self._turn_detection_mode in ("manual", "realtime_llm"):
@@ -1809,7 +1820,8 @@ class AgentActivity(RecognitionHooks):
         self, 
         speech_id: str | None, 
         eou_timestamp: float,
-        first_audio_timestamp: float
+        first_audio_timestamp: float,
+        agent_ttft: float | None = None
     ) -> None:
         """Emit comprehensive end-to-end latency metrics."""
         
@@ -1826,8 +1838,16 @@ class AgentActivity(RecognitionHooks):
         
         self._session.emit("metrics_collected", MetricsCollectedEvent(metrics=response_latency_metrics))
         
+        # Log enhanced information for debugging
+        if agent_ttft:
+            logger.info(f"E2E Latency: {e2e_latency:.3f}s (Agent TTFT: {agent_ttft:.3f}s)")
+        else:
+            logger.info(f"E2E Latency: {e2e_latency:.3f}s")
+        
         # Reset tracking for next response
         self._last_eou_timestamp = None
+        if speech_id and speech_id in self._agent_ttft_by_speech:
+            del self._agent_ttft_by_speech[speech_id]
 
     @property
     def vad(self) -> vad.VAD | None:
