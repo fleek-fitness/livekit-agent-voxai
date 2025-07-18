@@ -138,7 +138,12 @@ def perform_llm_inference(
         if isinstance(llm_node, AsyncIterable):
             # forward llm stream to output channels
             try:
+                first_chunk_time = None
                 async for chunk in llm_node:
+                    # Capture first non-content chunk arrival time
+                    if first_chunk_time is None:
+                        first_chunk_time = time.time() - agent_llm_start_time
+                    
                     # Capture first meaningful token for TTFT measurement
                     if not ttft_captured:
                         has_content = False
@@ -154,12 +159,15 @@ def perform_llm_inference(
                             
                             # Log detailed overhead breakdown for agent TTFT
                             streaming_overhead = agent_ttft - total_prep_overhead
+                            first_to_content = agent_ttft - first_chunk_time if first_chunk_time else 0
                             logger.info(f"=== Agent TTFT Breakdown ===")
                             logger.info(f"Total Agent TTFT: {agent_ttft*1000:.1f}ms")
                             logger.info(f"  Preparation Overhead: {total_prep_overhead*1000:.1f}ms")
                             logger.info(f"    - Tools prep: {tools_prep_time*1000:.1f}ms")
                             logger.info(f"    - Node exec: {node_exec_time*1000:.1f}ms") 
                             logger.info(f"    - Tool update: {tool_update_time*1000:.1f}ms")
+                            logger.info(f"  First Chunk Arrival: {first_chunk_time*1000:.1f}ms")
+                            logger.info(f"  First Chunk to Content: {first_to_content*1000:.1f}ms")
                             logger.info(f"  Streaming to First Token: {streaming_overhead*1000:.1f}ms")
                             logger.info(f"==============================")
                             
