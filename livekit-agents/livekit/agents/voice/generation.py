@@ -127,6 +127,7 @@ def perform_llm_inference(
                         timestamp=time.time(),
                         speech_id=speech_handle.id if speech_handle else None,
                         agent_ttft=data.agent_ttft,
+                        llm_node_await=node_exec_time,
                         request_id=data.id,
                     )
                     session.emit("metrics_collected", MetricsCollectedEvent(metrics=agent_llm_metrics))
@@ -178,6 +179,7 @@ def perform_llm_inference(
                                     timestamp=time.time(),
                                     speech_id=speech_handle.id if speech_handle else None,
                                     agent_ttft=agent_ttft,
+                                    llm_node_await=node_exec_time,
                                     request_id=data.id,
                                 )
                                 session.emit("metrics_collected", MetricsCollectedEvent(metrics=agent_llm_metrics))

@@ -144,6 +144,10 @@ class AgentLLMMetrics(BaseModel):
     agent_ttft: float | None = None
     """Time from agent start to first token available for TTS in seconds."""
     
+    # LLM node execution timing
+    llm_node_await: float | None = None
+    """Time spent executing the LLM node in seconds."""
+    
     # Context for understanding the processing
     request_id: str | None = None
     """Request ID from the underlying LLM provider."""
