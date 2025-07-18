@@ -104,8 +104,6 @@ def perform_llm_inference(
                     f"(Tools: {tools_prep_time*1000:.1f}ms, Node: {node_exec_time*1000:.1f}ms, "
                     f"Update: {tool_update_time*1000:.1f}ms)")
 
-        # Calculate total duration for agent LLM processing
-        llm_node_await = time.time() - agent_llm_start_time
 
         if isinstance(llm_node, str):
             # For non-streaming responses, TTFT is the total time to get response
@@ -122,13 +120,12 @@ def perform_llm_inference(
                 logger.info(f"  (Non-streaming: TTFT = Total Time)")
                 logger.info(f"==========================================")
                 
-                # Emit AgentLLMMetrics immediately with both values for non-streaming
+                # Emit AgentLLMMetrics immediately with agent_ttft for non-streaming
                 if session is not None:
                     speech_handle = _SpeechHandleContextVar.get(None)
                     agent_llm_metrics = AgentLLMMetrics(
                         timestamp=time.time(),
                         speech_id=speech_handle.id if speech_handle else None,
-                        llm_node_await=llm_node_await,
                         agent_ttft=data.agent_ttft,
                         request_id=data.id,
                     )
@@ -172,7 +169,6 @@ def perform_llm_inference(
                                 agent_llm_metrics = AgentLLMMetrics(
                                     timestamp=time.time(),
                                     speech_id=speech_handle.id if speech_handle else None,
-                                    llm_node_await=-1.0,  # Not available yet, will be updated later
                                     agent_ttft=agent_ttft,
                                     request_id=data.id,
                                 )

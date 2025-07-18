@@ -43,8 +43,9 @@ def log_metrics(metrics: AgentMetrics, *, logger: logging.Logger | None = None) 
             f"Response Latency metrics: end_to_end={metrics.e2e_latency:.2f}s"
         )
     elif isinstance(metrics, AgentLLMMetrics):
+        agent_ttft_str = f"agent_ttft={metrics.agent_ttft:.2f}s" if metrics.agent_ttft else "agent_ttft=None"
         logger.info(
-            f"Agent LLM metrics: llm_node_await={metrics.llm_node_await:.2f}s"  # noqa: E501
+            f"Agent LLM metrics: {agent_ttft_str}"  # noqa: E501
         )
     elif isinstance(metrics, ToolExecutionMetrics):
         tool_count = len(metrics.tool_durations)

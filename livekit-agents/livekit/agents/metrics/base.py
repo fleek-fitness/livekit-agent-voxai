@@ -140,10 +140,6 @@ class AgentLLMMetrics(BaseModel):
     speech_id: str | None = None
     """The speech ID this LLM processing is associated with."""
     
-    # Overall agent LLM processing timing
-    llm_node_await: float
-    """Total time for complete agent llm_node processing including custom logic in seconds."""
-    
     # Streaming-aware timing for E2E calculation
     agent_ttft: float | None = None
     """Time from agent start to first token available for TTS in seconds."""
