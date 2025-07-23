@@ -1,6 +1,11 @@
+from __future__ import annotations
+
 import time
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 from dataclasses import dataclass
+
+if TYPE_CHECKING:
+    from .agent_session import VoiceOptions
 
 
 @dataclass
@@ -56,7 +61,7 @@ class ConversationStateTracker:
 class DynamicInterruptionManager:
     """Manages dynamic interruption logic for voice sessions."""
     
-    def __init__(self, session_options):
+    def __init__(self, session_options: VoiceOptions) -> None:
         self.session_options = session_options
         self.conversation_state = ConversationStateTracker(
             continuity_threshold=getattr(session_options, 'conversation_continuity_threshold', 8.0)
@@ -65,6 +70,9 @@ class DynamicInterruptionManager:
         
         # Store original min_interruption_words
         self.original_min_interruption_words = session_options.min_interruption_words
+        
+        # Interruption history tracking for context-aware endpointing
+        self._interruption_history: list[float] = []
     
     def get_current_min_interruption_words(self) -> int:
         """Get the current min_interruption_words value based on conversation context."""
@@ -86,3 +94,23 @@ class DynamicInterruptionManager:
     def on_agent_speech_started(self):
         """Called when agent starts speaking."""
         self.conversation_state.update_agent_speech_started()
+    
+    def on_interruption(self) -> None:
+        """Called when an interruption/overlap is detected"""
+        current_time = time.time()
+        self._interruption_history.append(current_time)
+    
+    def get_endpointing_delay_multiplier(self) -> float:
+        """Returns multiplier for endpointing delays based on recent interruptions"""
+        if not self._interruption_history:
+            return 1.0  # Normal delays when no interruptions
+        
+        # Be more patient for 10 seconds after most recent interruption  
+        most_recent = self._interruption_history[-1]
+        time_since_interruption = time.time() - most_recent
+        
+        if time_since_interruption < 10.0:
+            return 2.0  # 2x patience after recent interruption
+        else:
+            return 1.0  # Return to normal responsiveness
+    

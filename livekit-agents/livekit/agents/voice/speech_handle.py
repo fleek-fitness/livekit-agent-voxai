@@ -3,9 +3,19 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections.abc import Generator
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Protocol
 
 from .. import llm, utils
+
+if TYPE_CHECKING:
+    pass
+
+
+class InterruptionNotifier(Protocol):
+    """Protocol for receiving interruption notifications."""
+    def on_interruption(self) -> None:
+        """Called when speech is interrupted."""
+        ...
 
 
 class SpeechHandle:
@@ -23,6 +33,7 @@ class SpeechHandle:
         allow_interruptions: bool,
         step_index: int,
         parent: SpeechHandle | None,
+        interruption_notifier: InterruptionNotifier | None = None,
     ) -> None:
         self._id = speech_id
         self._step_index = step_index
@@ -31,6 +42,7 @@ class SpeechHandle:
         self._authorize_fut = asyncio.Future[None]()
         self._playout_done_fut = asyncio.Future[None]()
         self._parent = parent
+        self._interruption_notifier = interruption_notifier
 
         self._chat_message: llm.ChatMessage | None = None
 
@@ -39,12 +51,14 @@ class SpeechHandle:
         allow_interruptions: bool = True,
         step_index: int = 0,
         parent: SpeechHandle | None = None,
+        interruption_notifier: InterruptionNotifier | None = None,
     ) -> SpeechHandle:
         return SpeechHandle(
             speech_id=utils.shortuuid("speech_"),
             allow_interruptions=allow_interruptions,
             step_index=step_index,
             parent=parent,
+            interruption_notifier=interruption_notifier,
         )
 
     @property
@@ -102,6 +116,10 @@ class SpeechHandle:
 
         with contextlib.suppress(asyncio.InvalidStateError):
             self._interrupt_fut.set_result(None)
+        
+        # Notify interruption via callback
+        if self._interruption_notifier:
+            self._interruption_notifier.on_interruption()
 
         return self
 

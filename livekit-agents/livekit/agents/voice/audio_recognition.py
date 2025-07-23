@@ -17,6 +17,7 @@ from .agent import ModelSettings
 
 if TYPE_CHECKING:
     from .agent_session import TurnDetectionMode
+    from .dynamic_interruption import DynamicInterruptionManager
 
 MIN_LANGUAGE_DETECTION_LENGTH = 5
 
@@ -58,6 +59,7 @@ class AudioRecognition:
         min_endpointing_delay: float,
         max_endpointing_delay: float,
         turn_detection_mode: TurnDetectionMode | None,
+        dynamic_interruption: DynamicInterruptionManager | None = None,
     ) -> None:
         self._hooks = hooks
         self._audio_input_atask: asyncio.Task[None] | None = None
@@ -68,11 +70,14 @@ class AudioRecognition:
         self._min_endpointing_delay = min_endpointing_delay
         self._max_endpointing_delay = max_endpointing_delay
         self._turn_detector = turn_detector
+        self._dynamic_interruption = dynamic_interruption
         self._stt = stt
         self._vad = vad
         self._turn_detection_mode = turn_detection_mode
         self._vad_base_turn_detection = turn_detection_mode in ("vad", None)
-        self._user_turn_committed = False  # true if user turn ended but EOU task not done
+        self._user_turn_committed = (
+            False  # true if user turn ended but EOU task not done
+        )
         self._sample_rate: int | None = None
 
         self._speaking = False
@@ -266,7 +271,10 @@ class AudioRecognition:
             self._hooks.on_interim_transcript(ev)
             self._audio_interim_transcript = ev.alternatives[0].text
 
-        elif ev.type == stt.SpeechEventType.END_OF_SPEECH and self._turn_detection_mode == "stt":
+        elif (
+            ev.type == stt.SpeechEventType.END_OF_SPEECH
+            and self._turn_detection_mode == "stt"
+        ):
             self._user_turn_committed = True
             if not self._speaking:
                 # start response after vad fires END_OF_SPEECH to avoid vad interruption
@@ -298,7 +306,11 @@ class AudioRecognition:
                 self._run_eou_detection(chat_ctx)
 
     def _run_eou_detection(self, chat_ctx: llm.ChatContext) -> None:
-        if self._stt and not self._audio_transcript and self._turn_detection_mode != "manual":
+        if (
+            self._stt
+            and not self._audio_transcript
+            and self._turn_detection_mode != "manual"
+        ):
             # stt enabled but no transcript yet
             return
 
@@ -312,28 +324,57 @@ class AudioRecognition:
 
         @utils.log_exceptions(logger=logger)
         async def _bounce_eou_task(last_speaking_time: float) -> None:
-            endpointing_delay = self._min_endpointing_delay
+            base_delay = self._min_endpointing_delay
 
             if turn_detector is not None:
                 if not turn_detector.supports_language(self._last_language):
-                    logger.debug("Turn detector does not support language %s", self._last_language)
+                    logger.debug(
+                        "Turn detector does not support language %s",
+                        self._last_language,
+                    )
                 else:
-                    end_of_turn_probability = await turn_detector.predict_end_of_turn(chat_ctx)
+                    end_of_turn_probability = await turn_detector.predict_end_of_turn(
+                        chat_ctx
+                    )
                     tracing.Tracing.log_event(
                         "end of user turn probability",
                         {"probability": end_of_turn_probability},
                     )
-                    unlikely_threshold = turn_detector.unlikely_threshold(self._last_language)
+                    unlikely_threshold = turn_detector.unlikely_threshold(
+                        self._last_language
+                    )
                     if (
                         unlikely_threshold is not None
                         and end_of_turn_probability < unlikely_threshold
                     ):
-                        endpointing_delay = self._max_endpointing_delay
+                        base_delay = self._max_endpointing_delay
+
+            # Apply interruption-aware multiplier if enabled
+            if (
+                self._dynamic_interruption
+                and self._dynamic_interruption.session_options.enable_conversation_aware_endpointing
+            ):
+                multiplier = (
+                    self._dynamic_interruption.get_endpointing_delay_multiplier()
+                )
+                endpointing_delay = base_delay * multiplier
+                logger.info(
+                    f"Dynamic Endpointing Delay Multiplier: {multiplier} for base delay: {base_delay} -> {endpointing_delay}"
+                )
+                # Apply safety bounds
+                ENDPOINTING_DELAY_SAFETY_BOUND = 6.0
+                endpointing_delay = min(
+                    endpointing_delay, ENDPOINTING_DELAY_SAFETY_BOUND
+                )
+            else:
+                endpointing_delay = base_delay
 
             extra_sleep = last_speaking_time + endpointing_delay - time.time()
             await asyncio.sleep(max(extra_sleep, 0))
 
-            tracing.Tracing.log_event("end of user turn", {"transcript": self._audio_transcript})
+            tracing.Tracing.log_event(
+                "end of user turn", {"transcript": self._audio_transcript}
+            )
             committed = self._hooks.on_end_of_turn(
                 _EndOfTurnInfo(
                     new_transcript=self._audio_transcript,
@@ -353,7 +394,9 @@ class AudioRecognition:
             self._end_of_turn_task.cancel()
 
         # copy the last_speaking_time before awaiting (the value can change)
-        self._end_of_turn_task = asyncio.create_task(_bounce_eou_task(self._last_speaking_time))
+        self._end_of_turn_task = asyncio.create_task(
+            _bounce_eou_task(self._last_speaking_time)
+        )
 
     @utils.log_exceptions(logger=logger)
     async def _stt_task(
@@ -374,7 +417,9 @@ class AudioRecognition:
 
         if isinstance(node, AsyncIterable):
             async for ev in node:
-                assert isinstance(ev, stt.SpeechEvent), "STT node must yield SpeechEvent"
+                assert isinstance(
+                    ev, stt.SpeechEvent
+                ), "STT node must yield SpeechEvent"
                 await self._on_stt_event(ev)
 
     @utils.log_exceptions(logger=logger)

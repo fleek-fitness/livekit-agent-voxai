@@ -463,6 +463,7 @@ class AgentActivity(RecognitionHooks):
                 min_endpointing_delay=self._session.options.min_endpointing_delay,
                 max_endpointing_delay=self._session.options.max_endpointing_delay,
                 turn_detection_mode=self._turn_detection_mode,
+                dynamic_interruption=self._dynamic_interruption,
             )
             self._audio_recognition.start()
             self._started = True
@@ -582,7 +583,8 @@ class AgentActivity(RecognitionHooks):
         handle = SpeechHandle.create(
             allow_interruptions=allow_interruptions
             if is_given(allow_interruptions)
-            else self.allow_interruptions
+            else self.allow_interruptions,
+            interruption_notifier=self._dynamic_interruption
         )
         self._session.emit(
             "speech_created",
@@ -641,7 +643,8 @@ class AgentActivity(RecognitionHooks):
         handle = SpeechHandle.create(
             allow_interruptions=allow_interruptions
             if is_given(allow_interruptions)
-            else self.allow_interruptions
+            else self.allow_interruptions,
+            interruption_notifier=self._dynamic_interruption
         )
         self._session.emit(
             "speech_created",
@@ -875,7 +878,7 @@ class AgentActivity(RecognitionHooks):
             logger.warning("skipping new realtime generation, the agent is draining")
             return
 
-        handle = SpeechHandle.create(allow_interruptions=self.allow_interruptions)
+        handle = SpeechHandle.create(allow_interruptions=self.allow_interruptions, interruption_notifier=self._dynamic_interruption)
         self._session.emit(
             "speech_created",
             SpeechCreatedEvent(speech_handle=handle, user_initiated=False, source="generate_reply"),
@@ -1474,6 +1477,7 @@ class AgentActivity(RecognitionHooks):
                     allow_interruptions=speech_handle.allow_interruptions,
                     step_index=speech_handle.step_index + 1,
                     parent=speech_handle,
+                    interruption_notifier=self._dynamic_interruption
                 )
                 self._session.emit(
                     "speech_created",
@@ -1787,6 +1791,7 @@ class AgentActivity(RecognitionHooks):
                     allow_interruptions=speech_handle.allow_interruptions,
                     step_index=speech_handle.step_index + 1,
                     parent=speech_handle,
+                    interruption_notifier=self._dynamic_interruption
                 )
                 self._session.emit(
                     "speech_created",

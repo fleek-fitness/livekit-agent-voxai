@@ -5,7 +5,15 @@ import copy
 import time
 from collections.abc import AsyncIterable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Generic, Literal, Protocol, TypeVar, Union, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Generic,
+    Literal,
+    Protocol,
+    TypeVar,
+    Union,
+    runtime_checkable,
+)
 
 from livekit import rtc
 
@@ -51,11 +59,14 @@ class VoiceOptions:
     # Dynamic interruption settings
     enable_dynamic_interruption: bool = True
     conversation_continuity_threshold: float = 8.0  # seconds
+    enable_conversation_aware_endpointing: bool = True
 
 
 Userdata_T = TypeVar("Userdata_T")
 
-TurnDetectionMode = Union[Literal["stt", "vad", "realtime_llm", "manual"], _TurnDetector]
+TurnDetectionMode = Union[
+    Literal["stt", "vad", "realtime_llm", "manual"], _TurnDetector
+]
 """
 The mode of turn detection to use.
 
@@ -125,8 +136,9 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
         user_away_timeout: float | None = 15.0,
         min_consecutive_speech_delay: float = 0.0,
         interruption_ignore_words: list[str] | None = None,
-        enable_dynamic_interruption: bool = True,
+        enable_dynamic_interruption: bool = False,
         conversation_continuity_threshold: float = 8.0,
+        enable_conversation_aware_endpointing: bool = False,
         loop: asyncio.AbstractEventLoop | None = None,
     ) -> None:
         """`AgentSession` is the LiveKit Agents runtime that glues together
@@ -186,8 +198,8 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
                 Default ``15.0`` s, set to ``None`` to disable.
             min_consecutive_speech_delay (float, optional): The minimum delay between
                 consecutive speech. Default ``0.0`` s.
-            interruption_ignore_words (list[str] | None, optional): List of words or 
-                phrases that should not trigger interruptions when detected in the 
+            interruption_ignore_words (list[str] | None, optional): List of words or
+                phrases that should not trigger interruptions when detected in the
                 user's speech. Default ``None``.
             enable_dynamic_interruption (bool, optional): Enable dynamic interruption
                 behavior that adapts based on conversation flow. When enabled, the system
@@ -224,6 +236,7 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
             interruption_ignore_words=interruption_ignore_words,
             enable_dynamic_interruption=enable_dynamic_interruption,
             conversation_continuity_threshold=conversation_continuity_threshold,
+            enable_conversation_aware_endpointing=enable_conversation_aware_endpointing,
         )
         self._started = False
         self._turn_detection = turn_detection or None
@@ -234,7 +247,9 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
         self._mcp_servers = mcp_servers or None
 
         # configurable IO
-        self._input = io.AgentInput(self._on_video_input_changed, self._on_audio_input_changed)
+        self._input = io.AgentInput(
+            self._on_video_input_changed, self._on_audio_input_changed
+        )
         self._output = io.AgentOutput(
             self._on_video_output_changed,
             self._on_audio_output_changed,
@@ -393,7 +408,11 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
                 await self._room_io.start()
 
             else:
-                if not self._room_io and not self.output.audio and not self.output.transcription:
+                if (
+                    not self._room_io
+                    and not self.output.audio
+                    and not self.output.transcription
+                ):
                     logger.warning(
                         "session starts without output, forgetting to pass `room` to `AgentSession.start()`?"  # noqa: E501
                     )
@@ -427,8 +446,12 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
             return  # can happen at startup
 
         chat_ctx = self._activity.agent.chat_ctx
-        debug.Tracing.store_kv("chat_ctx", chat_ctx.to_dict(exclude_function_call=False))
-        debug.Tracing.store_kv("history", self.history.to_dict(exclude_function_call=False))
+        debug.Tracing.store_kv(
+            "chat_ctx", chat_ctx.to_dict(exclude_function_call=False)
+        )
+        debug.Tracing.store_kv(
+            "history", self.history.to_dict(exclude_function_call=False)
+        )
 
     async def drain(self) -> None:
         if self._activity is None:
@@ -439,7 +462,9 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
     async def _aclose_impl(
         self,
         *,
-        error: llm.LLMError | stt.STTError | tts.TTSError | llm.RealtimeModelError | None = None,
+        error: (
+            llm.LLMError | stt.STTError | tts.TTSError | llm.RealtimeModelError | None
+        ) = None,
     ) -> None:
         async with self._lock:
             if not self._started:
@@ -530,7 +555,9 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
 
         if self._activity.draining:
             if self._next_activity is None:
-                raise RuntimeError("AgentSession is closing, cannot use generate_reply()")
+                raise RuntimeError(
+                    "AgentSession is closing, cannot use generate_reply()"
+                )
 
             return self._next_activity._generate_reply(
                 user_message=user_message,
@@ -592,7 +619,9 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
         if self._closing_task or error.recoverable:
             return
 
-        logger.error("AgentSession is closing due to unrecoverable error", exc_info=error.error)
+        logger.error(
+            "AgentSession is closing due to unrecoverable error", exc_info=error.error
+        )
 
         async def drain_and_close() -> None:
             await self.drain()
@@ -635,7 +664,9 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
 
         async for frame in video_input:
             if self._activity is not None:
-                if self._video_sampler is not None and not self._video_sampler(frame, self):
+                if self._video_sampler is not None and not self._video_sampler(
+                    frame, self
+                ):
                     continue  # ignore this frame
 
                 self._activity.push_video(frame)
@@ -666,7 +697,8 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
         old_state = self._agent_state
         self._agent_state = state
         self.emit(
-            "agent_state_changed", AgentStateChangedEvent(old_state=old_state, new_state=state)
+            "agent_state_changed",
+            AgentStateChangedEvent(old_state=old_state, new_state=state),
         )
 
     def _update_user_state(self, state: UserState) -> None:
@@ -680,7 +712,10 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
 
         old_state = self._user_state
         self._user_state = state
-        self.emit("user_state_changed", UserStateChangedEvent(old_state=old_state, new_state=state))
+        self.emit(
+            "user_state_changed",
+            UserStateChangedEvent(old_state=old_state, new_state=state),
+        )
 
     def _conversation_item_added(self, message: llm.ChatMessage) -> None:
         self._chat_ctx.insert(message)
