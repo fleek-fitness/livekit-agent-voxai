@@ -115,6 +115,60 @@ class RealtimeModelMetrics(BaseModel):
     """Details about the output tokens used in the Response."""
 
 
+class ResponseLatencyMetrics(BaseModel):
+    type: Literal["response_latency_metrics"] = "response_latency_metrics"
+    timestamp: float
+    """When the metric was captured."""
+    speech_id: str | None = None
+    """The speech ID this latency measurement is associated with."""
+    
+    # Core end-to-end latency
+    e2e_latency: float
+    """Total time from end of user speech to first audio response in seconds."""
+    
+    # Boundary timestamps for verification
+    eou_timestamp: float
+    """Timestamp when user stopped speaking (from VAD)."""
+    first_audio_timestamp: float
+    """Timestamp when first audio response was generated."""
+
+
+class AgentLLMMetrics(BaseModel):
+    type: Literal["agent_llm_metrics"] = "agent_llm_metrics"
+    timestamp: float
+    """When the metric was captured."""
+    speech_id: str | None = None
+    """The speech ID this LLM processing is associated with."""
+    
+    # Streaming-aware timing for E2E calculation
+    agent_ttft: float | None = None
+    """Time from agent start to first token available for TTS in seconds."""
+    
+    # LLM node execution timing
+    llm_node_await: float | None = None
+    """Time spent executing the LLM node in seconds."""
+    
+    # Context for understanding the processing
+    request_id: str | None = None
+    """Request ID from the underlying LLM provider."""
+
+
+class ToolExecutionMetrics(BaseModel):
+    type: Literal["tool_execution_metrics"] = "tool_execution_metrics"
+    timestamp: float
+    """When the metric was captured."""
+    speech_id: str | None = None
+    """The speech ID this tool execution is associated with."""
+    
+    # Tool execution timing
+    total_execution_time: float
+    """Total time for all tool executions in seconds."""
+    
+    # Individual tool durations (detailed breakdown)
+    tool_durations: dict[str, float] = {}
+    """Per-tool execution durations in seconds."""
+
+
 AgentMetrics = Union[
     STTMetrics,
     LLMMetrics,
@@ -122,4 +176,7 @@ AgentMetrics = Union[
     VADMetrics,
     EOUMetrics,
     RealtimeModelMetrics,
+    ResponseLatencyMetrics,
+    AgentLLMMetrics,
+    ToolExecutionMetrics,
 ]

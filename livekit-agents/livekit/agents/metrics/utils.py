@@ -3,7 +3,17 @@ from __future__ import annotations
 import logging
 
 from ..log import logger as default_logger
-from .base import AgentMetrics, EOUMetrics, LLMMetrics, RealtimeModelMetrics, STTMetrics, TTSMetrics
+from .base import (
+    AgentMetrics,
+    AgentLLMMetrics,
+    EOUMetrics,
+    LLMMetrics,
+    RealtimeModelMetrics,
+    ResponseLatencyMetrics,
+    STTMetrics,
+    ToolExecutionMetrics,
+    TTSMetrics,
+)
 
 
 def log_metrics(metrics: AgentMetrics, *, logger: logging.Logger | None = None) -> None:
@@ -28,3 +38,18 @@ def log_metrics(metrics: AgentMetrics, *, logger: logging.Logger | None = None) 
         )
     elif isinstance(metrics, STTMetrics):
         logger.info(f"STT metrics: audio_duration={metrics.audio_duration:.2f}")
+    elif isinstance(metrics, ResponseLatencyMetrics):
+        logger.info(
+            f"Response Latency metrics: end_to_end={metrics.e2e_latency:.2f}s"
+        )
+    elif isinstance(metrics, AgentLLMMetrics):
+        agent_ttft_str = f"agent_ttft={metrics.agent_ttft:.2f}s" if metrics.agent_ttft else "agent_ttft=None"
+        logger.info(
+            f"Agent LLM metrics: {agent_ttft_str}"  # noqa: E501
+        )
+    elif isinstance(metrics, ToolExecutionMetrics):
+        tool_count = len(metrics.tool_durations)
+        tool_names = list(metrics.tool_durations.keys())
+        logger.info(
+            f"Tool Execution metrics: total_time={metrics.total_execution_time:.2f}s, tools_executed={tool_count}, tools={tool_names}"  # noqa: E501
+        )
