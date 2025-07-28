@@ -101,10 +101,10 @@ class ConversationStateTracker:
         - max_endpointing: 1.5초 → 총 응답시간: 2.4초
         - 사용자가 3초 시점에 재개 → 충돌 발생!
         
-        신규 시스템 (New System):
-        - 첫 시도: 2.0초 → 총 2.9초 (아슬아슬 회피)
-        - 1회 충돌 후: 2.0s × 1.8 = 3.6초 → 총 4.5초 (안전함)
-        - 2회 충돌 후: 2.0s × 2.5 = 5.0초 → 총 5.9초 (매우 안전함)
+        신규 시스템 (New System) - max_endpointing=2.0s, min_endpointing=1.5s:
+        - 충돌 없음: 1.5배 기본 → 2.0s × 1.5 = 3.0초 → 총 3.9초
+        - 1회 충돌 후: 2.0s × 2.7 = 5.4초 → 총 6.3초 (안전함)
+        - 2회 충돌 후: 2.0s × 3.5 = 7.0초 → 총 7.9초 (매우 안전함)
         
         📍 CASE 2: 주소 읽기 (Address Reading)  
         사용자: "충북 청주시..." [3초 기억 회상] "상당구 금천동..."
@@ -117,18 +117,21 @@ class ConversationStateTracker:
         
         🚀 다중 충돌 가중 시스템 (Multi-Collision Weighting System):
         
-        배수 결과 - 단일 충돌 (Single Collision Results):
-        - 기본 점수 0.8: 1.8배 → 3.6초 대기
+        배수 결과 - 충돌 없음 (No Collision):
+        - 기본: 1.5배 → min(1.5s) × 1.5 = 2.25초, max(2.0s) × 1.5 = 3.0초
+        
+        배수 결과 - 단일 충돌 (Single Collision):
+        - 기본 점수 0.8: 2.7배 → min(1.5s) × 2.7 = 4.05초, max(2.0s) × 2.7 = 5.4초
         
         배수 결과 - 다중 충돌 (Multiple Collision Results):
-        - 2회 충돌: 0.8 × 1.5 = 1.2 → 2.3배 → 4.6초 대기
-        - 4회 충돌: 0.8 × 2.0 = 1.6 → 2.7배 → 5.4초 대기
-        - 5초내 3회 버스트: 0.8 × 1.5 × 1.44 = 1.73 → 2.8배 → 5.6초 대기
+        - 2회 충돌: 0.8 × 1.5 = 1.2 → 3.3배 → max(2.0s) × 3.3 = 6.6초
+        - 4회 충돌: 0.8 × 2.0 = 1.6 → 3.9배 → max(2.0s) × 3.9 = 7.8초
+        - 5초내 3회 버스트: 0.8 × 1.5 × 1.44 = 1.73 → 4.0배 → max(2.0s) × 4.0 = 8.0초
         
         극단적 사례 (Extreme Cases):
-        - 5회 충돌 + 버스트: 1.6 × 1.44 = 2.3 → 3.0배 → 6.0초 (상한)
+        - 5회 충돌 + 버스트: 1.6 × 1.44 = 2.3 → 4.5배 → max(2.0s) × 4.5 = 9.0초 (상한)
         
-        Returns multiplier in range [1.0, 3.0] with smooth scaling.
+        Returns multiplier in range [1.5, 4.5] with smooth scaling (1.5x baseline).
         """
         if not self.enabled:
             return 1.0
@@ -202,27 +205,30 @@ class ConversationStateTracker:
         # (Smaller logarithmic contribution to prevent excessive delays)
         log_component = 0.2 * math.log(1 + weighted_collision_score)
         
-        # 보수적 스케일링: 최대 3배 (4배 대신)
-        # (Conservative scaling: max 3x instead of 4x)
-        # 공식: multiplier = 1 + 1.5×tanh(0.8×score) + 0.2×ln(1+score)
-        multiplier = 1.0 + 1.5 * sigmoid_component + log_component
+        # 1.5배 증가된 스케일링: 기본 1.5배, 최대 4.5배
+        # (1.5x increased scaling: base 1.5x, max 4.5x)
+        # 공식: multiplier = 1.5 + 2.25×tanh(0.8×score) + 0.3×ln(1+score)
+        multiplier = 1.5 + 2.25 * sigmoid_component + 0.3 * log_component
         
-        # 실제 사례 검증 (Real Case Validation):
+        # 실제 사례 검증 (Real Case Validation) - min=1.5s, max=2.0s 기준:
         # 
-        # 👤 사용자 A (단일 충돌): basic_score=0.84 × 1.0 × 1.0 = 0.84
-        #    → multiplier=1.81 → 3.6초 대기 (적당한 적응)
+        # 👤 사용자 A (충돌 없음): score=0
+        #    → multiplier=1.5 → min(1.5s)×1.5=2.25초, max(2.0s)×1.5=3.0초 (기본 인내)
         #
-        # 👥 사용자 B (3회 충돌): basic_score=1.43 × 1.5 × 1.0 = 2.15  
-        #    → multiplier=2.71 → 5.4초 대기 (강한 적응)
+        # 👤 사용자 B (단일 충돌): basic_score=0.84 × 1.0 × 1.0 = 0.84
+        #    → multiplier=2.71 → max(2.0s)×2.71=5.42초 (적당한 적응)
         #
-        # 😤 사용자 C (5회 충돌 + 버스트): basic_score=1.8 × 2.0 × 1.44 = 5.18
-        #    → multiplier=3.0 → 6.0초 대기 (최대 인내)
+        # 👥 사용자 C (3회 충돌): basic_score=1.43 × 1.5 × 1.0 = 2.15  
+        #    → multiplier=3.88 → max(2.0s)×3.88=7.76초 (강한 적응)
         #
-        # 🎯 핵심: 다중 충돌 사용자가 2.5배 더 많은 대기시간 확보!
+        # 😤 사용자 D (5회 충돌 + 버스트): basic_score=1.8 × 2.0 × 1.44 = 5.18
+        #    → multiplier=4.5 → max(2.0s)×4.5=9.0초 (최대 인내)
+        #
+        # 🎯 핵심: 기본 1.5배로 시작하여 다중 충돌시 최대 3배 더 많은 대기시간!
         
-        # 3.0배 상한 = 2.0초 × 3.0 = 6.0초 최대 대기 (데드 에어 방지)
-        # (3.0x cap = 2.0s × 3.0 = 6.0s maximum wait, prevents dead air)
-        return max(1.0, min(3.0, round(multiplier, 2)))
+        # 4.5배 상한 = 2.0초 × 4.5 = 9.0초 최대 대기 (충분한 인내심)
+        # (4.5x cap = 2.0s × 4.5 = 9.0s maximum wait, provides sufficient patience)
+        return max(1.5, min(4.5, round(multiplier, 2)))
 
 
 class DynamicInterruptionManager:
