@@ -346,15 +346,20 @@ class AudioRecognition:
                     ):
                         endpointing_delay = self._max_endpointing_delay
 
-            # Apply adaptive endpointing based on recent collisions
+            # 충돌 기반 적응형 엔드포인팅 적용 (Apply collision-based adaptive endpointing)
             if hasattr(self._hooks, "_dynamic_interruption"):
                 multiplier = (
                     self._hooks._dynamic_interruption.get_endpointing_multiplier()
                 )
                 if multiplier > 1.0:
+                    # 원본 지연시간 보존 (Preserve original delay for logging)
+                    original_delay = endpointing_delay
+                    if endpointing_delay < 1.0:
+                        endpointing_delay = 1.0
+                    # 배수 적용 후 안전 상한 (Apply multiplier with safety cap)
                     endpointing_delay = min(endpointing_delay * multiplier, 6.0)
                     logger.info(
-                        f"Adaptive endpointing: {multiplier}x delay = {endpointing_delay:.1f}s"
+                        f"Adaptive endpointing: {multiplier:.2f}x delay = {original_delay:.1f}s → {endpointing_delay:.1f}s"
                     )
 
             extra_sleep = last_speaking_time + endpointing_delay - time.time()
