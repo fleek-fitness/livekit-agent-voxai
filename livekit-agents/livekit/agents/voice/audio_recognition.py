@@ -355,7 +355,7 @@ class AudioRecognition:
                     # 원본 지연시간 보존 (Preserve original delay for logging)
                     original_delay = endpointing_delay
                     if endpointing_delay < 1.0:
-                        endpointing_delay = 1.0
+                        endpointing_delay = 1.5
                     # 배수 적용 후 안전 상한 (Apply multiplier with safety cap)
                     endpointing_delay = min(endpointing_delay * multiplier, 6.0)
                     logger.info(
