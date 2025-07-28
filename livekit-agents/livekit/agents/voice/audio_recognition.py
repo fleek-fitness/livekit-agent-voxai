@@ -357,7 +357,7 @@ class AudioRecognition:
                     if endpointing_delay < 1.0:
                         endpointing_delay = 1.5
                     # 배수 적용 후 안전 상한 (Apply multiplier with safety cap)
-                    endpointing_delay = min(endpointing_delay * multiplier, 6.0)
+                    endpointing_delay = min(endpointing_delay * multiplier, 4.0)
                     logger.info(
                         f"Adaptive endpointing: {multiplier:.2f}x delay = {original_delay:.1f}s → {endpointing_delay:.1f}s"
                     )
