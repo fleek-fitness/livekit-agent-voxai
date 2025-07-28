@@ -1,6 +1,7 @@
 import time
 from typing import Optional
 from dataclasses import dataclass
+from collections import deque
 
 
 @dataclass
@@ -12,6 +13,8 @@ class ConversationStateTracker:
         self.last_agent_speech_start_time: Optional[float] = None
         self.continuity_threshold = continuity_threshold
         self.enabled = True
+        # Track recent continuation collisions for adaptive endpointing
+        self.collision_memory = deque()  # Stores timestamps of collisions
     
     def update_user_speech_ended(self, timestamp: Optional[float] = None):
         """Called when user finishes speaking."""
@@ -51,6 +54,31 @@ class ConversationStateTracker:
     def is_in_conversation_flow(self, current_time: Optional[float] = None) -> bool:
         """Check if we're currently in conversation flow."""
         return self.get_dynamic_min_interruption_words(current_time) == 0
+    
+    def record_continuation_collision(self):
+        """Record when user interrupts agent because they needed more time."""
+        now = time.time()
+        self.collision_memory.append(now)
+        # Keep only collisions from last 15 seconds
+        cutoff = now - 15.0
+        self.collision_memory = deque(t for t in self.collision_memory if t > cutoff)
+    
+    def get_endpointing_multiplier(self) -> float:
+        """Get multiplier for endpointing delay based on recent collisions."""
+        if not self.enabled:
+            return 1.0
+            
+        # Count recent collisions (last 15 seconds)
+        now = time.time()
+        cutoff = now - 15.0
+        recent_collisions = sum(1 for t in self.collision_memory if t > cutoff)
+        
+        # More collisions = user needs more time
+        if recent_collisions >= 2:
+            return 3.0  # Triple the delay
+        elif recent_collisions >= 1:
+            return 2.0  # Double the delay
+        return 1.0  # No recent collisions, normal timing
 
 
 class DynamicInterruptionManager:
@@ -86,3 +114,11 @@ class DynamicInterruptionManager:
     def on_agent_speech_started(self):
         """Called when agent starts speaking."""
         self.conversation_state.update_agent_speech_started()
+    
+    def record_continuation_collision(self):
+        """Record when user interrupts agent because they needed more time."""
+        self.conversation_state.record_continuation_collision()
+    
+    def get_endpointing_multiplier(self) -> float:
+        """Get multiplier for endpointing delay based on recent collisions."""
+        return self.conversation_state.get_endpointing_multiplier()

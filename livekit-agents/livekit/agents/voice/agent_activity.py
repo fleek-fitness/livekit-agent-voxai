@@ -951,6 +951,15 @@ class AgentActivity(RecognitionHooks):
             and not self._current_speech.interrupted
             and self._current_speech.allow_interruptions
         ):
+            # Check if this is a continuation collision (user needed more time)
+            if self._dynamic_interruption.conversation_state.last_user_speech_end_time:
+                time_since_user_stopped = time.time() - self._dynamic_interruption.conversation_state.last_user_speech_end_time
+                
+                # If user stopped speaking < 5s ago, they likely needed more time
+                if time_since_user_stopped < 5.0:
+                    self._dynamic_interruption.record_continuation_collision()
+                    logger.debug(f"Continuation collision detected - user resumed after {time_since_user_stopped:.1f}s")
+            
             log_event(
                 "speech interrupted by vad",
                 speech_id=self._current_speech.id,
