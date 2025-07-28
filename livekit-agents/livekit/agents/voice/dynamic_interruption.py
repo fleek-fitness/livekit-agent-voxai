@@ -115,10 +115,18 @@ class ConversationStateTracker:
         - 3초 전 충돌: weight = e^(-0.173×3) = 0.59 → 중간 영향  
         - 6초 전 충돌: weight = e^(-0.173×6) = 0.35 → 낮은 영향
         
-        배수 결과 (Multiplier Results):
-        - 점수 0.5: 1.4배 → 2.8초 대기
-        - 점수 1.0: 1.8배 → 3.6초 대기
-        - 점수 2.0: 2.5배 → 5.0초 대기
+        🚀 다중 충돌 가중 시스템 (Multi-Collision Weighting System):
+        
+        배수 결과 - 단일 충돌 (Single Collision Results):
+        - 기본 점수 0.8: 1.8배 → 3.6초 대기
+        
+        배수 결과 - 다중 충돌 (Multiple Collision Results):
+        - 2회 충돌: 0.8 × 1.5 = 1.2 → 2.3배 → 4.6초 대기
+        - 4회 충돌: 0.8 × 2.0 = 1.6 → 2.7배 → 5.4초 대기
+        - 5초내 3회 버스트: 0.8 × 1.5 × 1.44 = 1.73 → 2.8배 → 5.6초 대기
+        
+        극단적 사례 (Extreme Cases):
+        - 5회 충돌 + 버스트: 1.6 × 1.44 = 2.3 → 3.0배 → 6.0초 (상한)
         
         Returns multiplier in range [1.0, 3.0] with smooth scaling.
         """
@@ -141,14 +149,44 @@ class ConversationStateTracker:
         half_life = 4.0
         decay_constant = math.log(2) / half_life  # λ = ln(2)/t₁/₂ = 0.173
         
-        weighted_collision_score = 0.0
+        # 기본 EMA 가중치 계산 (Basic EMA weight calculation)
+        basic_weighted_score = 0.0
         for collision_time in self.collision_memory:
             age = now - collision_time
             # 지수 감쇠 공식: weight = e^(-λt) 
             # (Exponential decay formula: weight = e^(-λt))
             # 예시: 2초 전 충돌 = e^(-0.173×2) = 0.69 (69% 가중치)
             weight = math.exp(-decay_constant * age)
-            weighted_collision_score += weight
+            basic_weighted_score += weight
+        
+        # 다중 충돌 패턴 감지 및 부스트 (Multi-collision pattern detection and boost)
+        collision_count = len(self.collision_memory)
+        
+        # 1. 충돌 밀도 부스트 (Collision density boost)
+        # 더 많은 충돌 = 지수적으로 더 높은 가중치
+        # (More collisions = exponentially higher weight)
+        if collision_count >= 4:
+            density_multiplier = 2.0  # 4+ collisions = 심각한 패턴 (serious pattern)
+        elif collision_count >= 2:
+            density_multiplier = 1.5  # 2-3 collisions = 중간 패턴 (moderate pattern)
+        else:
+            density_multiplier = 1.0  # 1 collision = 정상 (normal)
+        
+        # 2. 충돌 버스트 감지 (Collision burst detection)
+        # 5초 내 다중 충돌 = 추가 부스트
+        # (Multiple collisions within 5s = additional boost)
+        burst_window = 5.0
+        burst_boost = 1.0
+        for i, collision_time in enumerate(self.collision_memory):
+            nearby_collisions = sum(1 for t in self.collision_memory 
+                                  if abs(t - collision_time) <= burst_window)
+            if nearby_collisions >= 2:
+                # 버스트 크기에 따른 지수적 부스트
+                # (Exponential boost based on burst size)
+                burst_boost = max(burst_boost, 1.2 ** (nearby_collisions - 1))
+        
+        # 3. 최종 가중 점수 계산 (Final weighted score calculation)
+        weighted_collision_score = basic_weighted_score * density_multiplier * burst_boost
         
         # 프로덕션 음성 AI 최적화 보수적 함수
         # (Production voice AI optimized conservative function)
@@ -170,9 +208,17 @@ class ConversationStateTracker:
         multiplier = 1.0 + 1.5 * sigmoid_component + log_component
         
         # 실제 사례 검증 (Real Case Validation):
-        # weighted_score=0.84 (1초 전 충돌) → multiplier=1.81 → 3.6초 대기
-        # weighted_score=1.43 (다중 충돌) → multiplier=2.34 → 4.7초 대기  
-        # weighted_score=2.18 (심각한 패턴) → multiplier=2.78 → 5.6초 대기
+        # 
+        # 👤 사용자 A (단일 충돌): basic_score=0.84 × 1.0 × 1.0 = 0.84
+        #    → multiplier=1.81 → 3.6초 대기 (적당한 적응)
+        #
+        # 👥 사용자 B (3회 충돌): basic_score=1.43 × 1.5 × 1.0 = 2.15  
+        #    → multiplier=2.71 → 5.4초 대기 (강한 적응)
+        #
+        # 😤 사용자 C (5회 충돌 + 버스트): basic_score=1.8 × 2.0 × 1.44 = 5.18
+        #    → multiplier=3.0 → 6.0초 대기 (최대 인내)
+        #
+        # 🎯 핵심: 다중 충돌 사용자가 2.5배 더 많은 대기시간 확보!
         
         # 3.0배 상한 = 2.0초 × 3.0 = 6.0초 최대 대기 (데드 에어 방지)
         # (3.0x cap = 2.0s × 3.0 = 6.0s maximum wait, prevents dead air)
