@@ -110,10 +110,11 @@ class ConversationStateTracker:
         사용자: "충북 청주시..." [3초 기억 회상] "상당구 금천동..."
         (User: "Chungbuk Cheongju..." [3s memory recall] "Sangdang-gu Geumcheon-dong...")
         
-        가중점수 계산 예시 (Weighted Score Examples):
-        - 1초 전 충돌: weight = e^(-0.173×1) = 0.84 → 높은 영향
-        - 3초 전 충돌: weight = e^(-0.173×3) = 0.59 → 중간 영향  
-        - 6초 전 충돌: weight = e^(-0.173×6) = 0.35 → 낮은 영향
+        가중점수 계산 예시 (Weighted Score Examples - 더 완만한 감쇠):
+        - 1초 전 충돌: weight = e^(-0.099×1) = 0.91 → 매우 높은 영향
+        - 3초 전 충돌: weight = e^(-0.099×3) = 0.74 → 높은 영향  
+        - 6초 전 충돌: weight = e^(-0.099×6) = 0.55 → 중간 영향 (이전: 0.35)
+        - 8초 전 충돌: weight = e^(-0.099×8) = 0.45 → 낮은 영향 (이전: 0.25)
         
         🚀 다중 충돌 가중 시스템 (Multi-Collision Weighting System):
         
@@ -147,10 +148,10 @@ class ConversationStateTracker:
 
         # 지수 감쇠 가중치: 최근 충돌일수록 지수적으로 높은 가중치
         # (Exponential decay weighting: recent collisions weighted exponentially higher)
-        # 반감기 4초 = 한국어 전화번호 청킹 패턴에 최적화
-        # (4-second half-life optimized for Korean phone number chunking patterns)
-        half_life = 4.0
-        decay_constant = math.log(2) / half_life  # λ = ln(2)/t₁/₂ = 0.173
+        # 반감기 7초 = 한국어 전화번호 청킹 패턴에 최적화 (더 완만한 감쇠)
+        # (7-second half-life optimized for Korean phone number chunking patterns - gentler decay)
+        half_life = 7.0
+        decay_constant = math.log(2) / half_life  # λ = ln(2)/t₁/₂ = 0.099
         
         # 기본 EMA 가중치 계산 (Basic EMA weight calculation)
         basic_weighted_score = 0.0
@@ -158,7 +159,7 @@ class ConversationStateTracker:
             age = now - collision_time
             # 지수 감쇠 공식: weight = e^(-λt) 
             # (Exponential decay formula: weight = e^(-λt))
-            # 예시: 2초 전 충돌 = e^(-0.173×2) = 0.69 (69% 가중치)
+            # 예시: 2초 전 충돌 = e^(-0.099×2) = 0.82 (82% 가중치, 더 완만함)
             weight = math.exp(-decay_constant * age)
             basic_weighted_score += weight
         
