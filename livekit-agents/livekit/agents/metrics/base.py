@@ -169,12 +169,40 @@ class ToolExecutionMetrics(BaseModel):
     """Per-tool execution durations in seconds."""
 
 
+class TurnDetectionMetrics(BaseModel):
+    type: Literal["turn_detection"] = "turn_detection"
+    timestamp: float
+    """When the turn detection was performed."""
+    
+    # Core prediction data
+    probability: float
+    """Turn detection probability (0.0-1.0) from the model."""
+    
+    turn_ended: bool
+    """Final boolean decision: True if turn should end, False if user likely to continue speaking."""
+    
+    inference_time: float
+    """Time taken for turn detection inference in seconds."""
+    
+    # Behavioral data
+    endpointing_delay: float
+    """Actual endpointing delay applied (may be adapted based on collision detection)."""
+    
+    collision_multiplier: float = 1.0
+    """Adaptive endpointing multiplier based on collision patterns."""
+    
+    # Correlation
+    speech_id: str | None = None
+    """Links this turn detection to the resulting speech generation."""
+
+
 AgentMetrics = Union[
     STTMetrics,
     LLMMetrics,
     TTSMetrics,
     VADMetrics,
     EOUMetrics,
+    TurnDetectionMetrics,
     RealtimeModelMetrics,
     ResponseLatencyMetrics,
     AgentLLMMetrics,

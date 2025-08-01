@@ -45,6 +45,10 @@ class RecognitionHooks(Protocol):
     def on_end_of_turn(self, info: _EndOfTurnInfo) -> bool: ...
 
     def retrieve_chat_ctx(self) -> llm.ChatContext: ...
+    
+    def emit_turn_detection_metrics(self, metrics) -> None: 
+        """Emit turn detection metrics. Optional method for backward compatibility."""
+        ...
 
 
 class AudioRecognition:
@@ -322,6 +326,9 @@ class AudioRecognition:
         @utils.log_exceptions(logger=logger)
         async def _bounce_eou_task(last_speaking_time: float) -> None:
             endpointing_delay = self._min_endpointing_delay
+            turn_probability = None
+            turn_inference_time = None
+            turn_ended_decision = None
 
             if turn_detector is not None:
                 if not turn_detector.supports_language(self._last_language):
@@ -330,9 +337,14 @@ class AudioRecognition:
                         self._last_language,
                     )
                 else:
+                    # Time the turn detection inference
+                    inference_start = time.perf_counter()
                     end_of_turn_probability = await turn_detector.predict_end_of_turn(
                         chat_ctx
                     )
+                    turn_inference_time = time.perf_counter() - inference_start
+                    turn_probability = end_of_turn_probability
+                    
                     tracing.Tracing.log_event(
                         "end of user turn probability",
                         {"probability": end_of_turn_probability},
@@ -345,22 +357,44 @@ class AudioRecognition:
                         and end_of_turn_probability < unlikely_threshold
                     ):
                         endpointing_delay = self._max_endpointing_delay
+                        turn_ended_decision = False  # Turn continues, use max delay
+                    else:
+                        turn_ended_decision = True  # Turn should end
 
             # 충돌 기반 적응형 엔드포인팅 적용 (Apply collision-based adaptive endpointing)
+            collision_multiplier = 1.0
             if hasattr(self._hooks, "_dynamic_interruption"):
-                multiplier = (
+                collision_multiplier = (
                     self._hooks._dynamic_interruption.get_endpointing_multiplier()
                 )
-                if multiplier > 1.0:
+                if collision_multiplier > 1.0:
                     # 원본 지연시간 보존 (Preserve original delay for logging)
                     original_delay = endpointing_delay
                     if endpointing_delay < 1.0:
                         endpointing_delay = 1.5
                     # 배수 적용 후 안전 상한 (Apply multiplier with safety cap)
-                    endpointing_delay = min(endpointing_delay * multiplier, 4.0)
+                    endpointing_delay = min(endpointing_delay * collision_multiplier, 4.0)
                     logger.info(
-                        f"Adaptive endpointing: {multiplier:.2f}x delay = {original_delay:.1f}s → {endpointing_delay:.1f}s"
+                        f"Adaptive endpointing: {collision_multiplier:.2f}x delay = {original_delay:.1f}s → {endpointing_delay:.1f}s"
                     )
+
+            # Emit turn detection metrics if we have turn detection data
+            if turn_probability is not None and hasattr(self._hooks, 'emit_turn_detection_metrics'):
+                try:
+                    from ..metrics import TurnDetectionMetrics
+                    turn_metrics = TurnDetectionMetrics(
+                        timestamp=time.time(),
+                        probability=turn_probability,
+                        turn_ended=turn_ended_decision or False,  # Default to False if None
+                        inference_time=turn_inference_time or 0.0,
+                        endpointing_delay=endpointing_delay,
+                        collision_multiplier=collision_multiplier,
+                        speech_id=None  # Will be set by AgentActivity if available
+                    )
+                    self._hooks.emit_turn_detection_metrics(turn_metrics)
+                except Exception as e:
+                    # Graceful degradation - don't break existing functionality
+                    logger.debug(f"Failed to emit turn detection metrics: {e}")
 
             extra_sleep = last_speaking_time + endpointing_delay - time.time()
             await asyncio.sleep(max(extra_sleep, 0))

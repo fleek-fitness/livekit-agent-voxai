@@ -7,6 +7,7 @@ from .base import (
     ResponseLatencyMetrics,
     STTMetrics,
     ToolExecutionMetrics,
+    TurnDetectionMetrics,
     TTSMetrics,
     VADMetrics,
 )
@@ -20,6 +21,7 @@ __all__ = [
     "EOUMetrics",
     "STTMetrics",
     "TTSMetrics",
+    "TurnDetectionMetrics",
     "RealtimeModelMetrics",
     "ResponseLatencyMetrics",
     "AgentLLMMetrics",

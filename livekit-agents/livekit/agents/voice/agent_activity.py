@@ -1127,6 +1127,29 @@ class AgentActivity(RecognitionHooks):
     def retrieve_chat_ctx(self) -> llm.ChatContext:
         return self._agent.chat_ctx
 
+    def emit_turn_detection_metrics(self, metrics) -> None:
+        """Emit turn detection metrics through the session with speech correlation."""
+        try:
+            # Import here to avoid circular imports
+            from ..metrics import TurnDetectionMetrics
+            from .events import MetricsCollectedEvent
+            
+            # Ensure we have the right type (defensive programming)
+            if not isinstance(metrics, TurnDetectionMetrics):
+                logger.debug(f"Invalid metrics type: {type(metrics)}")
+                return
+            
+            # Set speech_id for correlation if we have current speech context
+            if self._current_speech is not None:
+                metrics.speech_id = self._current_speech.id
+            
+            # Emit through the session's metrics system
+            self._session.emit("metrics_collected", MetricsCollectedEvent(metrics=metrics))
+            
+        except Exception as e:
+            # Graceful degradation - don't break existing functionality
+            logger.debug(f"Failed to emit turn detection metrics: {e}")
+
     # endregion
 
     @utils.log_exceptions(logger=logger)
