@@ -1114,6 +1114,24 @@ class AgentActivity(RecognitionHooks):
             # lose data like the beginning of a user speech).
             speech_handle.interrupt()
 
+        # Emit TurnDetectionMetrics first if available
+        if info.turn_detection_data is not None:
+            try:
+                from ..metrics import TurnDetectionMetrics
+                turn_metrics = TurnDetectionMetrics(
+                    timestamp=time.time(),
+                    probability=info.turn_detection_data['probability'],
+                    turn_ended=info.turn_detection_data['turn_ended'],
+                    inference_time=info.turn_detection_data['inference_time'],
+                    endpointing_delay=info.turn_detection_data['endpointing_delay'],
+                    collision_multiplier=info.turn_detection_data['collision_multiplier'],
+                    speech_id=speech_handle.id,
+                )
+                self._session.emit("metrics_collected", MetricsCollectedEvent(metrics=turn_metrics))
+            except Exception as e:
+                logger.debug(f"Failed to emit turn detection metrics: {e}")
+
+        # Emit EOUMetrics immediately after
         eou_metrics = EOUMetrics(
             timestamp=time.time(),
             end_of_utterance_delay=info.end_of_utterance_delay,
@@ -1126,29 +1144,6 @@ class AgentActivity(RecognitionHooks):
     # AudioRecognition is calling this method to retrieve the chat context before running the TurnDetector model  # noqa: E501
     def retrieve_chat_ctx(self) -> llm.ChatContext:
         return self._agent.chat_ctx
-
-    def emit_turn_detection_metrics(self, metrics) -> None:
-        """Emit turn detection metrics through the session with speech correlation."""
-        try:
-            # Import here to avoid circular imports
-            from ..metrics import TurnDetectionMetrics
-            from .events import MetricsCollectedEvent
-            
-            # Ensure we have the right type (defensive programming)
-            if not isinstance(metrics, TurnDetectionMetrics):
-                logger.debug(f"Invalid metrics type: {type(metrics)}")
-                return
-            
-            # Set speech_id for correlation if we have current speech context
-            if self._current_speech is not None:
-                metrics.speech_id = self._current_speech.id
-            
-            # Emit through the session's metrics system
-            self._session.emit("metrics_collected", MetricsCollectedEvent(metrics=metrics))
-            
-        except Exception as e:
-            # Graceful degradation - don't break existing functionality
-            logger.debug(f"Failed to emit turn detection metrics: {e}")
 
     # endregion
 

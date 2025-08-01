@@ -26,6 +26,7 @@ class _EndOfTurnInfo:
     new_transcript: str
     transcription_delay: float
     end_of_utterance_delay: float
+    turn_detection_data: dict | None = None
 
 
 class _TurnDetector(Protocol):
@@ -45,10 +46,6 @@ class RecognitionHooks(Protocol):
     def on_end_of_turn(self, info: _EndOfTurnInfo) -> bool: ...
 
     def retrieve_chat_ctx(self) -> llm.ChatContext: ...
-    
-    def emit_turn_detection_metrics(self, metrics) -> None: 
-        """Emit turn detection metrics. Optional method for backward compatibility."""
-        ...
 
 
 class AudioRecognition:
@@ -378,23 +375,16 @@ class AudioRecognition:
                         f"Adaptive endpointing: {collision_multiplier:.2f}x delay = {original_delay:.1f}s → {endpointing_delay:.1f}s"
                     )
 
-            # Emit turn detection metrics if we have turn detection data
-            if turn_probability is not None and hasattr(self._hooks, 'emit_turn_detection_metrics'):
-                try:
-                    from ..metrics import TurnDetectionMetrics
-                    turn_metrics = TurnDetectionMetrics(
-                        timestamp=time.time(),
-                        probability=turn_probability,
-                        turn_ended=turn_ended_decision or False,  # Default to False if None
-                        inference_time=turn_inference_time or 0.0,
-                        endpointing_delay=endpointing_delay,
-                        collision_multiplier=collision_multiplier,
-                        speech_id=None  # Will be set by AgentActivity if available
-                    )
-                    self._hooks.emit_turn_detection_metrics(turn_metrics)
-                except Exception as e:
-                    # Graceful degradation - don't break existing functionality
-                    logger.debug(f"Failed to emit turn detection metrics: {e}")
+            # Store turn detection data to emit later with EOUMetrics
+            turn_detection_data = None
+            if turn_probability is not None:
+                turn_detection_data = {
+                    'probability': turn_probability,
+                    'turn_ended': turn_ended_decision or False,
+                    'inference_time': turn_inference_time or 0.0,
+                    'endpointing_delay': endpointing_delay,
+                    'collision_multiplier': collision_multiplier,
+                }
 
             extra_sleep = last_speaking_time + endpointing_delay - time.time()
             await asyncio.sleep(max(extra_sleep, 0))
@@ -409,6 +399,7 @@ class AudioRecognition:
                         self._last_final_transcript_time - last_speaking_time, 0
                     ),
                     end_of_utterance_delay=time.time() - last_speaking_time,
+                    turn_detection_data=turn_detection_data,
                 )
             )
             if committed:
