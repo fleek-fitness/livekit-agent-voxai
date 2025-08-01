@@ -72,7 +72,9 @@ class AudioRecognition:
         self._vad = vad
         self._turn_detection_mode = turn_detection_mode
         self._vad_base_turn_detection = turn_detection_mode in ("vad", None)
-        self._user_turn_committed = False  # true if user turn ended but EOU task not done
+        self._user_turn_committed = (
+            False  # true if user turn ended but EOU task not done
+        )
         self._sample_rate: int | None = None
 
         self._speaking = False
@@ -266,7 +268,10 @@ class AudioRecognition:
             self._hooks.on_interim_transcript(ev)
             self._audio_interim_transcript = ev.alternatives[0].text
 
-        elif ev.type == stt.SpeechEventType.END_OF_SPEECH and self._turn_detection_mode == "stt":
+        elif (
+            ev.type == stt.SpeechEventType.END_OF_SPEECH
+            and self._turn_detection_mode == "stt"
+        ):
             self._user_turn_committed = True
             if not self._speaking:
                 # start response after vad fires END_OF_SPEECH to avoid vad interruption
@@ -298,7 +303,11 @@ class AudioRecognition:
                 self._run_eou_detection(chat_ctx)
 
     def _run_eou_detection(self, chat_ctx: llm.ChatContext) -> None:
-        if self._stt and not self._audio_transcript and self._turn_detection_mode != "manual":
+        if (
+            self._stt
+            and not self._audio_transcript
+            and self._turn_detection_mode != "manual"
+        ):
             # stt enabled but no transcript yet
             return
 
@@ -316,24 +325,49 @@ class AudioRecognition:
 
             if turn_detector is not None:
                 if not turn_detector.supports_language(self._last_language):
-                    logger.debug("Turn detector does not support language %s", self._last_language)
+                    logger.debug(
+                        "Turn detector does not support language %s",
+                        self._last_language,
+                    )
                 else:
-                    end_of_turn_probability = await turn_detector.predict_end_of_turn(chat_ctx)
+                    end_of_turn_probability = await turn_detector.predict_end_of_turn(
+                        chat_ctx
+                    )
                     tracing.Tracing.log_event(
                         "end of user turn probability",
                         {"probability": end_of_turn_probability},
                     )
-                    unlikely_threshold = turn_detector.unlikely_threshold(self._last_language)
+                    unlikely_threshold = turn_detector.unlikely_threshold(
+                        self._last_language
+                    )
                     if (
                         unlikely_threshold is not None
                         and end_of_turn_probability < unlikely_threshold
                     ):
                         endpointing_delay = self._max_endpointing_delay
 
+            # 충돌 기반 적응형 엔드포인팅 적용 (Apply collision-based adaptive endpointing)
+            if hasattr(self._hooks, "_dynamic_interruption"):
+                multiplier = (
+                    self._hooks._dynamic_interruption.get_endpointing_multiplier()
+                )
+                if multiplier > 1.0:
+                    # 원본 지연시간 보존 (Preserve original delay for logging)
+                    original_delay = endpointing_delay
+                    if endpointing_delay < 1.0:
+                        endpointing_delay = 1.5
+                    # 배수 적용 후 안전 상한 (Apply multiplier with safety cap)
+                    endpointing_delay = min(endpointing_delay * multiplier, 4.0)
+                    logger.info(
+                        f"Adaptive endpointing: {multiplier:.2f}x delay = {original_delay:.1f}s → {endpointing_delay:.1f}s"
+                    )
+
             extra_sleep = last_speaking_time + endpointing_delay - time.time()
             await asyncio.sleep(max(extra_sleep, 0))
 
-            tracing.Tracing.log_event("end of user turn", {"transcript": self._audio_transcript})
+            tracing.Tracing.log_event(
+                "end of user turn", {"transcript": self._audio_transcript}
+            )
             committed = self._hooks.on_end_of_turn(
                 _EndOfTurnInfo(
                     new_transcript=self._audio_transcript,
@@ -353,7 +387,9 @@ class AudioRecognition:
             self._end_of_turn_task.cancel()
 
         # copy the last_speaking_time before awaiting (the value can change)
-        self._end_of_turn_task = asyncio.create_task(_bounce_eou_task(self._last_speaking_time))
+        self._end_of_turn_task = asyncio.create_task(
+            _bounce_eou_task(self._last_speaking_time)
+        )
 
     @utils.log_exceptions(logger=logger)
     async def _stt_task(
@@ -374,7 +410,9 @@ class AudioRecognition:
 
         if isinstance(node, AsyncIterable):
             async for ev in node:
-                assert isinstance(ev, stt.SpeechEvent), "STT node must yield SpeechEvent"
+                assert isinstance(
+                    ev, stt.SpeechEvent
+                ), "STT node must yield SpeechEvent"
                 await self._on_stt_event(ev)
 
     @utils.log_exceptions(logger=logger)
