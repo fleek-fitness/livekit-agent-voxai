@@ -143,28 +143,15 @@ class ConversationStateTracker:
         # Remove old collisions
         self.collision_memory = deque(t for t in self.collision_memory if t > cutoff)
 
-        if not self.collision_memory:
-            return 1.0  # No recent collisions
+        if len(self.collision_memory) < 2:
+            return 1.0  # Require at least 2 recent collisions to adapt
 
-        # 지수 감쇠 가중치: 최근 충돌일수록 지수적으로 높은 가중치
-        # (Exponential decay weighting: recent collisions weighted exponentially higher)
-        # 반감기 7초 = 한국어 전화번호 청킹 패턴에 최적화 (더 완만한 감쇠)
-        # (7-second half-life optimized for Korean phone number chunking patterns - gentler decay)
-        half_life = 7.0
-        decay_constant = math.log(2) / half_life  # λ = ln(2)/t₁/₂ = 0.099
-
-        # 기본 EMA 가중치 계산 (Basic EMA weight calculation)
-        basic_weighted_score = 0.0
-        for collision_time in self.collision_memory:
-            age = now - collision_time
-            # 지수 감쇠 공식: weight = e^(-λt)
-            # (Exponential decay formula: weight = e^(-λt))
-            # 예시: 2초 전 충돌 = e^(-0.099×2) = 0.82 (82% 가중치, 더 완만함)
-            weight = math.exp(-decay_constant * age)
-            basic_weighted_score += weight
+        # 최근성 제거: 모든 충돌을 동일 가중치(1.0)로 처리
+        # (No recency: treat every collision equally)
+        collision_count = len(self.collision_memory)
+        basic_weighted_score = float(collision_count)
 
         # 다중 충돌 패턴 감지 및 부스트 (Multi-collision pattern detection and boost)
-        collision_count = len(self.collision_memory)
 
         # 1. 충돌 밀도 부스트 (Collision density boost)
         # 더 많은 충돌 = 지수적으로 더 높은 가중치
@@ -197,24 +184,18 @@ class ConversationStateTracker:
             basic_weighted_score * density_multiplier * burst_boost
         )
 
-        # 프로덕션 음성 AI 최적화 보수적 함수
-        # (Production voice AI optimized conservative function)
-        # 연쇄 충돌과 데드 에어 문제 모두 방지
-        # (Prevents both collision cascades and dead air problems)
+        # 4. 2회부터 완만하게 증가하도록 곡선 재설계
+        # (Redesigned curve: start at 2.0x when c==2, then gently increase)
+        if collision_count == 2:
+            return 2.0
 
-        # 부드러운 시그모이드 곡선으로 점진적 적응
-        # (Gentler sigmoid curve for gradual adaptation)
-        steepness = 0.8  # 1.2에서 감소 → 더 점진적 반응
-        sigmoid_component = math.tanh(steepness * weighted_collision_score)
-
-        # 과도한 지연 방지를 위한 작은 로그 기여도
-        # (Smaller logarithmic contribution to prevent excessive delays)
-        log_component = 0.2 * math.log(1 + weighted_collision_score)
-
-        # 기본 스케일링: 기본 1.0배, 최대 3.0배
-        # (Standard scaling: base 1.0x, max 3.0x)
-        # 공식: multiplier = 1.0 + 1.5×tanh(0.8×score) + 0.2×ln(1+score)
-        multiplier = 1.0 + 1.5 * sigmoid_component + 0.2 * log_component
+        # Anchor the curve at the minimal 2-collision baseline score (≈3.0)
+        base_anchor = 3.0
+        steepness = 1.6  # steeper rise
+        sigmoid_component = math.tanh(
+            steepness * (weighted_collision_score - base_anchor)
+        )
+        multiplier = 2.0 + 1.0 * sigmoid_component
 
         # 실제 사례 검증 (Real Case Validation) - min=1.5s, max=2.0s 기준:
         #
@@ -234,7 +215,7 @@ class ConversationStateTracker:
 
         # 3.0배 상한 = 2.0초 × 3.0 = 6.0초 최대 대기 (충분한 인내심)
         # (3.0x cap = 2.0s × 3.0 = 6.0s maximum wait, provides sufficient patience)
-        return max(1.0, min(3.0, round(multiplier, 2)))
+        return max(2.0, min(3.0, round(multiplier, 2)))
 
 
 class DynamicInterruptionManager:
