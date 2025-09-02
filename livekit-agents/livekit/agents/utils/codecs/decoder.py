@@ -169,26 +169,8 @@ class AudioStreamDecoder:
         container: av.container.InputContainer | None = None
         resampler: av.AudioResampler | None = None
         try:
-            # open container in low-latency streaming mode
-            container = av.open(
-                self._input_buf,
-                mode="r",
-                format=self._av_format,
-                buffer_size=256,
-                options={
-                    "probesize": "32",
-                    "analyzeduration": "0",
-                    "fflags": "nobuffer+flush_packets",
-                    "flags": "low_delay",
-                    "reorder_queue_size": "0",
-                    "max_delay": "0",
-                    "avioflags": "direct",
-                },
-            )
-            # explicitly disable internal buffering flags on the FFmpeg container
-            container.flags |= cast(
-                int, av.container.Flags.no_buffer.value | av.container.Flags.flush_packets.value
-            )
+            # open container in simple, stable mode
+            container = av.open(self._input_buf, mode="r")
 
             if len(container.streams.audio) == 0:
                 raise ValueError("no audio stream found")
