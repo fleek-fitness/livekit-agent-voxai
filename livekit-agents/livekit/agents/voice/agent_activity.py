@@ -13,10 +13,13 @@ from .. import debug, llm, stt, tts, utils, vad
 from ..llm.tool_context import StopResponse
 from ..log import logger
 from ..metrics import (
+    AgentLLMMetrics,
     EOUMetrics,
     LLMMetrics,
     RealtimeModelMetrics,
+    ResponseLatencyMetrics,
     STTMetrics,
+    ToolExecutionMetrics,
     TTSMetrics,
     VADMetrics,
 )
@@ -45,10 +48,70 @@ from .generation import (
     update_instructions,
 )
 from .speech_handle import SpeechHandle
+from .dynamic_interruption import DynamicInterruptionManager
 
 
 def log_event(event: str, **kwargs: Any) -> None:
     debug.Tracing.log_event(event, kwargs)
+
+
+def _matches_ignore_words(
+    text: str, ignore_words: list[str] | None
+) -> bool:
+    """Check if the transcript is composed of repetitions of words/phrases that should be ignored for interruption."""
+    import string
+
+    if not ignore_words or not text:
+        return False
+
+    # Remove punctuation and convert to lowercase
+    text_cleaned = (
+        text.lower()
+        .strip()
+        .translate(str.maketrans("", "", string.punctuation))
+    )
+
+    if not text_cleaned:
+        return False
+
+    # This handles cases like "um ah" by treating them as "umah".
+    text_cleaned = "".join(text_cleaned.split())
+
+    if not text_cleaned:
+        return False
+
+    # Clean and prepare ignore words
+    cleaned_ignore_words = []
+    for w in ignore_words:
+        if w is None or not isinstance(w, str):
+            continue
+        cleaned_word = (
+            w.lower()
+            .strip()
+            .translate(str.maketrans("", "", string.punctuation))
+        )
+        if cleaned_word:
+            cleaned_ignore_words.append(cleaned_word)
+
+    if not cleaned_ignore_words:
+        return False
+
+    # DP approach to see if text_cleaned can be segmented by ignore words
+    dp = [False] * (len(text_cleaned) + 1)
+    dp[0] = True
+
+    for i in range(1, len(text_cleaned) + 1):
+        for word in cleaned_ignore_words:
+            if (
+                i >= len(word)
+                and dp[i - len(word)]
+                and text_cleaned[i - len(word) : i] == word
+            ):
+                dp[i] = True
+                break
+
+    return dp[len(text_cleaned)]
+
 
 
 if TYPE_CHECKING:
@@ -86,6 +149,13 @@ class AgentActivity(RecognitionHooks):
         self._turn_detection_mode = (
             self.turn_detection if isinstance(self.turn_detection, str) else None
         )
+        
+        # Add dynamic interruption manager
+        self._dynamic_interruption = DynamicInterruptionManager(sess.options)
+        
+        # Track end-to-end latency timing
+        self._last_eou_timestamp: float | None = None
+        self._agent_ttft_by_speech: dict[str, float] = {}
 
         if self._turn_detection_mode == "vad" and not self.vad:
             logger.warning("turn_detection is set to 'vad', but no VAD model is provided")
@@ -211,6 +281,14 @@ class AgentActivity(RecognitionHooks):
     @property
     def tools(self) -> list[llm.FunctionTool | llm.RawFunctionTool | mcp.MCPTool]:
         return self._agent.tools + self._mcp_tools  # type: ignore
+
+    @property
+    def min_consecutive_speech_delay(self) -> float:
+        return (
+            self._agent.min_consecutive_speech_delay
+            if is_given(self._agent.min_consecutive_speech_delay)
+            else self._session.options.min_consecutive_speech_delay
+        )
 
     async def update_instructions(self, instructions: str) -> None:
         self._agent._instructions = instructions
@@ -677,14 +755,20 @@ class AgentActivity(RecognitionHooks):
 
     @utils.log_exceptions(logger=logger)
     async def _main_task(self) -> None:
+        last_playout_ts = 0.0
         while True:
             await self._q_updated.wait()
             while self._speech_q:
                 _, _, speech = heapq.heappop(self._speech_q)
                 self._current_speech = speech
+                if self.min_consecutive_speech_delay > 0.0:
+                    await asyncio.sleep(
+                        self.min_consecutive_speech_delay - (time.time() - last_playout_ts)
+                    )
                 speech._authorize_playout()
                 await speech.wait_for_playout()
                 self._current_speech = None
+                last_playout_ts = time.time()
 
             # If we're draining and there are no more speech tasks, we can exit.
             # Only speech tasks can bypass draining to create a tool response
@@ -696,12 +780,33 @@ class AgentActivity(RecognitionHooks):
     # -- Realtime Session events --
 
     def _on_metrics_collected(
-        self, ev: STTMetrics | TTSMetrics | VADMetrics | LLMMetrics | RealtimeModelMetrics
+        self, ev: STTMetrics | TTSMetrics | VADMetrics | LLMMetrics | RealtimeModelMetrics | AgentLLMMetrics | ToolExecutionMetrics
     ) -> None:
         if (speech_handle := _SpeechHandleContextVar.get(None)) and (
-            isinstance(ev, LLMMetrics) or isinstance(ev, TTSMetrics)
+            isinstance(ev, (LLMMetrics, TTSMetrics, AgentLLMMetrics, ToolExecutionMetrics))
         ):
             ev.speech_id = speech_handle.id
+        
+        # Store agent TTFT metrics when received from AgentLLMMetrics
+        if isinstance(ev, AgentLLMMetrics) and ev.speech_id and ev.agent_ttft is not None:
+            self._agent_ttft_by_speech[ev.speech_id] = ev.agent_ttft
+            
+        # Track timing for end-to-end latency measurement
+        if self._last_eou_timestamp is not None and isinstance(ev, TTSMetrics) and ev.ttfb > 0:
+            # Calculate when first audio was produced
+            first_audio_timestamp = ev.timestamp - ev.duration + ev.ttfb
+            
+            # Get agent TTFT for this speech
+            speech_id = speech_handle.id if speech_handle else None
+            agent_ttft = self._agent_ttft_by_speech.get(speech_id) if speech_id else None
+            
+            self._emit_response_latency_metrics(
+                speech_id,
+                self._last_eou_timestamp,
+                first_audio_timestamp,
+                agent_ttft
+            )
+                
         self._session.emit("metrics_collected", MetricsCollectedEvent(metrics=ev))
 
     def _on_error(
@@ -785,6 +890,12 @@ class AgentActivity(RecognitionHooks):
         )
         self._schedule_speech(handle, SpeechHandle.SPEECH_PRIORITY_NORMAL)
 
+    def _update_agent_state(self, state: str) -> None:
+        """Update agent state and track for dynamic interruption."""
+        self._session._update_agent_state(state)
+        if state == "speaking":
+            self._dynamic_interruption.on_agent_speech_started()
+
     # region recognition hooks
 
     def on_start_of_speech(self, ev: vad.VADEvent) -> None:
@@ -792,6 +903,12 @@ class AgentActivity(RecognitionHooks):
 
     def on_end_of_speech(self, ev: vad.VADEvent) -> None:
         self._session._update_user_state("listening")
+        # Add dynamic interruption hook - track when user stops speaking
+        self._dynamic_interruption.on_user_speech_ended()
+        
+        # FIX: Use actual speech end time, accounting for VAD silence duration
+        actual_speech_end_time = time.time() - ev.silence_duration
+        self._last_eou_timestamp = actual_speech_end_time
 
     def on_vad_inference_done(self, ev: vad.VADEvent) -> None:
         if self._turn_detection_mode in ("manual", "realtime_llm"):
@@ -807,7 +924,7 @@ class AgentActivity(RecognitionHooks):
 
         if (
             self.stt is not None
-            and self._session.options.min_interruption_words > 0
+            and self._dynamic_interruption.get_current_min_interruption_words() > 0  # Use dynamic value
             and self._audio_recognition is not None
         ):
             text = self._audio_recognition.current_transcript
@@ -815,8 +932,18 @@ class AgentActivity(RecognitionHooks):
             # TODO(long): better word splitting for multi-language
             if (
                 len(split_words(text, split_character=True))
-                < self._session.options.min_interruption_words
+                < self._dynamic_interruption.get_current_min_interruption_words()  # Use dynamic value
             ):
+                return
+
+        # Check if the transcript matches ignore words
+        if (
+            self.stt is not None
+            and self._audio_recognition is not None
+            and self._session.options.interruption_ignore_words is not None
+        ):
+            text = self._audio_recognition.current_transcript
+            if _matches_ignore_words(text, self._session.options.interruption_ignore_words):
                 return
 
         if (
@@ -824,6 +951,15 @@ class AgentActivity(RecognitionHooks):
             and not self._current_speech.interrupted
             and self._current_speech.allow_interruptions
         ):
+            # Check if this is a continuation collision (user needed more time)
+            if self._dynamic_interruption.conversation_state.last_user_speech_end_time:
+                time_since_user_stopped = time.time() - self._dynamic_interruption.conversation_state.last_user_speech_end_time
+                
+                # If user stopped speaking < 5s ago, they likely needed more time
+                if time_since_user_stopped < 5.0:
+                    self._dynamic_interruption.record_continuation_collision()
+                    logger.debug(f"Continuation collision detected - user resumed after {time_since_user_stopped:.1f}s")
+            
             log_event(
                 "speech interrupted by vad",
                 speech_id=self._current_speech.id,
@@ -875,11 +1011,23 @@ class AgentActivity(RecognitionHooks):
             and self._current_speech is not None
             and self._current_speech.allow_interruptions
             and not self._current_speech.interrupted
-            and self._session.options.min_interruption_words > 0
+            and self._dynamic_interruption.get_current_min_interruption_words() > 0  # Use dynamic value
             and len(split_words(info.new_transcript, split_character=True))
-            < self._session.options.min_interruption_words
+            < self._dynamic_interruption.get_current_min_interruption_words()  # Use dynamic value
         ):
             # avoid interruption if the new_transcript is too short
+            return False
+
+        if (
+            self.stt is not None
+            and self._turn_detection_mode != "manual"
+            and self._current_speech is not None
+            and self._current_speech.allow_interruptions
+            and not self._current_speech.interrupted
+            and self._session.options.interruption_ignore_words is not None
+            and _matches_ignore_words(info.new_transcript, self._session.options.interruption_ignore_words)
+        ):
+            # avoid interruption if the new_transcript matches ignore words
             return False
 
         old_task = self._user_turn_completed_atask
@@ -1032,7 +1180,7 @@ class AgentActivity(RecognitionHooks):
             tasks.append(forward_text)
 
         def _on_first_frame(_: asyncio.Future[None]) -> None:
-            self._session._update_agent_state("speaking")
+            self._update_agent_state("speaking")
 
         if audio_output is None:
             # update the agent state based on text if no audio output
@@ -1084,7 +1232,7 @@ class AgentActivity(RecognitionHooks):
             speech_handle._set_chat_message(msg)
             self._session._conversation_item_added(msg)
 
-        self._session._update_agent_state("listening")
+        self._update_agent_state("listening")
 
     @utils.log_exceptions(logger=logger)
     async def _pipeline_reply_task(
@@ -1128,13 +1276,17 @@ class AgentActivity(RecognitionHooks):
             except ValueError:
                 logger.exception("failed to update the instructions")
 
-        self._session._update_agent_state("thinking")
+        self._agent._reply_chat_ctx = self._agent._chat_ctx.copy()
+        self._agent._reply_messages = []
+
+        self._update_agent_state("thinking")
         tasks: list[asyncio.Task[Any]] = []
         llm_task, llm_gen_data = perform_llm_inference(
             node=self._agent.llm_node,
             chat_ctx=chat_ctx,
             tool_ctx=tool_ctx,
             model_settings=model_settings,
+            session=self._session,
         )
         tasks.append(llm_task)
         tts_text_input, llm_output = utils.aio.itertools.tee(llm_gen_data.text_ch)
@@ -1169,7 +1321,7 @@ class AgentActivity(RecognitionHooks):
             tasks.append(forward_task)
 
         def _on_first_frame(_: asyncio.Future[None]) -> None:
-            self._session._update_agent_state("speaking")
+            self._update_agent_state("speaking")
 
         audio_out: _AudioOutput | None = None
         if audio_output is not None:
@@ -1201,7 +1353,7 @@ class AgentActivity(RecognitionHooks):
                 [asyncio.ensure_future(audio_output.wait_for_playout())]
             )
             if not speech_handle.interrupted:
-                self._session._update_agent_state("listening")
+                self._update_agent_state("listening")
 
         # add the tools messages that triggers this reply to the chat context
         if _tools_messages:
@@ -1209,6 +1361,7 @@ class AgentActivity(RecognitionHooks):
                 # reset the created_at to the reply start time
                 msg.created_at = reply_started_at
             self._agent._chat_ctx.insert(_tools_messages)
+            self._agent._reply_messages.extend(_tools_messages)
 
         if speech_handle.interrupted:
             await utils.aio.cancel_and_wait(*tasks)
@@ -1239,11 +1392,13 @@ class AgentActivity(RecognitionHooks):
                 created_at=reply_started_at,
             )
             self._agent._chat_ctx.insert(msg)
-            self._session._update_agent_state("listening")
+            self._agent._reply_messages.append(msg)
+            self._update_agent_state("listening")
             self._session._conversation_item_added(msg)
             speech_handle._set_chat_message(msg)
             speech_handle._mark_playout_done()
             await utils.aio.cancel_and_wait(exe_task)
+            self._agent.reply_callback(self._agent._reply_chat_ctx, self._agent._reply_messages)
             return
 
         if text_out and text_out.text:
@@ -1255,16 +1410,17 @@ class AgentActivity(RecognitionHooks):
                 created_at=reply_started_at,
             )
             self._agent._chat_ctx.insert(msg)
+            self._agent._reply_messages.append(msg)
             self._session._conversation_item_added(msg)
             speech_handle._set_chat_message(msg)
 
-        self._session._update_agent_state("listening")
+        self._update_agent_state("listening")
         log_event("playout completed", speech_id=speech_handle.id)
 
         speech_handle._mark_playout_done()  # mark the playout done before waiting for the tool execution  # noqa: E501
 
         tool_output.first_tool_fut.add_done_callback(
-            lambda _: self._session._update_agent_state("thinking")
+            lambda _: self._update_agent_state("thinking")
         )
         await exe_task
 
@@ -1359,6 +1515,10 @@ class AgentActivity(RecognitionHooks):
                 for msg in tool_messages:
                     msg.created_at = reply_started_at
                 self._agent._chat_ctx.insert(tool_messages)
+                self._agent._reply_messages.extend(tool_messages)
+
+        # Call the reply callback with the chat context and messages
+        self._agent.reply_callback(self._agent._reply_chat_ctx, self._agent._reply_messages)
 
     @utils.log_exceptions(logger=logger)
     async def _realtime_reply_task(
@@ -1444,7 +1604,7 @@ class AgentActivity(RecognitionHooks):
             return  # TODO(theomonnom): remove the message from the serverside history
 
         def _on_first_frame(_: asyncio.Future[None]) -> None:
-            self._session._update_agent_state("speaking")
+            self._update_agent_state("speaking")
 
         @utils.log_exceptions(logger=logger)
         async def _read_messages(
@@ -1516,7 +1676,7 @@ class AgentActivity(RecognitionHooks):
             await speech_handle.wait_if_not_interrupted(
                 [asyncio.ensure_future(audio_output.wait_for_playout())]
             )
-            self._session._update_agent_state("listening")
+            self._update_agent_state("listening")
 
         if speech_handle.interrupted:
             await utils.aio.cancel_and_wait(*tasks)
@@ -1576,7 +1736,7 @@ class AgentActivity(RecognitionHooks):
         speech_handle._mark_playout_done()  # mark the playout done before waiting for the tool execution  # noqa: E501
 
         tool_output.first_tool_fut.add_done_callback(
-            lambda _: self._session._update_agent_state("thinking")
+            lambda _: self._update_agent_state("thinking")
         )
         await exe_task
 
@@ -1665,7 +1825,39 @@ class AgentActivity(RecognitionHooks):
                     bypass_draining=True,
                 )
 
-    # move them to the end to avoid shadowing the same named modules for mypy
+    def _emit_response_latency_metrics(
+        self, 
+        speech_id: str | None, 
+        eou_timestamp: float,
+        first_audio_timestamp: float,
+        agent_ttft: float | None = None
+    ) -> None:
+        """Emit comprehensive end-to-end latency metrics."""
+        
+        # Calculate the complete end-to-end latency
+        e2e_latency = first_audio_timestamp - eou_timestamp
+        
+        response_latency_metrics = ResponseLatencyMetrics(
+            timestamp=time.time(),
+            speech_id=speech_id,
+            e2e_latency=e2e_latency,
+            eou_timestamp=eou_timestamp,
+            first_audio_timestamp=first_audio_timestamp,
+        )
+        
+        self._session.emit("metrics_collected", MetricsCollectedEvent(metrics=response_latency_metrics))
+        
+        # Log enhanced information for debugging
+        if agent_ttft:
+            logger.info(f"E2E Latency: {e2e_latency:.3f}s (Agent TTFT: {agent_ttft:.3f}s)")
+        else:
+            logger.info(f"E2E Latency: {e2e_latency:.3f}s")
+        
+        # Reset tracking for next response
+        self._last_eou_timestamp = None
+        if speech_id and speech_id in self._agent_ttft_by_speech:
+            del self._agent_ttft_by_speech[speech_id]
+
     @property
     def vad(self) -> vad.VAD | None:
         return self._agent.vad if is_given(self._agent.vad) else self._session.vad
