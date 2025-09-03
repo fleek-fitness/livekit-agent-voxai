@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncGenerator, AsyncIterable, Coroutine, Generator
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, Callable, Generic, TypeVar
 
 from livekit import rtc
 
@@ -66,6 +66,10 @@ class Agent:
         self._use_tts_aligned_transcript = use_tts_aligned_transcript
         self._min_endpointing_delay = min_endpointing_delay
         self._max_endpointing_delay = max_endpointing_delay
+
+        self._reply_chat_ctx: llm.ChatContext | None = None
+        self._reply_messages: list[llm.ChatItem] = []
+        self._reply_callbacks: list[Callable] = []
 
         if isinstance(mcp_servers, list) and len(mcp_servers) == 0:
             mcp_servers = None  # treat empty list as None (but keep NOT_GIVEN)
@@ -584,6 +588,20 @@ class Agent:
             NotGivenOr[bool]: Whether to use TTS-aligned transcript.
         """
         return self._use_tts_aligned_transcript
+
+    def reply_callback(self, chat_ctx: llm.ChatContext, replies: list[llm.ChatItem]) -> None:
+        """
+        Execute all registered reply callbacks with the provided chat context and replies.
+
+        Args:
+            chat_ctx (llm.ChatContext): The chat context associated with the reply.
+            replies (list[llm.ChatItem]): The list of chat items (replies) to process.
+        """
+        if not replies:
+            return
+
+        for callback in self._reply_callbacks:
+            callback(chat_ctx, replies)
 
     @property
     def session(self) -> AgentSession:

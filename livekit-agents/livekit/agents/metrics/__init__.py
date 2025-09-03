@@ -1,9 +1,12 @@
 from .base import (
     AgentMetrics,
+    AgentLLMMetrics,
     EOUMetrics,
     LLMMetrics,
     RealtimeModelMetrics,
+    ResponseLatencyMetrics,
     STTMetrics,
+    ToolExecutionMetrics,
     TTSMetrics,
     VADMetrics,
 )
@@ -18,6 +21,9 @@ __all__ = [
     "STTMetrics",
     "TTSMetrics",
     "RealtimeModelMetrics",
+    "ResponseLatencyMetrics",
+    "AgentLLMMetrics",
+    "ToolExecutionMetrics",
     "UsageSummary",
     "UsageCollector",
     "log_metrics",

@@ -168,6 +168,7 @@ class ChunkedStream(ABC):
         """Task used to collect metrics"""
 
         start_time = time.perf_counter()
+        logger.info(f"TTFB measurement started for non-streaming TTS at {time.time()}")
         audio_duration = 0.0
         ttfb = -1.0
         request_id = ""
@@ -410,6 +411,7 @@ class SynthesizeStream(ABC):
         # only set the started time once, it'll get reset after we emit metrics
         if self._started_time == 0:
             self._started_time = time.perf_counter()
+            logger.info(f"TTFB measurement started for streaming TTS at {time.time()}")
 
     async def _metrics_monitor_task(self, event_aiter: AsyncIterable[SynthesizedAudio]) -> None:
         """Task used to collect metrics"""

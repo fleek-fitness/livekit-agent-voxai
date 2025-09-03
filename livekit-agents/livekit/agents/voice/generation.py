@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import functools
 import inspect
 import json
+import time
 from collections.abc import AsyncIterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Optional, Protocol, runtime_checkable
@@ -27,15 +29,22 @@ from ..llm.tool_context import (
     is_raw_function_tool,
 )
 from ..log import logger
+from ..metrics import AgentLLMMetrics, ToolExecutionMetrics
 from ..telemetry import trace_types, tracer
 from ..types import USERDATA_TIMED_TRANSCRIPT, NotGivenOr
 from ..utils import aio
 from . import io
+from .events import MetricsCollectedEvent
 from .speech_handle import SpeechHandle
 
 if TYPE_CHECKING:
     from .agent import Agent, ModelSettings
     from .agent_session import AgentSession
+
+
+# Import the speech handle context variable (defined in agent_activity.py)
+# We'll access it by importing it from there
+_SpeechHandleContextVar = contextvars.ContextVar["SpeechHandle"]("agents_speech_handle")
 
 
 @runtime_checkable
@@ -51,6 +60,7 @@ class _LLMGenerationData:
     generated_functions: list[llm.FunctionCall] = field(default_factory=list)
     id: str = field(default_factory=lambda: utils.shortuuid("item_"))
     started_fut: asyncio.Future[None] = field(default_factory=asyncio.Future)
+    agent_ttft: float | None = None
 
 
 def perform_llm_inference(
@@ -59,12 +69,13 @@ def perform_llm_inference(
     chat_ctx: ChatContext,
     tool_ctx: ToolContext,
     model_settings: ModelSettings,
+    session: AgentSession | None = None,
 ) -> tuple[asyncio.Task[bool], _LLMGenerationData]:
     text_ch = aio.Chan[str]()
     function_ch = aio.Chan[llm.FunctionCall]()
     data = _LLMGenerationData(text_ch=text_ch, function_ch=function_ch)
     llm_task = asyncio.create_task(
-        _llm_inference_task(node, chat_ctx, tool_ctx, model_settings, data)
+        _llm_inference_task(node, chat_ctx, tool_ctx, model_settings, data, session)
     )
     llm_task.add_done_callback(lambda _: text_ch.close())
     llm_task.add_done_callback(lambda _: function_ch.close())
@@ -86,7 +97,12 @@ async def _llm_inference_task(
     tool_ctx: ToolContext,
     model_settings: ModelSettings,
     data: _LLMGenerationData,
+    session: AgentSession | None = None,
 ) -> bool:
+    # Start timing for agent LLM metrics
+    agent_llm_start_time = time.time()
+    ttft_captured = False
+
     current_span = trace.get_current_span()
     data.started_fut.set_result(None)
 
@@ -103,14 +119,37 @@ async def _llm_inference_task(
         trace_types.ATTR_FUNCTION_TOOLS, json.dumps(list(tool_ctx.function_tools.keys()))
     )
 
+    # Measure custom node execution overhead
+    node_start = time.time()
     llm_node = node(chat_ctx, tools, model_settings)
     if asyncio.iscoroutine(llm_node):
         llm_node = await llm_node
+    node_exec_time = time.time() - node_start
 
-    # update the tool context after llm node
     tool_ctx.update_tools(tools)
 
     if isinstance(llm_node, str):
+        # For non-streaming responses, TTFT is the total time to get response
+        if not ttft_captured:
+            data.agent_ttft = time.time() - agent_llm_start_time
+            # Log detailed overhead breakdown for non-streaming agent TTFT
+            logger.info("=== Non-Streaming Agent TTFT Breakdown ===")
+            logger.info(f"Total Agent TTFT: {data.agent_ttft * 1000:.1f}ms")
+            logger.info(f" - Node exec: {node_exec_time * 1000:.1f}ms")
+            logger.info("  (Non-streaming: TTFT = Total Time)")
+            logger.info("==========================================")
+            # Emit AgentLLMMetrics immediately with agent_ttft for non-streaming
+            if session is not None:
+                speech_handle = _SpeechHandleContextVar.get(None)
+                agent_llm_metrics = AgentLLMMetrics(
+                    timestamp=time.time(),
+                    speech_id=speech_handle.id if speech_handle else None,
+                    agent_ttft=data.agent_ttft,
+                    llm_node_await=node_exec_time,
+                    request_id=data.id,
+                )
+                session.emit("metrics_collected", MetricsCollectedEvent(metrics=agent_llm_metrics))
+
         data.generated_text = llm_node
         text_ch.send_nowait(llm_node)
         current_span.set_attribute(trace_types.ATTR_RESPONSE_TEXT, data.generated_text)
@@ -121,7 +160,50 @@ async def _llm_inference_task(
 
     # forward llm stream to output channels
     try:
+        first_chunk_time = None
         async for chunk in llm_node:
+            # Capture first non-content chunk arrival time
+            if first_chunk_time is None:
+                first_chunk_time = time.time() - agent_llm_start_time
+
+            # Capture first meaningful token for TTFT measurement
+            if not ttft_captured:
+                has_content = False
+                if isinstance(chunk, str) and chunk.strip():
+                    has_content = True
+                elif isinstance(chunk, ChatChunk) and chunk.delta and chunk.delta.content:
+                    has_content = True
+
+                if has_content:
+                    agent_ttft = time.time() - agent_llm_start_time
+                    data.agent_ttft = agent_ttft
+                    ttft_captured = True
+
+                    # Log detailed overhead breakdown for agent TTFT
+                    streaming_overhead = agent_ttft - node_exec_time
+                    first_to_content = agent_ttft - first_chunk_time if first_chunk_time else 0
+                    logger.info("=== Agent TTFT Breakdown ===")
+                    logger.info(f"Total Agent TTFT: {agent_ttft * 1000:.1f}ms")
+                    logger.info(f"    - Node exec: {node_exec_time * 1000:.1f}ms")
+                    logger.info(f"  First Chunk Arrival: {first_chunk_time * 1000:.1f}ms")
+                    logger.info(f"  First Chunk to Content: {first_to_content * 1000:.1f}ms")
+                    logger.info(f"  Streaming to First Token: {streaming_overhead * 1000:.1f}ms")
+                    logger.info("==============================")
+
+                    # Emit AgentLLMMetrics immediately with agent_ttft
+                    if session is not None:
+                        speech_handle = _SpeechHandleContextVar.get(None)
+                        agent_llm_metrics = AgentLLMMetrics(
+                            timestamp=time.time(),
+                            speech_id=speech_handle.id if speech_handle else None,
+                            agent_ttft=agent_ttft,
+                            llm_node_await=node_exec_time,
+                            request_id=data.id,
+                        )
+                        session.emit(
+                            "metrics_collected", MetricsCollectedEvent(metrics=agent_llm_metrics)
+                        )
+
             # io.LLMNode can either return a string or a ChatChunk
             if isinstance(chunk, str):
                 data.generated_text += chunk
@@ -371,6 +453,11 @@ async def _execute_tools_task(
     from .agent import _set_activity_task_info
     from .events import RunContext
 
+    # Tool execution tracking
+    tool_execution_start_time = time.time()
+    executed_tools: list[str] = []
+    tool_durations: dict[str, float] = {}
+
     def _tool_completed(out: ToolExecutionOutput) -> None:
         tool_execution_completed_cb(out)
         tool_output.output.append(out)
@@ -539,6 +626,7 @@ async def _execute_tools_task(
                     task, speech_handle=speech_handle, function_call=fnc_call, inline_task=True
                 )
                 tasks.append(task)
+                executed_tools.append(fnc_call.name)
                 task.add_done_callback(lambda task: tasks.remove(task))
             except Exception as e:
                 # catching exceptions here because even though the function is asynchronous,
@@ -569,6 +657,19 @@ async def _execute_tools_task(
             await asyncio.gather(*tasks)
     finally:
         await utils.aio.cancel_and_wait(*tasks)
+
+        # Calculate total tool execution time
+        total_execution_time = time.time() - tool_execution_start_time
+        # Emit tool execution metrics if any tools were executed
+        if len(executed_tools) > 0:
+            tool_metrics = ToolExecutionMetrics(
+                timestamp=time.time(),
+                speech_id=speech_handle.id,
+                total_execution_time=total_execution_time,
+                tool_durations=tool_durations,
+            )
+
+            session.emit("metrics_collected", MetricsCollectedEvent(metrics=tool_metrics))
 
         if len(tool_output.output) > 0:
             logger.debug(
