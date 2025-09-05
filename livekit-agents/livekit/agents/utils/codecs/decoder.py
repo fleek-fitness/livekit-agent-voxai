@@ -20,10 +20,7 @@ import struct
 import threading
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
-from typing import cast
-
 import av
-import av.container
 
 from livekit import rtc
 
@@ -169,26 +166,9 @@ class AudioStreamDecoder:
         container: av.container.InputContainer | None = None
         resampler: av.AudioResampler | None = None
         try:
-            # open container in low-latency streaming mode
-            container = av.open(
-                self._input_buf,
-                mode="r",
-                format=self._av_format,
-                buffer_size=256,
-                options={
-                    "probesize": "32",
-                    "analyzeduration": "0",
-                    "fflags": "nobuffer+flush_packets",
-                    "flags": "low_delay",
-                    "reorder_queue_size": "0",
-                    "max_delay": "0",
-                    "avioflags": "direct",
-                },
-            )
-            # explicitly disable internal buffering flags on the FFmpeg container
-            container.flags |= cast(
-                int, av.container.Flags.no_buffer.value | av.container.Flags.flush_packets.value
-            )
+            # Simple, stable configuration - removed aggressive low-latency options
+            # that were causing STT latency issues due to event loop contention
+            container = av.open(self._input_buf, mode="r")
 
             if len(container.streams.audio) == 0:
                 raise ValueError("no audio stream found")
