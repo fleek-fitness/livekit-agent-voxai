@@ -66,6 +66,10 @@ class _ParticipantAudioOutput(io.AudioOutput):
             await self._publication.wait_for_subscription()
             if not self._subscribed_fut.done():
                 self._subscribed_fut.set_result(None)
+            logger.info(
+                "Sink track published and subscribed",
+                extra={"track": self._track_name},
+            )
 
     @property
     def subscribed(self) -> asyncio.Future[None]:
@@ -99,6 +103,11 @@ class _ParticipantAudioOutput(io.AudioOutput):
         for f in self._audio_bstream.push(frame.data):
             await self._audio_buf.send(f)
             self._pushed_duration += f.duration
+        if self._pushed_duration == frame.duration:
+            logger.info(
+                "Sink first frame",
+                extra={"sr": frame.sample_rate, "ch": frame.num_channels},
+            )
 
     def flush(self) -> None:
         super().flush()
@@ -108,6 +117,7 @@ class _ParticipantAudioOutput(io.AudioOutput):
             self._pushed_duration += f.duration
 
         if not self._pushed_duration:
+            logger.info("Sink flush start", extra={"pushed_duration": self._pushed_duration})
             return
 
         if self._flush_task and not self._flush_task.done():
@@ -116,6 +126,7 @@ class _ParticipantAudioOutput(io.AudioOutput):
             self._flush_task.cancel()
 
         self._flush_task = asyncio.create_task(self._wait_for_playout())
+        logger.info("Sink flush start", extra={"pushed_duration": self._pushed_duration})
 
     def clear_buffer(self) -> None:
         self._audio_bstream.clear()
@@ -128,10 +139,12 @@ class _ParticipantAudioOutput(io.AudioOutput):
         super().pause()
         self._playback_enabled.clear()
         # self._audio_source.clear_queue()
+        logger.info("Sink pause")
 
     def resume(self) -> None:
         super().resume()
         self._playback_enabled.set()
+        logger.info("Sink resume")
 
     async def _wait_for_playout(self) -> None:
         wait_for_interruption = asyncio.create_task(self._interrupted_event.wait())
@@ -166,6 +179,10 @@ class _ParticipantAudioOutput(io.AudioOutput):
         self._pushed_duration = 0
         self._interrupted_event.clear()
         self.on_playback_finished(playback_position=pushed_duration, interrupted=interrupted)
+        logger.info(
+            "Sink playout finished",
+            extra={"interrupted": interrupted, "played": pushed_duration},
+        )
 
     async def _forward_audio(self) -> None:
         async for frame in self._audio_buf:

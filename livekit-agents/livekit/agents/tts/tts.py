@@ -655,6 +655,11 @@ class AudioEmitter:
         if self._write_ch.closed:
             return
 
+        logger.info(
+            "Emitter segment start",
+            extra={"seg": segment_id, "req": self._request_id},
+        )
+
         self._num_segments += 1
         self._write_ch.send_nowait(self._StartSegment(segment_id=segment_id))
 
@@ -673,6 +678,8 @@ class AudioEmitter:
 
         if self._write_ch.closed:
             return
+
+        logger.info("Emitter segment end", extra={"req": self._request_id})
 
         self._write_ch.send_nowait(self._EndSegment())
 
@@ -749,9 +756,11 @@ class AudioEmitter:
                     last_frame = frame
                     return
                 elif segment_ctx.audio_duration > 0:
+                    # Always emit at least a 10ms silent frame to close the segment if no frames were produced.
+                    # This guarantees downstream playout signaling even for fully silent responses.
                     if frame is None:
                         # NOTE: if end_input called after flush with no new audio frames pushed,
-                        # it will create a 0.01s empty frame to indicate the end of the segment
+                        # inject a 0.01s empty frame to indicate the end of the segment
                         frame = rtc.AudioFrame(
                             data=b"\0\0" * (self._sample_rate // 100 * self._num_channels),
                             sample_rate=self._sample_rate,
@@ -818,6 +827,15 @@ class AudioEmitter:
 
             if lk_dump_tts:
                 debug_frames.append(last_frame)
+
+            logger.info(
+                "Emitter flush",
+                extra={
+                    "seg": segment_ctx.segment_id,
+                    "req": self._request_id,
+                    "audio_dur": segment_ctx.audio_duration,
+                },
+            )
 
             last_frame = None
 
@@ -938,6 +956,14 @@ class AudioEmitter:
                                 audio_decoder.end_input()
                                 await decode_atask
                             _emit_frame(is_final=True)
+                            logger.info(
+                                "Emitter segment finalized",
+                                extra={
+                                    "seg": segment_ctx.segment_id,
+                                    "req": self._request_id,
+                                    "audio_dur": segment_ctx.audio_duration,
+                                },
+                            )
                             dump_segment()
                             audio_decoder = segment_ctx = audio_byte_stream = last_frame = None
                         else:
