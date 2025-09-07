@@ -755,7 +755,8 @@ class AudioEmitter:
                 if not is_final:
                     last_frame = frame
                     return
-                elif segment_ctx.audio_duration > 0:
+                # elif segment_ctx.audio_duration > 0:
+                else:
                     # Always emit at least a 10ms silent frame to close the segment if no frames were produced.
                     # This guarantees downstream playout signaling even for fully silent responses.
                     if frame is None:
