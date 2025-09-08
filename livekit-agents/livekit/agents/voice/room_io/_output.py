@@ -132,6 +132,8 @@ class _ParticipantAudioOutput(io.AudioOutput):
         self._audio_bstream.clear()
 
         if not self._pushed_duration:
+            # even if no audio was pushed, signal completion to unblock waiters
+            self.on_playback_finished(playback_position=0.0, interrupted=False)
             return
         self._interrupted_event.set()
 
@@ -187,7 +189,7 @@ class _ParticipantAudioOutput(io.AudioOutput):
     async def _forward_audio(self) -> None:
         async for frame in self._audio_buf:
             if not self._playback_enabled.is_set():
-                self._audio_source.clear_queue()
+                # do not clear queue on pause; keep frames and resume later
                 await self._playback_enabled.wait()
                 # TODO(long): save the frames in the queue and play them later
                 # TODO(long): ignore frames from previous syllable
