@@ -1021,7 +1021,11 @@ class AgentActivity(RecognitionHooks):
                         self._current_speech = None
                         continue
                 speech._authorize_generation()
+                _gen_wait_start = time.perf_counter()
                 await speech._wait_for_generation()
+                _gen_wait = (time.perf_counter() - _gen_wait_start) * 1000.0
+                if _gen_wait > 100.0:
+                    logger.debug(f"speech_generation_blocked speech_id={speech.id} wait_ms={_gen_wait:.1f}")
                 self._current_speech = None
                 last_playout_ts = time.time()
 

@@ -253,6 +253,9 @@ class ChunkedStream(tts.ChunkedStream):
 
     async def _run(self, output_emitter: tts.AudioEmitter) -> None:
         try:
+            logger.info(
+                f"tts_req provider={self._tts.provider} model={self._tts.model} encoding={self._opts.encoding} sample_rate={self._opts.sample_rate}"
+            )
             if self._opts.use_markup:
                 tts_input = texttospeech.SynthesisInput(
                     markup=self._input_text, custom_pronunciations=self._opts.custom_pronunciations
@@ -363,6 +366,9 @@ class SynthesizeStream(tts.SynthesizeStream):
         output_emitter: tts.AudioEmitter,
         streaming_config: texttospeech.StreamingSynthesizeConfig,
     ) -> None:
+        logger.info(
+            f"tts_req provider={self._tts.provider} model={self._tts.model} streaming_encoding={streaming_config.streaming_audio_config.audio_encoding} sample_rate={streaming_config.streaming_audio_config.sample_rate_hertz}"
+        )
         @utils.log_exceptions(logger=logger)
         async def input_generator() -> AsyncGenerator[
             texttospeech.StreamingSynthesizeRequest, None
@@ -390,7 +396,14 @@ class SynthesizeStream(tts.SynthesizeStream):
             )
             output_emitter.start_segment(segment_id=utils.shortuuid())
 
+            bytes_in = 0
+            last_log = time.perf_counter()
             async for resp in stream:
+                if resp.audio_content:
+                    bytes_in += len(resp.audio_content)
+                    if time.perf_counter() - last_log >= 0.2:
+                        logger.debug(f"tts_rx provider={self._tts.provider} bytes={bytes_in}")
+                        last_log = time.perf_counter()
                 output_emitter.push(resp.audio_content)
 
             output_emitter.end_segment()

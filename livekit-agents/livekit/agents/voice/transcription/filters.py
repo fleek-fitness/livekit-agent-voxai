@@ -1,6 +1,9 @@
 import re
+import time
 from collections.abc import AsyncIterable, Sequence
 from typing import Literal
+
+from ...log import logger
 
 TextTransforms = Literal["filter_markdown", "filter_emoji"]
 
@@ -62,6 +65,7 @@ async def filter_markdown(text: AsyncIterable[str]) -> AsyncIterable[str]:
     Filter out markdown symbols from the text.
     """
 
+    last_emit_time = time.perf_counter()
     def has_incomplete_pattern(buffer: str) -> bool:
         """Check if buffer might contain incomplete markdown patterns that need more text."""
 
@@ -129,6 +133,12 @@ async def filter_markdown(text: AsyncIterable[str]) -> AsyncIterable[str]:
             for i, line in enumerate(lines[:-1]):
                 is_newline = buffer_is_newline if i == 0 else True
                 processed_line = process_complete_text(line, is_newline=is_newline)
+                emit_delay = time.perf_counter() - last_emit_time
+                if emit_delay > 0.05:
+                    logger.debug(
+                        f"md_filter_emit delay_ms={emit_delay*1000:.1f} buffer_len={len(line)} preview='{line[:40]}'"
+                    )
+                last_emit_time = time.perf_counter()
                 yield processed_line + "\n"
 
             buffer_is_newline = True
@@ -145,11 +155,22 @@ async def filter_markdown(text: AsyncIterable[str]) -> AsyncIterable[str]:
             processable = buffer[:last_split_pos]  # exclude the split token
             rest = buffer[last_split_pos:]
             if not has_incomplete_pattern(processable):
+                emit_delay = time.perf_counter() - last_emit_time
+                if emit_delay > 0.05:
+                    logger.debug(
+                        f"md_filter_emit delay_ms={emit_delay*1000:.1f} buffer_len={len(processable)} preview='{processable[:40]}'"
+                    )
+                last_emit_time = time.perf_counter()
                 yield process_complete_text(processable, is_newline=buffer_is_newline)
                 buffer = rest
                 buffer_is_newline = False
 
     if buffer:
+        emit_delay = time.perf_counter() - last_emit_time
+        if emit_delay > 0.05:
+            logger.debug(
+                f"md_filter_emit_final delay_ms={emit_delay*1000:.1f} buffer_len={len(buffer)} preview='{buffer[:40]}'"
+            )
         yield process_complete_text(buffer, is_newline=buffer_is_newline)
 
 
