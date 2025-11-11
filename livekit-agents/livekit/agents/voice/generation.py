@@ -97,9 +97,12 @@ async def _llm_inference_task(
     data.started_fut.set_result(None)
 
     text_ch, function_ch = data.text_ch, data.function_ch
-    tools = list(tool_ctx.function_tools.values())
     agent_llm_start_time = time.time()
     ttft_captured = False
+
+    tools_start = time.time()
+    tools = list(tool_ctx.function_tools.values())
+    tools_prep_time = time.time() - tools_start
 
     current_span.set_attribute(
         trace_types.ATTR_CHAT_CTX,
@@ -111,35 +114,59 @@ async def _llm_inference_task(
         trace_types.ATTR_FUNCTION_TOOLS, json.dumps(list(tool_ctx.function_tools.keys()))
     )
 
+    llm_node_start = time.time()
     llm_node = node(chat_ctx, tools, model_settings)
     if asyncio.iscoroutine(llm_node):
         llm_node = await llm_node
+    node_exec_time = time.time() - llm_node_start
 
     # update the tool context after llm node
+    tool_update_start = time.time()
     tool_ctx.update_tools(tools)
+    tool_update_time = time.time() - tool_update_start
+
+    total_prep_overhead = tools_prep_time + node_exec_time + tool_update_time
+    logger.debug(
+        "Agent LLM Preparation Overhead: %.1fms (Tools: %.1fms, Node: %.1fms, Update: %.1fms)",
+        total_prep_overhead * 1000,
+        tools_prep_time * 1000,
+        node_exec_time * 1000,
+        tool_update_time * 1000,
+    )
 
     if isinstance(llm_node, str):
         data.generated_text = llm_node
         text_ch.send_nowait(llm_node)
         current_span.set_attribute(trace_types.ATTR_RESPONSE_TEXT, data.generated_text)
         # Non-streaming TTFT
-        if not ttft_captured and session is not None:
+        if not ttft_captured:
             agent_ttft = time.time() - agent_llm_start_time
             ttft_captured = True
-            try:
-                session.emit(
-                    "metrics_collected",
-                    MetricsCollectedEvent(
-                        metrics=AgentLLMMetrics(
-                            timestamp=time.time(),
-                            speech_id=None,
-                            agent_ttft=agent_ttft,
-                            llm_node_await=None,
-                        )
-                    ),
-                )
-            except Exception:
-                pass
+
+            logger.info("=== Non-Streaming Agent TTFT Breakdown ===")
+            logger.info("Total Agent TTFT: %.1fms", agent_ttft * 1000)
+            logger.info("  Preparation Overhead: %.1fms", total_prep_overhead * 1000)
+            logger.info("    - Tools prep: %.1fms", tools_prep_time * 1000)
+            logger.info("    - Node exec: %.1fms", node_exec_time * 1000)
+            logger.info("    - Tool update: %.1fms", tool_update_time * 1000)
+            logger.info("  (Non-streaming: TTFT = Total Time)")
+            logger.info("==========================================")
+
+            if session is not None:
+                try:
+                    session.emit(
+                        "metrics_collected",
+                        MetricsCollectedEvent(
+                            metrics=AgentLLMMetrics(
+                                timestamp=time.time(),
+                                speech_id=None,
+                                agent_ttft=agent_ttft,
+                                llm_node_await=node_exec_time,
+                            )
+                        ),
+                    )
+                except Exception:
+                    pass
         return True
 
     if not isinstance(llm_node, AsyncIterable):
@@ -147,28 +174,48 @@ async def _llm_inference_task(
 
     # forward llm stream to output channels
     try:
+        first_chunk_elapsed: float | None = None
         async for chunk in llm_node:
+            if first_chunk_elapsed is None:
+                first_chunk_elapsed = time.time() - agent_llm_start_time
             # io.LLMNode can either return a string or a ChatChunk
             if isinstance(chunk, str):
                 data.generated_text += chunk
                 text_ch.send_nowait(chunk)
-                if not ttft_captured and session is not None and chunk.strip():
+                if not ttft_captured and chunk.strip():
                     agent_ttft = time.time() - agent_llm_start_time
                     ttft_captured = True
-                    try:
-                        session.emit(
-                            "metrics_collected",
-                            MetricsCollectedEvent(
-                                metrics=AgentLLMMetrics(
-                                    timestamp=time.time(),
-                                    speech_id=None,
-                                    agent_ttft=agent_ttft,
-                                    llm_node_await=None,
+                    streaming_overhead = max(agent_ttft - total_prep_overhead, 0.0)
+                    first_to_content = max(agent_ttft - (first_chunk_elapsed or 0.0), 0.0)
+                    logger.info("=== Agent TTFT Breakdown ===")
+                    logger.info("Total Agent TTFT: %.1fms", agent_ttft * 1000)
+                    logger.info("  Preparation Overhead: %.1fms", total_prep_overhead * 1000)
+                    logger.info("    - Tools prep: %.1fms", tools_prep_time * 1000)
+                    logger.info("    - Node exec: %.1fms", node_exec_time * 1000)
+                    logger.info("    - Tool update: %.1fms", tool_update_time * 1000)
+                    logger.info(
+                        "  First Chunk Arrival: %.1fms",
+                        (first_chunk_elapsed or 0.0) * 1000,
+                    )
+                    logger.info("  First Chunk to Content: %.1fms", first_to_content * 1000)
+                    logger.info("  Streaming to First Token: %.1fms", streaming_overhead * 1000)
+                    logger.info("================================")
+
+                    if session is not None:
+                        try:
+                            session.emit(
+                                "metrics_collected",
+                                MetricsCollectedEvent(
+                                    metrics=AgentLLMMetrics(
+                                        timestamp=time.time(),
+                                        speech_id=None,
+                                        agent_ttft=agent_ttft,
+                                        llm_node_await=node_exec_time,
+                                    )
                                 )
-                            ),
-                        )
-                    except Exception:
-                        pass
+                            )
+                        except Exception:
+                            pass
 
             elif isinstance(chunk, ChatChunk):
                 if not chunk.delta:
@@ -191,23 +238,42 @@ async def _llm_inference_task(
                 if chunk.delta.content:
                     data.generated_text += chunk.delta.content
                     text_ch.send_nowait(chunk.delta.content)
-                    if not ttft_captured and session is not None and chunk.delta.content.strip():
+                    if not ttft_captured and chunk.delta.content.strip():
                         agent_ttft = time.time() - agent_llm_start_time
                         ttft_captured = True
-                        try:
-                            session.emit(
-                                "metrics_collected",
-                                MetricsCollectedEvent(
-                                    metrics=AgentLLMMetrics(
-                                        timestamp=time.time(),
-                                        speech_id=None,
-                                        agent_ttft=agent_ttft,
-                                        llm_node_await=None,
+                        streaming_overhead = max(agent_ttft - total_prep_overhead, 0.0)
+                        first_to_content = max(agent_ttft - (first_chunk_elapsed or 0.0), 0.0)
+                        logger.info("=== Agent TTFT Breakdown ===")
+                        logger.info("Total Agent TTFT: %.1fms", agent_ttft * 1000)
+                        logger.info("  Preparation Overhead: %.1fms", total_prep_overhead * 1000)
+                        logger.info("    - Tools prep: %.1fms", tools_prep_time * 1000)
+                        logger.info("    - Node exec: %.1fms", node_exec_time * 1000)
+                        logger.info("    - Tool update: %.1fms", tool_update_time * 1000)
+                        logger.info(
+                            "  First Chunk Arrival: %.1fms",
+                            (first_chunk_elapsed or 0.0) * 1000,
+                        )
+                        logger.info("  First Chunk to Content: %.1fms", first_to_content * 1000)
+                        logger.info(
+                            "  Streaming to First Token: %.1fms", streaming_overhead * 1000
+                        )
+                        logger.info("================================")
+
+                        if session is not None:
+                            try:
+                                session.emit(
+                                    "metrics_collected",
+                                    MetricsCollectedEvent(
+                                        metrics=AgentLLMMetrics(
+                                            timestamp=time.time(),
+                                            speech_id=None,
+                                            agent_ttft=agent_ttft,
+                                            llm_node_await=node_exec_time,
+                                        )
                                     )
-                                ),
-                            )
-                        except Exception:
-                            pass
+                                )
+                            except Exception:
+                                pass
             else:
                 logger.warning(
                     f"LLM node returned an unexpected type: {type(chunk)}",
