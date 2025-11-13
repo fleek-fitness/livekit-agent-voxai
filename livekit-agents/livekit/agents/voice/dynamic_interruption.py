@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from ..log import logger
 
 # Typed only for clarity; avoid importing to reduce risk of circular imports at import time
 try:  # pragma: no cover - type hint convenience
@@ -20,6 +21,7 @@ class DynamicInterruptionManager:
     def __init__(self, opts: VoiceOptions) -> None:
         self._opts = opts
         self.conversation_state = ConversationStateTracker()
+        self._collision_recorded_since_last_user_end = False
 
     # ---- Interruption dynamics ----
     def on_agent_speech_started(self) -> None:
@@ -28,6 +30,7 @@ class DynamicInterruptionManager:
 
     def on_user_speech_ended(self) -> None:
         self.conversation_state.last_user_speech_end_time = time.time()
+        self._collision_recorded_since_last_user_end = False
 
     def get_current_min_interruption_words(self) -> int:
         """Compute an adaptive min_interruption_words threshold.
@@ -59,7 +62,13 @@ class DynamicInterruptionManager:
         return bool(getattr(self._opts, "enable_adaptive_endpointing", False))
 
     def record_continuation_collision(self) -> None:
+        if self._collision_recorded_since_last_user_end:
+            return
+        self._collision_recorded_since_last_user_end = True
         self.conversation_state.continuation_collisions += 1
+        logger.info(
+            f"Continuation collision detected (collision count: {self.conversation_state.continuation_collisions})",
+        )
 
     def get_endpointing_multiplier(self) -> float:
         """Return a backoff multiplier based on recent collisions.
@@ -77,5 +86,6 @@ class DynamicInterruptionManager:
 
     def reset_collisions(self) -> None:
         self.conversation_state.continuation_collisions = 0
+        self._collision_recorded_since_last_user_end = False
 
 

@@ -1220,7 +1220,7 @@ class AgentActivity(RecognitionHooks):
             # Interruption ignore words
             if opt.interruption_ignore_words:
                 text = self._audio_recognition.current_transcript
-                if _matches_ignore_words(text, opt.interruption_ignore_words):
+                if _matches_ignore_words(text, opt.interruption_ignore_words) or text.strip() == "":
                     return
 
         if self._rt_session is not None:
@@ -1239,10 +1239,6 @@ class AgentActivity(RecognitionHooks):
                 elapsed = time.time() - last_end
                 if elapsed < 5.0:
                     self._dynamic_interruption.record_continuation_collision()
-                    logger.debug(
-                        "Continuation collision detected",
-                        extra={"since_user_stopped_s": round(elapsed, 2)},
-                    )
 
             # reset the false interruption timer
             if self._false_interruption_timer:
