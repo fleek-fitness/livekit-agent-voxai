@@ -3,7 +3,17 @@ from __future__ import annotations
 import logging
 
 from ..log import logger as default_logger
-from .base import AgentMetrics, EOUMetrics, LLMMetrics, RealtimeModelMetrics, STTMetrics, TTSMetrics
+from .base import (
+    AgentLLMMetrics,
+    AgentMetrics,
+    EOUMetrics,
+    LLMMetrics,
+    RealtimeModelMetrics,
+    ResponseLatencyMetrics,
+    STTMetrics,
+    TTSMetrics,
+    ToolExecutionMetrics,
+)
 
 
 def log_metrics(metrics: AgentMetrics, *, logger: logging.Logger | None = None) -> None:
@@ -66,5 +76,31 @@ def log_metrics(metrics: AgentMetrics, *, logger: logging.Logger | None = None) 
             extra=metadata
             | {
                 "audio_duration": round(metrics.audio_duration, 2),
+            },
+        )
+    elif isinstance(metrics, ResponseLatencyMetrics):
+        logger.info(
+            "Response latency",
+            extra=metadata
+            | {
+                "e2e_latency": round(metrics.e2e_latency, 3),
+            },
+        )
+    elif isinstance(metrics, AgentLLMMetrics):
+        logger.info(
+            "Agent LLM TTFT",
+            extra=metadata
+            | {
+                "agent_ttft": round(metrics.agent_ttft or 0.0, 3),
+                "await_ms": round((metrics.llm_node_await or 0.0) * 1000, 1),
+            },
+        )
+    elif isinstance(metrics, ToolExecutionMetrics):
+        logger.info(
+            "Tool execution",
+            extra=metadata
+            | {
+                "total_time": round(metrics.total_execution_time, 3),
+                **{f"tool_{k}": round(v, 3) for k, v in metrics.tool_durations.items()},
             },
         )
