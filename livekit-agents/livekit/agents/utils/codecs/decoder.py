@@ -19,7 +19,6 @@ import io
 import struct
 import threading
 from collections.abc import AsyncIterator
-import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import cast
 
@@ -169,9 +168,6 @@ class AudioStreamDecoder:
     def _decode_loop(self) -> None:
         container: av.container.InputContainer | None = None
         resampler: av.AudioResampler | None = None
-        frames_decoded = 0
-        audio_ms = 0.0
-        last_log = time.perf_counter()
         try:
             # open container in low-latency streaming mode
             container = av.open(
@@ -189,7 +185,6 @@ class AudioStreamDecoder:
                     "avioflags": "direct",
                 },
             )
-            logger.info(f"decoder_open mime={self._mime_type} av_fmt={self._av_format}")
             # explicitly disable internal buffering flags on the FFmpeg container
             container.flags |= cast(
                 int, av.container.Flags.no_buffer.value | av.container.Flags.flush_packets.value
@@ -226,17 +221,11 @@ class AudioStreamDecoder:
                             samples_per_channel=int(f.samples / nchannels),
                         ),
                     )
-                    frames_decoded += 1
-                    audio_ms += (float(f.samples) / float(f.sample_rate)) * 1000.0
-                    if time.perf_counter() - last_log >= 0.2:
-                        logger.debug(f"decoder_stats frames={frames_decoded} audio_ms={audio_ms:.1f}")
-                        last_log = time.perf_counter()
 
         except Exception:
             logger.exception("error decoding audio")
         finally:
             self._loop.call_soon_threadsafe(self._output_ch.close)
-            logger.info(f"decoder_done frames={frames_decoded} audio_ms={audio_ms:.1f}")
             if container:
                 container.close()
 
@@ -246,9 +235,6 @@ class AudioStreamDecoder:
         This can be much faster than using ffmpeg, as we are emitting frames as quickly as possible.
         """
 
-        frames_decoded = 0
-        audio_ms = 0.0
-        last_log = time.perf_counter()
         try:
             # parse RIFF header
             header = b""
@@ -308,7 +294,6 @@ class AudioStreamDecoder:
                 if self._sample_rate is not None
                 else None
             )
-            logger.info(f"decoder_open mime={self._mime_type} av_fmt=wav")
 
             def resample_and_push(frame: rtc.AudioFrame) -> None:
                 if not resampler:
@@ -328,21 +313,13 @@ class AudioStreamDecoder:
                 frames = bstream.push(chunk)
                 for rtc_frame in frames:
                     resample_and_push(rtc_frame)
-                    frames_decoded += 1
-                    audio_ms += rtc_frame.duration * 1000.0
-                    if time.perf_counter() - last_log >= 0.2:
-                        logger.debug(f"decoder_stats frames={frames_decoded} audio_ms={audio_ms:.1f}")
-                        last_log = time.perf_counter()
 
             for rtc_frame in bstream.flush():
                 resample_and_push(rtc_frame)
-                frames_decoded += 1
-                audio_ms += rtc_frame.duration * 1000.0
         except Exception:
             logger.exception("error decoding wav")
         finally:
             self._loop.call_soon_threadsafe(self._output_ch.close)
-            logger.info(f"decoder_done frames={frames_decoded} audio_ms={audio_ms:.1f}")
 
     def __aiter__(self) -> AsyncIterator[rtc.AudioFrame]:
         return self

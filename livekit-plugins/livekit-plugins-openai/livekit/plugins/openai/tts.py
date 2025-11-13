@@ -208,9 +208,6 @@ class ChunkedStream(tts.ChunkedStream):
         self._opts = replace(tts._opts)
 
     async def _run(self, output_emitter: tts.AudioEmitter) -> None:
-        logger.info(
-            f"tts_req provider={self._tts.provider} model={self._tts.model} response_format={self._opts.response_format} sample_rate={SAMPLE_RATE}"
-        )
         oai_stream = self._tts._client.audio.speech.with_streaming_response.create(
             input=self.input_text,
             model=self._opts.model,
@@ -230,13 +227,7 @@ class ChunkedStream(tts.ChunkedStream):
                     mime_type=f"audio/{self._opts.response_format}",
                 )
 
-                bytes_in = 0
-                last_log = time.perf_counter()
                 async for data in stream.iter_bytes():
-                    bytes_in += len(data)
-                    if time.perf_counter() - last_log >= 0.2:
-                        logger.debug(f"tts_rx provider={self._tts.provider} request_id={stream.request_id or ''} bytes={bytes_in}")
-                        last_log = time.perf_counter()
                     output_emitter.push(data)
 
             output_emitter.flush()

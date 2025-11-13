@@ -397,7 +397,10 @@ class VADStream(agents.vad.VADStream):
                     extra_inference_time + inference_duration - window_duration,
                 )
                 if inference_duration > SLOW_INFERENCE_THRESHOLD:
-                    logger.warning(f"vad_slow inference_ms={inference_duration*1000:.1f} window_ms={window_duration*1000:.1f} delay_acc={extra_inference_time:.3f}")
+                    logger.warning(
+                        "inference is slower than realtime",
+                        extra={"delay": extra_inference_time},
+                    )
 
                 def _reset_write_cursor() -> None:
                     nonlocal speech_buffer_index

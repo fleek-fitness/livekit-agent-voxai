@@ -649,9 +649,6 @@ class AudioEmitter:
         self._sample_rate = sample_rate
         self._num_channels = num_channels
         self._streaming = stream
-        logger.info(
-            f"tts_emitter_init request_id={self._request_id} mime={self._mime_type} sample_rate={self._sample_rate} channels={self._num_channels} frame_size_ms={self._frame_size_ms} streaming={self._streaming}"
-        )
 
         from ..voice.io import TimedString
 
@@ -793,11 +790,6 @@ class AudioEmitter:
             if flush_if_delayed:
                 # force flush the buffer if the audio comes slower than realtime
                 delay = sent_duration - (event_loop.time() - sent_start) - 0.02
-                logger.debug(
-                    f"tts_flush_sched request_id={self._request_id} delay_ms={delay*1000:.1f} sent_duration={sent_duration:.3f}"
-                )
-                if delay <= 0:
-                    logger.warning(f"tts_flush_immediate request_id={self._request_id}")
                 flush_timer = event_loop.call_later(delay, _flush)
 
         def _emit_frame(frame: rtc.AudioFrame | None = None, *, is_final: bool = False) -> None:
@@ -879,9 +871,6 @@ class AudioEmitter:
             timed_transcripts = []
             segment_ctx.audio_duration += last_frame.duration
             self._audio_durations[-1] += last_frame.duration
-            logger.debug(
-                f"tts_flush_emit request_id={self._request_id} segment_id={segment_ctx.segment_id} segment_audio_ms={segment_ctx.audio_duration*1000:.1f}"
-            )
 
             if lk_dump_tts:
                 debug_frames.append(last_frame)

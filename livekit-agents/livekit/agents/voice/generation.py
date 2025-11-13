@@ -312,23 +312,7 @@ def perform_tts_inference(
     if text_transforms:
         from .transcription.filters import apply_text_transforms
 
-        logger.debug(f"tts_text_transforms enabled transforms={list(text_transforms)}")
         input = apply_text_transforms(input, text_transforms)
-
-    start_t = time.perf_counter()
-    first_text_logged = False
-
-    async def _log_first_text_stream(src: AsyncIterable[str]) -> AsyncIterable[str]:
-        nonlocal first_text_logged
-        async for chunk in src:
-            if not first_text_logged:
-                first_text_logged = True
-                logger.debug(
-                    f"tts_input_first_chunk delay_ms={(time.perf_counter()-start_t)*1000:.1f} chunk_len={len(chunk)}"
-                )
-            yield chunk
-
-    input = _log_first_text_stream(input)
 
     tts_task = asyncio.create_task(_tts_inference_task(node, input, model_settings, data))
 

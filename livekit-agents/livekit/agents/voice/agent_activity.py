@@ -1021,7 +1021,6 @@ class AgentActivity(RecognitionHooks):
                         self._current_speech = None
                         continue
                 speech._authorize_generation()
-                _gen_wait_start = time.perf_counter()
                 await speech._wait_for_generation()
                 self._current_speech = None
                 last_playout_ts = time.time()
