@@ -562,10 +562,23 @@ class AudioRecognition:
                             }
                         )
 
+            # Apply adaptive endpointing multiplier before waiting
+            manager = getattr(self._hooks, "_dynamic_interruption", None)
+            if manager and getattr(manager, "adaptive_endpointing_enabled", False):
+                try:
+                    multiplier = float(manager.get_endpointing_multiplier())
+                except Exception:
+                    multiplier = 1.0
+                if multiplier > 1.0:
+                    base_delay = max(endpointing_delay, 1.0)
+                    endpointing_delay = min(base_delay * multiplier, self._max_endpointing_delay)
+                    logger.debug(
+                        f"adaptive endpointing: multiplier={round(multiplier, 2)}, delay={round(endpointing_delay, 2)}",
+                    )
+
             extra_sleep = endpointing_delay
             if last_speaking_time:
                 extra_sleep += last_speaking_time - time.time()
-
             if extra_sleep > 0:
                 try:
                     await asyncio.wait_for(self._closing.wait(), timeout=extra_sleep)

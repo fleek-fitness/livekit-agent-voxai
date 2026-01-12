@@ -90,6 +90,11 @@ class AgentSessionOptions:
     preemptive_generation: bool
     tts_text_transforms: Sequence[TextTransforms] | None
     ivr_detection: bool
+    # Dynamic interruption and adaptive endpointing (all disabled by default)
+    interruption_ignore_words: list[str] | None = None
+    enable_dynamic_interruption: bool = False
+    conversation_continuity_threshold: float = 8.0
+    enable_adaptive_endpointing: bool = False
 
 
 Userdata_T = TypeVar("Userdata_T")
@@ -161,6 +166,11 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
         preemptive_generation: bool = False,
         ivr_detection: bool = False,
         conn_options: NotGivenOr[SessionConnectOptions] = NOT_GIVEN,
+        # Dynamic interruption / adaptive endpointing
+        interruption_ignore_words: list[str] | None = None,
+        enable_dynamic_interruption: bool = False,
+        conversation_continuity_threshold: float = 8.0,
+        enable_adaptive_endpointing: bool = False,
         loop: asyncio.AbstractEventLoop | None = None,
         # deprecated
         agent_false_interruption_timeout: NotGivenOr[float | None] = NOT_GIVEN,
@@ -289,6 +299,10 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
             use_tts_aligned_transcript=use_tts_aligned_transcript
             if is_given(use_tts_aligned_transcript)
             else None,
+            interruption_ignore_words=interruption_ignore_words,
+            enable_dynamic_interruption=enable_dynamic_interruption,
+            conversation_continuity_threshold=conversation_continuity_threshold,
+            enable_adaptive_endpointing=enable_adaptive_endpointing,
         )
         self._conn_options = conn_options or SessionConnectOptions()
         self._started = False
@@ -844,6 +858,10 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
         min_endpointing_delay: NotGivenOr[float] = NOT_GIVEN,
         max_endpointing_delay: NotGivenOr[float] = NOT_GIVEN,
         turn_detection: NotGivenOr[TurnDetectionMode | None] = NOT_GIVEN,
+        interruption_ignore_words: NotGivenOr[list[str] | None] = NOT_GIVEN,
+        enable_dynamic_interruption: NotGivenOr[bool] = NOT_GIVEN,
+        conversation_continuity_threshold: NotGivenOr[float] = NOT_GIVEN,
+        enable_adaptive_endpointing: NotGivenOr[bool] = NOT_GIVEN,
     ) -> None:
         """
         Update the options for the agent session.
@@ -858,6 +876,14 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
             self._opts.min_endpointing_delay = min_endpointing_delay
         if is_given(max_endpointing_delay):
             self._opts.max_endpointing_delay = max_endpointing_delay
+        if is_given(interruption_ignore_words):
+            self._opts.interruption_ignore_words = interruption_ignore_words
+        if is_given(enable_dynamic_interruption):
+            self._opts.enable_dynamic_interruption = enable_dynamic_interruption
+        if is_given(conversation_continuity_threshold):
+            self._opts.conversation_continuity_threshold = conversation_continuity_threshold
+        if is_given(enable_adaptive_endpointing):
+            self._opts.enable_adaptive_endpointing = enable_adaptive_endpointing
 
         if is_given(turn_detection):
             self._turn_detection = cast(Optional[TurnDetectionMode], turn_detection)
