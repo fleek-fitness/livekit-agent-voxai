@@ -140,3 +140,50 @@ AgentMetrics = Union[
     EOUMetrics,
     RealtimeModelMetrics,
 ]
+
+# --- Extended metrics (adaptive endpointing & tooling visibility) ---
+
+class ResponseLatencyMetrics(BaseModel):
+    type: Literal["response_latency_metrics"] = "response_latency_metrics"
+    timestamp: float
+    speech_id: str | None = None
+    e2e_latency: float
+    eou_timestamp: float
+    first_audio_timestamp: float
+    metadata: Metadata | None = None
+
+
+class AgentLLMMetrics(BaseModel):
+    type: Literal["agent_llm_metrics"] = "agent_llm_metrics"
+    timestamp: float
+    speech_id: str | None = None
+    agent_ttft: float | None = None
+    llm_node_await: float | None = None
+    request_id: str | None = None
+    metadata: Metadata | None = None
+
+
+from pydantic import Field
+
+
+class ToolExecutionMetrics(BaseModel):
+    type: Literal["tool_execution_metrics"] = "tool_execution_metrics"
+    timestamp: float
+    speech_id: str | None = None
+    total_execution_time: float
+    tool_durations: dict[str, float] = Field(default_factory=dict)
+    metadata: Metadata | None = None
+
+
+# Extend AgentMetrics union with new metric types
+AgentMetrics = Union[
+    STTMetrics,
+    LLMMetrics,
+    TTSMetrics,
+    VADMetrics,
+    EOUMetrics,
+    RealtimeModelMetrics,
+    ResponseLatencyMetrics,
+    AgentLLMMetrics,
+    ToolExecutionMetrics,
+]
