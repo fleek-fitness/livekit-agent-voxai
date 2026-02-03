@@ -87,6 +87,8 @@ if TYPE_CHECKING:
 
 _AgentActivityContextVar = contextvars.ContextVar["AgentActivity"]("agents_activity")
 _SpeechHandleContextVar = contextvars.ContextVar["SpeechHandle"]("agents_speech_handle")
+
+
 def _matches_ignore_words(text: str, ignore_words: list[str] | None) -> bool:
     """Return True if `text` can be composed entirely of the ignore words.
 
@@ -95,17 +97,18 @@ def _matches_ignore_words(text: str, ignore_words: list[str] | None) -> bool:
     """
     import string
 
-    if not ignore_words or not text:
+    if not text:
         return False
 
-    text_cleaned = (
-        text.lower().strip().translate(str.maketrans("", "", string.punctuation))
-    )
+    text_cleaned = text.lower().strip().translate(str.maketrans("", "", string.punctuation))
     if not text_cleaned:
-        return False
+        return True
 
     text_cleaned = "".join(text_cleaned.split())
     if not text_cleaned:
+        return True
+
+    if not ignore_words:
         return False
 
     cleaned_ignore_words: list[str] = []
@@ -118,6 +121,10 @@ def _matches_ignore_words(text: str, ignore_words: list[str] | None) -> bool:
 
     if not cleaned_ignore_words:
         return False
+
+    # Single character: always ignore
+    if len(text_cleaned) == 1:
+        return True
 
     dp = [False] * (len(text_cleaned) + 1)
     dp[0] = True
@@ -1133,7 +1140,13 @@ class AgentActivity(RecognitionHooks):
 
     def _on_metrics_collected(
         self,
-        ev: STTMetrics | TTSMetrics | VADMetrics | LLMMetrics | RealtimeModelMetrics | AgentLLMMetrics | ToolExecutionMetrics,
+        ev: STTMetrics
+        | TTSMetrics
+        | VADMetrics
+        | LLMMetrics
+        | RealtimeModelMetrics
+        | AgentLLMMetrics
+        | ToolExecutionMetrics,
     ) -> None:
         # Attach speech_id when possible (for LLM/TTS/AgentLLM)
         if speech_handle := _SpeechHandleContextVar.get(None):
@@ -1167,7 +1180,9 @@ class AgentActivity(RecognitionHooks):
                 eou_timestamp=self._last_eou_timestamp,
                 first_audio_timestamp=first_audio_timestamp,
             )
-            self._session.emit("metrics_collected", MetricsCollectedEvent(metrics=response_latency_metrics))
+            self._session.emit(
+                "metrics_collected", MetricsCollectedEvent(metrics=response_latency_metrics)
+            )
 
             logger.debug(
                 f"E2E Latency computed (e2e_latency: {round(e2e_latency, 3)}, agent_ttft: {round(agent_ttft or 0.0, 3)})",
@@ -1514,7 +1529,7 @@ class AgentActivity(RecognitionHooks):
                 self._cancel_preemptive_generation()
                 # avoid interruption if the new_transcript is too short
                 return False
-            
+
             # Check interruption ignore words
             if self._session.options.interruption_ignore_words and _matches_ignore_words(
                 info.new_transcript, self._session.options.interruption_ignore_words
