@@ -689,6 +689,10 @@ class _Connection:
                     chars = alignment["chars"]
                     starts = alignment.get("charStartTimesMs") or alignment.get("charsStartTimesMs")
                     durs = alignment.get("charDurationsMs") or alignment.get("charsDurationsMs")
+                    logger.debug(
+                        "[ElevenLabs TTS] alignment: chars=%d, starts=%s, durs=%s",
+                        len(chars), starts is not None, durs is not None,
+                    )
                     if starts and durs and len(chars) == len(durs) and len(starts) == len(durs):
                         stream._text_buffer += "".join(chars)
                         # in case item in chars has multiple characters
@@ -701,6 +705,10 @@ class _Connection:
 
                         timed_words, stream._text_buffer = _to_timed_words(
                             stream._text_buffer, stream._start_times_ms, stream._durations_ms
+                        )
+                        logger.debug(
+                            "[ElevenLabs TTS] timed_words: %s",
+                            [(str(w), w.start_time, w.end_time) for w in timed_words],
                         )
                         emitter.push_timed_transcript(timed_words)
                         stream._start_times_ms = stream._start_times_ms[-len(stream._text_buffer) :]
@@ -719,6 +727,10 @@ class _Connection:
                             stream._start_times_ms,
                             stream._durations_ms,
                             flush=True,
+                        )
+                        logger.debug(
+                            "[ElevenLabs TTS] final timed_words: %s",
+                            [(str(w), w.start_time, w.end_time) for w in timed_words],
                         )
                         emitter.push_timed_transcript(timed_words)
 

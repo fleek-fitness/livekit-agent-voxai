@@ -307,6 +307,7 @@ class _TTSGenerationData:
     audio_ch: aio.Chan[rtc.AudioFrame]
     timed_texts_fut: asyncio.Future[aio.Chan[io.TimedString] | None]
     ttfb: float | None = None
+    collected_timed_words: list[io.TimedString] = field(default_factory=list)
 
 
 def perform_tts_inference(
@@ -379,6 +380,7 @@ async def _tts_inference_task(
                         if is_given(text.end_time):
                             text.end_time += pushed_duration
                         timed_text_ch.send_nowait(text)
+                        data.collected_timed_words.append(text)
 
             audio_ch.send_nowait(audio_frame)
             audio_duration += audio_frame.duration

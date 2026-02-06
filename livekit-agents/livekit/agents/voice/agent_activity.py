@@ -86,6 +86,42 @@ if TYPE_CHECKING:
     from .agent_session import AgentSession
 
 _AgentActivityContextVar = contextvars.ContextVar["AgentActivity"]("agents_activity")
+
+
+def _build_word_timestamps_extra(
+    tts_gen_data: _TTSGenerationData | None,
+) -> dict[str, Any]:
+    """Build extra dict with word_timestamps from TTS generation data."""
+    if not tts_gen_data or not tts_gen_data.collected_timed_words:
+        return {}
+    return {
+        "word_timestamps": [
+            {
+                "text": str(w),
+                "start_time": w.start_time if is_given(w.start_time) else None,
+                "end_time": w.end_time if is_given(w.end_time) else None,
+            }
+            for w in tts_gen_data.collected_timed_words
+        ]
+    }
+
+
+def _build_user_word_timestamps_extra(
+    word_timestamps: list | None,
+) -> dict[str, Any]:
+    """Build extra dict with word_timestamps from STT word data."""
+    if not word_timestamps:
+        return {}
+    return {
+        "word_timestamps": [
+            {
+                "text": str(w),
+                "start_time": w.start_time if is_given(w.start_time) else None,
+                "end_time": w.end_time if is_given(w.end_time) else None,
+            }
+            for w in word_timestamps
+        ]
+    }
 _SpeechHandleContextVar = contextvars.ContextVar["SpeechHandle"]("agents_speech_handle")
 def _matches_ignore_words(text: str, ignore_words: list[str] | None) -> bool:
     """Return True if `text` can be composed entirely of the ignore words.
@@ -1488,6 +1524,7 @@ class AgentActivity(RecognitionHooks):
                     role="user",
                     content=[info.new_transcript],
                     transcript_confidence=info.transcript_confidence,
+                    extra=_build_user_word_timestamps_extra(info.word_timestamps),
                 )
                 self._agent._chat_ctx.items.append(user_message)
                 self._session._conversation_item_added(user_message)
@@ -1577,6 +1614,7 @@ class AgentActivity(RecognitionHooks):
             role="user",
             content=[info.new_transcript],
             transcript_confidence=info.transcript_confidence,
+            extra=_build_user_word_timestamps_extra(info.word_timestamps),
         )
 
         if self._scheduling_paused:
@@ -1887,6 +1925,7 @@ class AgentActivity(RecognitionHooks):
                 content=forwarded_text,
                 interrupted=speech_handle.interrupted,
                 metrics=assistant_metrics,
+                extra=_build_word_timestamps_extra(tts_gen_data),
             )
             speech_handle._item_added([msg])
             self._session._conversation_item_added(msg)
@@ -2163,6 +2202,7 @@ class AgentActivity(RecognitionHooks):
                     interrupted=True,
                     created_at=reply_started_at,
                     metrics=assistant_metrics,
+                    extra=_build_word_timestamps_extra(tts_gen_data),
                 )
                 self._agent._chat_ctx.insert(msg)
                 self._session._conversation_item_added(msg)
@@ -2190,6 +2230,7 @@ class AgentActivity(RecognitionHooks):
                 interrupted=False,
                 created_at=reply_started_at,
                 metrics=assistant_metrics,
+                extra=_build_word_timestamps_extra(tts_gen_data),
             )
             self._agent._chat_ctx.insert(msg)
             self._session._conversation_item_added(msg)

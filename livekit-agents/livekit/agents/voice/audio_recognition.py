@@ -37,6 +37,7 @@ class _EndOfTurnInfo:
     stopped_speaking_at: float | None
     transcription_delay: float | None
     end_of_turn_delay: float | None
+    word_timestamps: list | None = None
 
 
 @dataclass
@@ -139,6 +140,7 @@ class AudioRecognition:
         self._stt_ch: aio.Chan[rtc.AudioFrame] | None = None
         self._vad_ch: aio.Chan[rtc.AudioFrame] | None = None
         self._tasks: set[asyncio.Task[Any]] = set()
+        self._accumulated_words: list = []
 
         self._user_turn_span: trace.Span | None = None
         self._closing = asyncio.Event()
@@ -368,6 +370,9 @@ class AudioRecognition:
             self._audio_transcript += f" {transcript}"
             self._audio_transcript = self._audio_transcript.lstrip()
             self._final_transcript_confidence.append(confidence)
+            # Accumulate word-level timestamps from STT
+            if ev.alternatives[0].words:
+                self._accumulated_words.extend(ev.alternatives[0].words)
             transcript_changed = self._audio_transcript != self._audio_preflight_transcript
             self._audio_interim_transcript = ""
             self._audio_preflight_transcript = ""
@@ -607,6 +612,7 @@ class AudioRecognition:
                 transcription_delay = max(last_final_transcript_time - last_speaking_time, 0)
                 end_of_turn_delay = time.time() - last_speaking_time
 
+            accumulated_words = self._accumulated_words if self._accumulated_words else None
             committed = self._hooks.on_end_of_turn(
                 _EndOfTurnInfo(
                     new_transcript=self._audio_transcript,
@@ -615,6 +621,7 @@ class AudioRecognition:
                     end_of_turn_delay=end_of_turn_delay,
                     started_speaking_at=started_speaking_at,
                     stopped_speaking_at=stopped_speaking_at,
+                    word_timestamps=accumulated_words,
                 )
             )
             if committed:
@@ -632,6 +639,7 @@ class AudioRecognition:
                 # clear the transcript if the user turn was committed
                 self._audio_transcript = ""
                 self._final_transcript_confidence = []
+                self._accumulated_words = []
                 self._last_speaking_time = None
                 self._last_final_transcript_time = None
                 self._speech_start_time = None
