@@ -4,7 +4,7 @@ import asyncio
 import json
 import time
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterable, AsyncIterator
+from collections.abc import AsyncIterable, AsyncIterator, Callable
 from datetime import datetime, timezone
 from types import TracebackType
 from typing import Any, ClassVar, Generic, Literal, TypeVar, Union
@@ -164,6 +164,9 @@ class LLMStream(ABC):
         self._chat_ctx = chat_ctx
         self._tools = tools
         self._conn_options = conn_options
+        self.__fnc_name: str | None = None
+        self._tool_name_callbacks: list[Callable[[str], None]] = []
+        self._detected_tool_keys: set[tuple[str, str | None]] = set()
 
         self._event_ch = aio.Chan[ChatChunk]()
         self._event_aiter, monitor_aiter = aio.itertools.tee(self._event_ch, 2)
@@ -184,6 +187,81 @@ class LLMStream(ABC):
         self._task.add_done_callback(lambda _: self._event_ch.close())
 
         self._llm_request_span: trace.Span | None = None
+
+    def on_tool_name_detected(self, callback: Callable[[str], None]) -> None:
+        """Register callback for early tool name detection in this stream."""
+        self._tool_name_callbacks.append(callback)
+
+    @property
+    def _fnc_name(self) -> str | None:
+        return self.__fnc_name
+
+    @_fnc_name.setter
+    def _fnc_name(self, value: str | None) -> None:
+        prev = self.__fnc_name
+        self.__fnc_name = value
+
+        # `_fnc_name` is used by OpenAI-compatible/Anthropic/AWS plugins.
+        # Fire only on first observation for this value transition.
+        if value and value != prev:
+            call_id = getattr(self, "_tool_call_id", None)
+            if not isinstance(call_id, str) or not call_id:
+                call_id = None
+
+            logger.debug(
+                "[EARLY_SPEAK_TRACE] tool name observed via _fnc_name | name=%s call_id=%s",
+                value,
+                call_id,
+            )
+            self._fire_tool_name_detected(value, call_id=call_id)
+
+    def _fire_tool_name_detected(
+        self,
+        name: str,
+        *,
+        call_id: str | None = None,
+    ) -> None:
+        if not self._tool_name_callbacks or not name:
+            return
+
+        dedupe_key = (name, call_id)
+        if dedupe_key in self._detected_tool_keys:
+            logger.debug(
+                "[EARLY_SPEAK_TRACE] duplicate tool name ignored | name=%s call_id=%s",
+                name,
+                call_id,
+            )
+            return
+        self._detected_tool_keys.add(dedupe_key)
+
+        logger.debug(
+            "[EARLY_SPEAK_TRACE] tool name callback fired | name=%s call_id=%s callbacks=%s",
+            name,
+            call_id,
+            len(self._tool_name_callbacks),
+        )
+        for cb in self._tool_name_callbacks:
+            try:
+                cb(name)
+            except Exception:
+                logger.warning("tool_name_detected callback failed", exc_info=True)
+
+    def _detect_tool_names_from_chunk(self, chunk: ChatChunk) -> None:
+        # Google/Mistral style: direct tool_calls emission path.
+        if not self._tool_name_callbacks or chunk.delta is None or not chunk.delta.tool_calls:
+            return
+
+        for tool_call in chunk.delta.tool_calls:
+            if not tool_call.name:
+                continue
+
+            call_id = tool_call.call_id if tool_call.call_id else None
+            logger.debug(
+                "[EARLY_SPEAK_TRACE] tool name observed via chunk delta | name=%s call_id=%s",
+                tool_call.name,
+                call_id,
+            )
+            self._fire_tool_name_detected(tool_call.name, call_id=call_id)
 
     @abstractmethod
     async def _run(self) -> None: ...
@@ -355,6 +433,7 @@ class LLMStream(ABC):
 
             raise StopAsyncIteration from None
 
+        self._detect_tool_names_from_chunk(val)
         return val
 
     def __aiter__(self) -> AsyncIterator[ChatChunk]:
