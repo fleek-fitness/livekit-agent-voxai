@@ -769,12 +769,32 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
         drain: bool = False,
         error: llm.LLMError | stt.STTError | tts.TTSError | llm.RealtimeModelError | None = None,
     ) -> None:
+        close_trace_id = f"{id(self)}-{time.monotonic_ns()}"
+        logger.info(
+            "agent_session_aclose_trace",
+            extra={
+                "trace_id": close_trace_id,
+                "event": "aclose_start",
+                "reason": reason.value,
+                "drain": drain,
+            },
+        )
+
         if self._root_span_context:
             # make `activity.drain` and `on_exit` under the root span
             otel_context.attach(self._root_span_context)
 
         async with self._lock:
             if not self._started:
+                logger.info(
+                    "agent_session_aclose_trace",
+                    extra={
+                        "trace_id": close_trace_id,
+                        "event": "aclose_skip_not_started",
+                        "reason": reason.value,
+                        "drain": drain,
+                    },
+                )
                 return
 
             self._closing = True
@@ -784,15 +804,43 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
                 if not drain:
                     try:
                         # force interrupt speeches when closing the session
+                        logger.info(
+                            "agent_session_aclose_trace",
+                            extra={"trace_id": close_trace_id, "event": "step_start", "step": "activity.interrupt(force=True)"},
+                        )
                         await self._activity.interrupt(force=True)
+                        logger.info(
+                            "agent_session_aclose_trace",
+                            extra={"trace_id": close_trace_id, "event": "step_done", "step": "activity.interrupt(force=True)"},
+                        )
                     except RuntimeError:
                         # uninterruptible speech
+                        logger.info(
+                            "agent_session_aclose_trace",
+                            extra={"trace_id": close_trace_id, "event": "step_runtime_error_ignored", "step": "activity.interrupt(force=True)"},
+                        )
                         pass
+                logger.info(
+                    "agent_session_aclose_trace",
+                    extra={"trace_id": close_trace_id, "event": "step_start", "step": "activity.drain"},
+                )
                 await self._activity.drain()
+                logger.info(
+                    "agent_session_aclose_trace",
+                    extra={"trace_id": close_trace_id, "event": "step_done", "step": "activity.drain"},
+                )
 
                 # wait any uninterruptible speech to finish
                 if self._activity.current_speech:
+                    logger.info(
+                        "agent_session_aclose_trace",
+                        extra={"trace_id": close_trace_id, "event": "step_start", "step": "activity.current_speech"},
+                    )
                     await self._activity.current_speech
+                    logger.info(
+                        "agent_session_aclose_trace",
+                        extra={"trace_id": close_trace_id, "event": "step_done", "step": "activity.current_speech"},
+                    )
 
                 # detach the inputs and outputs
                 self.input.audio = None
@@ -807,7 +855,15 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
                     # wait for the user transcript to be committed
                     audio_recognition.commit_user_turn(audio_detached=True, transcript_timeout=2.0)
 
+                logger.info(
+                    "agent_session_aclose_trace",
+                    extra={"trace_id": close_trace_id, "event": "step_start", "step": "activity.aclose"},
+                )
                 await self._activity.aclose()
+                logger.info(
+                    "agent_session_aclose_trace",
+                    extra={"trace_id": close_trace_id, "event": "step_done", "step": "activity.aclose"},
+                )
                 self._activity = None
 
             if self._agent_speaking_span:
@@ -819,13 +875,37 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
                 self._user_speaking_span = None
 
             if self._forward_audio_atask is not None:
+                logger.info(
+                    "agent_session_aclose_trace",
+                    extra={"trace_id": close_trace_id, "event": "step_start", "step": "forward_audio.cancel_and_wait"},
+                )
                 await utils.aio.cancel_and_wait(self._forward_audio_atask)
+                logger.info(
+                    "agent_session_aclose_trace",
+                    extra={"trace_id": close_trace_id, "event": "step_done", "step": "forward_audio.cancel_and_wait"},
+                )
 
             if self._recorder_io:
+                logger.info(
+                    "agent_session_aclose_trace",
+                    extra={"trace_id": close_trace_id, "event": "step_start", "step": "recorder_io.aclose"},
+                )
                 await self._recorder_io.aclose()
+                logger.info(
+                    "agent_session_aclose_trace",
+                    extra={"trace_id": close_trace_id, "event": "step_done", "step": "recorder_io.aclose"},
+                )
 
             if self._ivr_activity is not None:
+                logger.info(
+                    "agent_session_aclose_trace",
+                    extra={"trace_id": close_trace_id, "event": "step_start", "step": "ivr_activity.aclose"},
+                )
                 await self._ivr_activity.aclose()
+                logger.info(
+                    "agent_session_aclose_trace",
+                    extra={"trace_id": close_trace_id, "event": "step_done", "step": "ivr_activity.aclose"},
+                )
 
             if self._session_span:
                 self._session_span.end()
@@ -837,7 +917,15 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
 
             if self._room_io:
                 # close room io after close event is emitted, ensure the room io's close callback is called
+                logger.info(
+                    "agent_session_aclose_trace",
+                    extra={"trace_id": close_trace_id, "event": "step_start", "step": "room_io.aclose.post_close_event"},
+                )
                 await self._room_io.aclose()
+                logger.info(
+                    "agent_session_aclose_trace",
+                    extra={"trace_id": close_trace_id, "event": "step_done", "step": "room_io.aclose.post_close_event"},
+                )
 
             self._cancel_user_away_timer()
             self._user_state = "listening"
@@ -848,8 +936,26 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
 
             # close room io after close event is emitted
             if self._room_io:
+                logger.info(
+                    "agent_session_aclose_trace",
+                    extra={"trace_id": close_trace_id, "event": "step_start", "step": "room_io.aclose.final"},
+                )
                 await self._room_io.aclose()
+                logger.info(
+                    "agent_session_aclose_trace",
+                    extra={"trace_id": close_trace_id, "event": "step_done", "step": "room_io.aclose.final"},
+                )
                 self._room_io = None
+
+        logger.info(
+            "agent_session_aclose_trace",
+            extra={
+                "trace_id": close_trace_id,
+                "event": "aclose_end",
+                "reason": reason.value,
+                "drain": drain,
+            },
+        )
 
         logger.debug("session closed", extra={"reason": reason.value, "error": error})
 
