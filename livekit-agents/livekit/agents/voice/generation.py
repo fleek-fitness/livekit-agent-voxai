@@ -29,6 +29,8 @@ from ..types import USERDATA_TIMED_TRANSCRIPT, FlushSentinel, NotGivenOr
 from ..utils import aio, is_given
 from ..utils.aio import itertools
 from . import io
+from ..metrics import AgentLLMMetrics, ToolExecutionMetrics
+from .events import MetricsCollectedEvent
 from .speech_handle import SpeechHandle
 from .transcription.filters import apply_text_transforms
 
@@ -60,12 +62,13 @@ def perform_llm_inference(
     chat_ctx: ChatContext,
     tool_ctx: ToolContext,
     model_settings: ModelSettings,
+    session: "AgentSession" | None = None,
 ) -> tuple[asyncio.Task[bool], _LLMGenerationData]:
     text_ch = aio.Chan[Union[str, FlushSentinel]]()
     function_ch = aio.Chan[llm.FunctionCall]()
     data = _LLMGenerationData(text_ch=text_ch, function_ch=function_ch)
     llm_task = asyncio.create_task(
-        _llm_inference_task(node, chat_ctx, tool_ctx, model_settings, data)
+        _llm_inference_task(node, chat_ctx, tool_ctx, model_settings, data, session)
     )
     llm_task.add_done_callback(lambda _: text_ch.close())
     llm_task.add_done_callback(lambda _: function_ch.close())
@@ -87,13 +90,19 @@ async def _llm_inference_task(
     tool_ctx: ToolContext,
     model_settings: ModelSettings,
     data: _LLMGenerationData,
+    session: "AgentSession" | None = None,
 ) -> bool:
     start_time = time.perf_counter()
     current_span = trace.get_current_span()
     data.started_fut.set_result(None)
 
     text_ch, function_ch = data.text_ch, data.function_ch
-    tools = tool_ctx.flatten()
+    agent_llm_start_time = time.time()
+    ttft_captured = False
+
+    tools_start = time.time()
+    tools = tool_ctx.flatten()  # 1.3.12 API: all_tools → flatten()
+    tools_prep_time = time.time() - tools_start
 
     current_span.set_attributes(
         {
@@ -108,19 +117,61 @@ async def _llm_inference_task(
         }
     )
 
+    llm_node_start = time.time()
     llm_node = node(chat_ctx, tools, model_settings)
     if asyncio.iscoroutine(llm_node):
         llm_node = await llm_node
+    node_exec_time = time.time() - llm_node_start
 
     # store any updated tools, to ensure subsequent tool calls in the same turn (nested calls)
     # are using the newer tools.
     # tool_ctx here is ephemeral for this turn, and we allow manipulations
+    tool_update_start = time.time()
     tool_ctx.update_tools(tools)
+    tool_update_time = time.time() - tool_update_start
+
+    total_prep_overhead = tools_prep_time + node_exec_time + tool_update_time
+    logger.debug(
+        "Agent LLM Preparation Overhead: %.1fms (Tools: %.1fms, Node: %.1fms, Update: %.1fms)",
+        total_prep_overhead * 1000,
+        tools_prep_time * 1000,
+        node_exec_time * 1000,
+        tool_update_time * 1000,
+    )
 
     if isinstance(llm_node, str):
         data.generated_text = llm_node
         text_ch.send_nowait(llm_node)
         current_span.set_attribute(trace_types.ATTR_RESPONSE_TEXT, data.generated_text)
+        # Non-streaming TTFT
+        if not ttft_captured:
+            agent_ttft = time.time() - agent_llm_start_time
+            ttft_captured = True
+
+            logger.info("=== Non-Streaming Agent TTFT Breakdown ===")
+            logger.info("Total Agent TTFT: %.1fms", agent_ttft * 1000)
+            logger.info("  Preparation Overhead: %.1fms", total_prep_overhead * 1000)
+            logger.info("    - Tools prep: %.1fms", tools_prep_time * 1000)
+            logger.info("    - Node exec: %.1fms", node_exec_time * 1000)
+            logger.info("    - Tool update: %.1fms", tool_update_time * 1000)
+            logger.info("  (Non-streaming: TTFT = Total Time)")
+            logger.info("==========================================")
+
+            if session is not None:
+                try:
+                    session.emit(
+                        "metrics_collected",
+                        MetricsCollectedEvent(
+                            metrics=AgentLLMMetrics(
+                                timestamp=time.time(),
+                                speech_id=None,
+                                agent_ttft=agent_ttft,
+                                llm_node_await=node_exec_time,
+                            )
+                        ),
+                    )
+                except Exception:
+                    pass
         return True
 
     if not isinstance(llm_node, AsyncIterable):
@@ -128,14 +179,50 @@ async def _llm_inference_task(
 
     # forward llm stream to output channels
     try:
+        first_chunk_elapsed: float | None = None
         async for chunk in llm_node:
             if data.ttft is None:
                 data.ttft = time.perf_counter() - start_time
-
+            if first_chunk_elapsed is None:
+                first_chunk_elapsed = time.time() - agent_llm_start_time
             # io.LLMNode can either return a string or a ChatChunk
             if isinstance(chunk, str):
                 data.generated_text += chunk
                 text_ch.send_nowait(chunk)
+                if not ttft_captured and chunk.strip():
+                    agent_ttft = time.time() - agent_llm_start_time
+                    ttft_captured = True
+                    streaming_overhead = max(agent_ttft - total_prep_overhead, 0.0)
+                    first_to_content = max(agent_ttft - (first_chunk_elapsed or 0.0), 0.0)
+                    logger.info("=== Agent TTFT Breakdown ===")
+                    logger.info("Total Agent TTFT: %.1fms", agent_ttft * 1000)
+                    logger.info("  Preparation Overhead: %.1fms", total_prep_overhead * 1000)
+                    logger.info("    - Tools prep: %.1fms", tools_prep_time * 1000)
+                    logger.info("    - Node exec: %.1fms", node_exec_time * 1000)
+                    logger.info("    - Tool update: %.1fms", tool_update_time * 1000)
+                    logger.info(
+                        "  First Chunk Arrival: %.1fms",
+                        (first_chunk_elapsed or 0.0) * 1000,
+                    )
+                    logger.info("  First Chunk to Content: %.1fms", first_to_content * 1000)
+                    logger.info("  Streaming to First Token: %.1fms", streaming_overhead * 1000)
+                    logger.info("================================")
+
+                    if session is not None:
+                        try:
+                            session.emit(
+                                "metrics_collected",
+                                MetricsCollectedEvent(
+                                    metrics=AgentLLMMetrics(
+                                        timestamp=time.time(),
+                                        speech_id=None,
+                                        agent_ttft=agent_ttft,
+                                        llm_node_await=node_exec_time,
+                                    )
+                                ),
+                            )
+                        except Exception:
+                            pass
 
             elif isinstance(chunk, ChatChunk):
                 if not chunk.delta:
@@ -159,6 +246,40 @@ async def _llm_inference_task(
                 if chunk.delta.content:
                     data.generated_text += chunk.delta.content
                     text_ch.send_nowait(chunk.delta.content)
+                    if not ttft_captured and chunk.delta.content.strip():
+                        agent_ttft = time.time() - agent_llm_start_time
+                        ttft_captured = True
+                        streaming_overhead = max(agent_ttft - total_prep_overhead, 0.0)
+                        first_to_content = max(agent_ttft - (first_chunk_elapsed or 0.0), 0.0)
+                        logger.info("=== Agent TTFT Breakdown ===")
+                        logger.info("Total Agent TTFT: %.1fms", agent_ttft * 1000)
+                        logger.info("  Preparation Overhead: %.1fms", total_prep_overhead * 1000)
+                        logger.info("    - Tools prep: %.1fms", tools_prep_time * 1000)
+                        logger.info("    - Node exec: %.1fms", node_exec_time * 1000)
+                        logger.info("    - Tool update: %.1fms", tool_update_time * 1000)
+                        logger.info(
+                            "  First Chunk Arrival: %.1fms",
+                            (first_chunk_elapsed or 0.0) * 1000,
+                        )
+                        logger.info("  First Chunk to Content: %.1fms", first_to_content * 1000)
+                        logger.info("  Streaming to First Token: %.1fms", streaming_overhead * 1000)
+                        logger.info("================================")
+
+                        if session is not None:
+                            try:
+                                session.emit(
+                                    "metrics_collected",
+                                    MetricsCollectedEvent(
+                                        metrics=AgentLLMMetrics(
+                                            timestamp=time.time(),
+                                            speech_id=None,
+                                            agent_ttft=agent_ttft,
+                                            llm_node_await=node_exec_time,
+                                        )
+                                    ),
+                                )
+                            except Exception:
+                                pass
 
             elif isinstance(chunk, FlushSentinel):
                 text_ch.send_nowait(chunk)
@@ -461,8 +582,12 @@ async def _execute_tools_task(
         tool_output.output.append(out)
 
     tasks: list[asyncio.Task[Any]] = []
+    tool_exec_start = time.time()
+    executed_any_tool = False
+    tool_durations: dict[str, float] = {}
     try:
         async for fnc_call in function_stream:
+            executed_any_tool = True
             if tool_choice == "none":
                 logger.error(
                     "received a tool call with tool_choice set to 'none', ignoring",
@@ -623,12 +748,28 @@ async def _execute_tools_task(
                     # TODO(theomonnom): Add the agent handoff inside the current_span
                     _tool_completed(output)
 
+                started_at = time.time()
                 task = asyncio.create_task(_traceable_fnc_tool(function_callable, fnc_call))
                 _set_activity_task_info(
                     task, speech_handle=speech_handle, function_call=fnc_call, inline_task=True
                 )
                 tasks.append(task)
                 task.add_done_callback(lambda task: tasks.remove(task))
+
+                # Record per-tool duration when each tool finishes
+                def _record_tool_duration(
+                    _: asyncio.Task[Any], *, name: str, started_at: float
+                ) -> None:
+                    try:
+                        tool_durations[name] = time.time() - started_at
+                    except Exception:
+                        pass
+
+                task.add_done_callback(
+                    lambda t, _name=fnc_call.name, _started=started_at: _record_tool_duration(
+                        t, name=_name, started_at=_started
+                    )
+                )
             except Exception as e:
                 # catching exceptions here because even though the function is asynchronous,
                 # errors such as missing or incompatible arguments can still occur at
@@ -664,6 +805,23 @@ async def _execute_tools_task(
                 "tools execution completed",
                 extra={"speech_id": speech_handle.id},
             )
+
+        # Emit tool execution metrics (only if at least one tool was invoked)
+        if executed_any_tool:
+            try:
+                session.emit(
+                    "metrics_collected",
+                    MetricsCollectedEvent(
+                        metrics=ToolExecutionMetrics(
+                            timestamp=time.time(),
+                            speech_id=None,
+                            total_execution_time=time.time() - tool_exec_start,
+                            tool_durations=tool_durations,
+                        )
+                    ),
+                )
+            except Exception:
+                pass
 
 
 def _is_valid_function_output(value: Any) -> bool:

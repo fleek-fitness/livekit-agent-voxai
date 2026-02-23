@@ -4,12 +4,12 @@ import asyncio
 import time
 from collections.abc import AsyncGenerator, AsyncIterable, Coroutine, Generator
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, TypeVar, Callable
 
 from livekit import rtc
 
 from .. import inference, llm, stt, tokenize, tts, utils, vad
-from ..llm import ChatContext, RealtimeModel, find_function_tools
+from ..llm import ChatContext, ChatItem, RealtimeModel, find_function_tools
 from ..llm.chat_context import _ReadOnlyChatContext
 from ..log import logger
 from ..types import NOT_GIVEN, FlushSentinel, NotGivenOr
@@ -86,6 +86,10 @@ class Agent:
 
         self._mcp_servers = mcp_servers
         self._activity: AgentActivity | None = None
+        # Reply callback tracking
+        self._reply_chat_ctx: llm.ChatContext | None = None
+        self._reply_messages: list[llm.ChatItem] = []
+        self._reply_callbacks: list[Callable[[llm.ChatContext, list[llm.ChatItem]], None]] = []
 
     @property
     def id(self) -> str:
@@ -198,6 +202,31 @@ class Agent:
         await self._activity.update_chat_ctx(
             chat_ctx, exclude_invalid_function_calls=exclude_invalid_function_calls
         )
+
+    # -- Reply callbacks --
+    def add_reply_callback(
+        self,
+        callback: Callable[[llm.ChatContext, list[llm.ChatItem]], None],
+    ) -> None:
+        self._reply_callbacks.append(callback)
+
+    def remove_reply_callback(
+        self,
+        callback: Callable[[llm.ChatContext, list[llm.ChatItem]], None],
+    ) -> None:
+        try:
+            self._reply_callbacks.remove(callback)
+        except ValueError:
+            pass
+
+    def reply_callback(self, chat_ctx: llm.ChatContext, replies: list[llm.ChatItem]) -> None:
+        if not replies:
+            return
+        for cb in self._reply_callbacks:
+            try:
+                cb(chat_ctx, replies)
+            except Exception:
+                logger.exception("reply callback failed")
 
     # -- Pipeline nodes --
     # They can all be overriden by subclasses, by default they use the STT/LLM/TTS specified in the
