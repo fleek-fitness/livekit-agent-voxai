@@ -1792,8 +1792,8 @@ class AgentActivity(RecognitionHooks):
     # endregion
 
     # Ensure agent state updates always trigger dynamic hooks
-    def _update_agent_state(self, state: "AgentState") -> None:
-        self._session._update_agent_state(state)
+    def _update_agent_state(self, state: "AgentState", **kwargs) -> None:
+        self._session._update_agent_state(state, **kwargs)
         if state == "speaking":
             self._dynamic_interruption.on_agent_speech_started()
 
