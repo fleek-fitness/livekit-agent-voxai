@@ -1352,21 +1352,24 @@ class AgentActivity(RecognitionHooks):
 
         if self.stt is not None and self._audio_recognition is not None:
             # Dynamic min_interruption_words
-            dyn_min_words = 0
             try:
                 dyn_min_words = self._dynamic_interruption.get_current_min_interruption_words()
             except Exception:
                 dyn_min_words = opt.min_interruption_words
 
+            text = self._audio_recognition.current_transcript
             if dyn_min_words > 0:
-                text = self._audio_recognition.current_transcript
                 if len(split_words(text, split_character=True)) < dyn_min_words:
                     return
 
             # Interruption ignore words
             if opt.interruption_ignore_words:
-                text = self._audio_recognition.current_transcript
-                if _matches_ignore_words(text, opt.interruption_ignore_words) or text.strip() == "":
+                is_empty = text.strip() == ""
+
+                if is_empty and dyn_min_words > 0:
+                    return
+
+                if (not is_empty) and _matches_ignore_words(text, opt.interruption_ignore_words):
                     return
 
         if self._rt_session is not None:
@@ -1409,6 +1412,7 @@ class AgentActivity(RecognitionHooks):
         self._session._update_user_state("speaking", last_speaking_time=speech_start_time)
         self._user_silence_event.clear()
         self._stt_eos_received = False
+        self._dynamic_interruption.on_user_speech_started()
 
         if self._false_interruption_timer:
             # cancel the timer when user starts speaking but leave the paused state unchanged
