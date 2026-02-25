@@ -22,15 +22,31 @@ class DynamicInterruptionManager:
         self._opts = opts
         self.conversation_state = ConversationStateTracker()
         self._collision_recorded_since_last_user_end = False
+        self._current_speech_within_continuity = False
 
     # ---- Interruption dynamics ----
     def on_agent_speech_started(self) -> None:
         # Today no-op; reserved for future heuristics (e.g., decay collisions on speak)
         pass
 
+    def on_user_speech_started(self) -> None:
+        if not getattr(self._opts, "enable_dynamic_interruption", False):
+            self._current_speech_within_continuity = False
+            return
+
+        last = self.conversation_state.last_user_speech_end_time
+        if last is None:
+            self._current_speech_within_continuity = False
+            return
+
+        threshold = float(getattr(self._opts, "conversation_continuity_threshold", 8.0) or 8.0)
+        self._current_speech_within_continuity = (time.time() - last) <= threshold
+
     def on_user_speech_ended(self) -> None:
         self.conversation_state.last_user_speech_end_time = time.time()
         self._collision_recorded_since_last_user_end = False
+        # Prevent "just-ended current speech" from being treated as continuity.
+        self._current_speech_within_continuity = False
 
     def get_current_min_interruption_words(self) -> int:
         """Compute an adaptive min_interruption_words threshold.
@@ -46,12 +62,12 @@ class DynamicInterruptionManager:
 
         last = self.conversation_state.last_user_speech_end_time
         base_min = int(getattr(self._opts, "min_interruption_words", 0) or 0)
-        threshold = float(getattr(self._opts, "conversation_continuity_threshold", 8.0) or 8.0)
 
         if last is None:
             return base_min
 
-        if (time.time() - last) <= threshold:
+        # Continuity is determined when user speech starts, not after it ends.
+        if self._current_speech_within_continuity:
             return 0
 
         return max(1, base_min)
@@ -87,5 +103,3 @@ class DynamicInterruptionManager:
     def reset_collisions(self) -> None:
         self.conversation_state.continuation_collisions = 0
         self._collision_recorded_since_last_user_end = False
-
-
