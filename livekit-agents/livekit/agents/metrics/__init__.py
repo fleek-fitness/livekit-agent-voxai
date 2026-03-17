@@ -1,10 +1,13 @@
 from .base import (
+    AgentLLMMetrics,
     AgentMetrics,
     EOUMetrics,
     LLMMetrics,
     RealtimeModelMetrics,
+    ResponseLatencyMetrics,
     STTMetrics,
     TTSMetrics,
+    ToolExecutionMetrics,
     VADMetrics,
 )
 from .usage_collector import UsageCollector, UsageSummary
@@ -12,12 +15,15 @@ from .utils import log_metrics
 
 __all__ = [
     "LLMMetrics",
+    "AgentLLMMetrics",
     "AgentMetrics",
     "VADMetrics",
     "EOUMetrics",
     "STTMetrics",
     "TTSMetrics",
     "RealtimeModelMetrics",
+    "ResponseLatencyMetrics",
+    "ToolExecutionMetrics",
     "UsageSummary",
     "UsageCollector",
     "log_metrics",

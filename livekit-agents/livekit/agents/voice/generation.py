@@ -25,11 +25,13 @@ from ..llm import (
 )
 from ..llm.chat_context import Instructions
 from ..log import logger
+from ..metrics import AgentLLMMetrics, ToolExecutionMetrics
 from ..telemetry import trace_types, tracer
 from ..types import USERDATA_TIMED_TRANSCRIPT, FlushSentinel, NotGivenOr
 from ..utils import aio, is_given
 from ..utils.aio import itertools
 from . import io
+from .events import MetricsCollectedEvent
 from .speech_handle import SpeechHandle
 from .transcription.text_transforms import _apply_text_transforms
 
@@ -61,12 +63,13 @@ def perform_llm_inference(
     chat_ctx: ChatContext,
     tool_ctx: ToolContext,
     model_settings: ModelSettings,
+    session: "AgentSession | None" = None,
 ) -> tuple[asyncio.Task[bool], _LLMGenerationData]:
     text_ch = aio.Chan[str | FlushSentinel]()
     function_ch = aio.Chan[llm.FunctionCall]()
     data = _LLMGenerationData(text_ch=text_ch, function_ch=function_ch)
     llm_task = asyncio.create_task(
-        _llm_inference_task(node, chat_ctx, tool_ctx, model_settings, data)
+        _llm_inference_task(node, chat_ctx, tool_ctx, model_settings, data, session=session)
     )
     llm_task.add_done_callback(lambda _: text_ch.close())
     llm_task.add_done_callback(lambda _: function_ch.close())
@@ -88,13 +91,20 @@ async def _llm_inference_task(
     tool_ctx: ToolContext,
     model_settings: ModelSettings,
     data: _LLMGenerationData,
+    *,
+    session: "AgentSession | None" = None,
 ) -> bool:
     start_time = time.perf_counter()
     current_span = trace.get_current_span()
     data.started_fut.set_result(None)
 
+    agent_llm_start_time = time.time()
+    ttft_captured = False
+
     text_ch, function_ch = data.text_ch, data.function_ch
+    tools_start = time.time()
     tools = tool_ctx.flatten()
+    tools_prep_time = time.time() - tools_start
 
     current_span.set_attributes(
         {
@@ -114,19 +124,57 @@ async def _llm_inference_task(
         }
     )
 
+    llm_node_start = time.time()
     llm_node = node(chat_ctx, tools, model_settings)
     if asyncio.iscoroutine(llm_node):
         llm_node = await llm_node
+    node_exec_time = time.time() - llm_node_start
 
     # store any updated tools, to ensure subsequent tool calls in the same turn (nested calls)
     # are using the newer tools.
     # tool_ctx here is ephemeral for this turn, and we allow manipulations
+    tool_update_start = time.time()
     tool_ctx.update_tools(tools)
     tools_snapshot = tools.copy()
+    tool_update_time = time.time() - tool_update_start
+
+    total_prep_overhead = tools_prep_time + node_exec_time + tool_update_time
+    logger.debug(
+        "Agent LLM Preparation Overhead: %.1fms (Tools: %.1fms, Node: %.1fms, Update: %.1fms)",
+        total_prep_overhead * 1000,
+        tools_prep_time * 1000,
+        node_exec_time * 1000,
+        tool_update_time * 1000,
+    )
 
     if isinstance(llm_node, str):
         data.generated_text = llm_node
         text_ch.send_nowait(llm_node)
+
+        if not ttft_captured and session is not None:
+            ttft_captured = True
+            agent_ttft = time.time() - agent_llm_start_time
+            logger.debug(
+                "Agent LLM TTFT: %.1fms (prep: %.1fms, network: %.1fms)",
+                agent_ttft * 1000,
+                total_prep_overhead * 1000,
+                (agent_ttft - total_prep_overhead) * 1000,
+            )
+            try:
+                session.emit(
+                    "metrics_collected",
+                    MetricsCollectedEvent(
+                        metrics=AgentLLMMetrics(
+                            timestamp=time.time(),
+                            speech_id=None,
+                            agent_ttft=agent_ttft,
+                            llm_node_await=node_exec_time,
+                        )
+                    ),
+                )
+            except Exception:
+                pass
+
         current_span.set_attribute(trace_types.ATTR_RESPONSE_TEXT, data.generated_text)
         return True
 
@@ -143,6 +191,31 @@ async def _llm_inference_task(
             if isinstance(chunk, str):
                 data.generated_text += chunk
                 text_ch.send_nowait(chunk)
+
+                if not ttft_captured and chunk.strip() and session is not None:
+                    ttft_captured = True
+                    first_chunk_elapsed = time.time() - agent_llm_start_time
+                    agent_ttft = first_chunk_elapsed
+                    logger.debug(
+                        "Agent LLM TTFT: %.1fms (prep: %.1fms, network: %.1fms)",
+                        agent_ttft * 1000,
+                        total_prep_overhead * 1000,
+                        (agent_ttft - total_prep_overhead) * 1000,
+                    )
+                    try:
+                        session.emit(
+                            "metrics_collected",
+                            MetricsCollectedEvent(
+                                metrics=AgentLLMMetrics(
+                                    timestamp=time.time(),
+                                    speech_id=None,
+                                    agent_ttft=agent_ttft,
+                                    llm_node_await=node_exec_time,
+                                )
+                            ),
+                        )
+                    except Exception:
+                        pass
 
             elif isinstance(chunk, ChatChunk):
                 if not chunk.delta:
@@ -174,6 +247,35 @@ async def _llm_inference_task(
                 if chunk.delta.content:
                     data.generated_text += chunk.delta.content
                     text_ch.send_nowait(chunk.delta.content)
+
+                    if (
+                        not ttft_captured
+                        and chunk.delta.content.strip()
+                        and session is not None
+                    ):
+                        ttft_captured = True
+                        first_chunk_elapsed = time.time() - agent_llm_start_time
+                        agent_ttft = first_chunk_elapsed
+                        logger.debug(
+                            "Agent LLM TTFT: %.1fms (prep: %.1fms, network: %.1fms)",
+                            agent_ttft * 1000,
+                            total_prep_overhead * 1000,
+                            (agent_ttft - total_prep_overhead) * 1000,
+                        )
+                        try:
+                            session.emit(
+                                "metrics_collected",
+                                MetricsCollectedEvent(
+                                    metrics=AgentLLMMetrics(
+                                        timestamp=time.time(),
+                                        speech_id=None,
+                                        agent_ttft=agent_ttft,
+                                        llm_node_await=node_exec_time,
+                                    )
+                                ),
+                            )
+                        except Exception:
+                            pass
 
             elif isinstance(chunk, FlushSentinel):
                 text_ch.send_nowait(chunk)
@@ -475,8 +577,12 @@ async def _execute_tools_task(
         tool_output.output.append(out)
 
     tasks: list[asyncio.Task[Any]] = []
+    tool_exec_start = time.time()
+    executed_any_tool = False
+    tool_durations: dict[str, float] = {}
     try:
         async for fnc_call in function_stream:
+            executed_any_tool = True
             if tool_choice == "none":
                 logger.error(
                     "received a tool call with tool_choice set to 'none', ignoring",
@@ -660,10 +766,26 @@ async def _execute_tools_task(
                     # TODO(theomonnom): Add the agent handoff inside the current_span
                     _tool_completed(output)
 
+                started_at = time.time()
                 task = asyncio.create_task(
                     _traceable_fnc_tool(function_callable, fnc_call),
                     name=f"func_exec_{fnc_call.name}",  # task name is used for logging when the task is cancelled
                 )
+
+                def _record_tool_duration(
+                    _: asyncio.Task[Any], *, name: str, started_at: float
+                ) -> None:
+                    try:
+                        tool_durations[name] = time.time() - started_at
+                    except Exception:
+                        pass
+
+                task.add_done_callback(
+                    lambda t, _name=fnc_call.name, _started=started_at: _record_tool_duration(
+                        t, name=_name, started_at=_started
+                    )
+                )
+
                 _set_activity_task_info(
                     task, speech_handle=speech_handle, function_call=fnc_call, inline_task=True
                 )
@@ -704,6 +826,23 @@ async def _execute_tools_task(
                 "tools execution completed",
                 extra={"speech_id": speech_handle.id},
             )
+
+        # Emit tool execution metrics (only if at least one tool was invoked)
+        if executed_any_tool:
+            try:
+                session.emit(
+                    "metrics_collected",
+                    MetricsCollectedEvent(
+                        metrics=ToolExecutionMetrics(
+                            timestamp=time.time(),
+                            speech_id=None,
+                            total_execution_time=time.time() - tool_exec_start,
+                            tool_durations=tool_durations,
+                        )
+                    ),
+                )
+            except Exception:
+                pass
 
 
 @dataclass
