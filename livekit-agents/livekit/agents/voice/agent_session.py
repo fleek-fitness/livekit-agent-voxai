@@ -852,101 +852,163 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
         drain: bool = False,
         error: llm.LLMError | stt.STTError | tts.TTSError | llm.RealtimeModelError | None = None,
     ) -> None:
+        close_trace_id = f"{id(self)}-{time.monotonic_ns()}"
+
+        def _log_aclose_trace(event: str, **extra: object) -> None:
+            fields = {
+                "trace_id": close_trace_id,
+                "event": event,
+                "reason": reason.value,
+                "drain": drain,
+                **extra,
+            }
+            field_text = " ".join(
+                f"{key}={value!r}" for key, value in fields.items() if value is not None
+            )
+            logger.info("agent_session_aclose_trace %s", field_text)
+
+        _log_aclose_trace("aclose_start")
+
         if self._root_span_context:
             # make `activity.drain` and `on_exit` under the root span
             otel_context.attach(self._root_span_context)
 
-        async with self._lock:
-            if not self._started:
-                return
+        try:
+            async with self._lock:
+                if not self._started:
+                    _log_aclose_trace("aclose_skip_not_started")
+                    return
 
-            self._closing = True
-            self._cancel_user_away_timer()
-            self._on_aec_warmup_expired()  # always clear aec warmup when closing the session
+                self._closing = True
+                self._cancel_user_away_timer()
+                self._on_aec_warmup_expired()  # always clear aec warmup when closing the session
 
-            activity = self._activity
-            while activity and isinstance(agent_task := activity.agent, AgentTask):
-                # notify AgentTask to complete and wait it to resume the parent agent
-                agent_task.cancel()
-                await agent_task._wait_for_inactive()
+                activity = self._activity
+                while activity and isinstance(agent_task := activity.agent, AgentTask):
+                    # notify AgentTask to complete and wait it to resume the parent agent
+                    agent_task.cancel()
+                    _log_aclose_trace("step_start", step="agent_task._wait_for_inactive")
+                    await agent_task._wait_for_inactive()
+                    _log_aclose_trace("step_done", step="agent_task._wait_for_inactive")
 
-                if old_agent := agent_task._old_agent:
-                    activity = old_agent._activity
-                else:
-                    break
+                    if old_agent := agent_task._old_agent:
+                        activity = old_agent._activity
+                    else:
+                        break
 
-            if activity is not None:
-                if not drain:
-                    try:
-                        # force interrupt speeches when closing the session
-                        await activity.interrupt(force=True)
-                    except RuntimeError:
-                        # uninterruptible speech
-                        pass
-                await activity.drain()
+                if activity is not None:
+                    if not drain:
+                        try:
+                            # force interrupt speeches when closing the session
+                            _log_aclose_trace(
+                                "step_start", step="activity.interrupt(force=True)"
+                            )
+                            await activity.interrupt(force=True)
+                            _log_aclose_trace(
+                                "step_done", step="activity.interrupt(force=True)"
+                            )
+                        except RuntimeError:
+                            # uninterruptible speech
+                            _log_aclose_trace(
+                                "step_runtime_error_ignored",
+                                step="activity.interrupt(force=True)",
+                            )
+                            pass
 
-                # wait any uninterruptible speech to finish
-                if activity.current_speech:
-                    await activity.current_speech
+                    _log_aclose_trace("step_start", step="activity.drain")
+                    await activity.drain()
+                    _log_aclose_trace("step_done", step="activity.drain")
 
-                # detach the inputs and outputs
-                self.input.audio = None
-                self.input.video = None
-                self.output.audio = None
-                self.output.transcription = None
+                    # wait any uninterruptible speech to finish
+                    if activity.current_speech:
+                        _log_aclose_trace("step_start", step="activity.current_speech")
+                        await activity.current_speech
+                        _log_aclose_trace("step_done", step="activity.current_speech")
 
-                if (
-                    reason != CloseReason.ERROR
-                    and (audio_recognition := activity._audio_recognition) is not None
-                ):
-                    # wait for the user transcript to be committed
-                    audio_recognition.commit_user_turn(audio_detached=True, transcript_timeout=2.0)
+                    # detach the inputs and outputs
+                    self.input.audio = None
+                    self.input.video = None
+                    self.output.audio = None
+                    self.output.transcription = None
 
-                await activity.aclose()
-            self._activity = None
+                    if (
+                        reason != CloseReason.ERROR
+                        and (audio_recognition := activity._audio_recognition) is not None
+                    ):
+                        # wait for the user transcript to be committed
+                        audio_recognition.commit_user_turn(
+                            audio_detached=True, transcript_timeout=2.0
+                        )
 
-            if self._agent_speaking_span:
-                self._agent_speaking_span.end()
-                self._agent_speaking_span = None
+                    _log_aclose_trace("step_start", step="activity.aclose")
+                    await activity.aclose()
+                    _log_aclose_trace("step_done", step="activity.aclose")
+                self._activity = None
 
-            if self._user_speaking_span:
-                self._user_speaking_span.end()
-                self._user_speaking_span = None
+                if self._agent_speaking_span:
+                    self._agent_speaking_span.end()
+                    self._agent_speaking_span = None
 
-            if self._forward_audio_atask is not None:
-                await utils.aio.cancel_and_wait(self._forward_audio_atask)
+                if self._user_speaking_span:
+                    self._user_speaking_span.end()
+                    self._user_speaking_span = None
 
-            if self._recorder_io:
-                await self._recorder_io.aclose()
+                if self._forward_audio_atask is not None:
+                    _log_aclose_trace(
+                        "step_start", step="forward_audio.cancel_and_wait"
+                    )
+                    await utils.aio.cancel_and_wait(self._forward_audio_atask)
+                    _log_aclose_trace(
+                        "step_done", step="forward_audio.cancel_and_wait"
+                    )
 
-            if self._ivr_activity is not None:
-                await self._ivr_activity.aclose()
+                if self._recorder_io:
+                    _log_aclose_trace("step_start", step="recorder_io.aclose")
+                    await self._recorder_io.aclose()
+                    _log_aclose_trace("step_done", step="recorder_io.aclose")
 
-            if self._session_span:
-                self._session_span.end()
-                self._session_span = None
+                if self._ivr_activity is not None:
+                    _log_aclose_trace("step_start", step="ivr_activity.aclose")
+                    await self._ivr_activity.aclose()
+                    _log_aclose_trace("step_done", step="ivr_activity.aclose")
 
-            self._started = False
+                if self._session_span:
+                    self._session_span.end()
+                    self._session_span = None
 
-            self.emit("close", CloseEvent(error=error, reason=reason))
+                self._started = False
 
-            self._cancel_user_away_timer()
-            self._user_state = "listening"
-            self._agent_state = "initializing"
-            self._llm_error_counts = 0
-            self._tts_error_counts = 0
-            self._root_span_context = None
+                self.emit("close", CloseEvent(error=error, reason=reason))
 
-            # close client events handler before room io
-            if self._client_events_handler:
-                await self._client_events_handler.aclose()
-                self._client_events_handler = None
+                self._cancel_user_away_timer()
+                self._user_state = "listening"
+                self._agent_state = "initializing"
+                self._llm_error_counts = 0
+                self._tts_error_counts = 0
+                self._root_span_context = None
 
-            # close room io after close event is emitted
-            if self._room_io:
-                await self._room_io.aclose()
-                self._room_io = None
+                # close client events handler before room io
+                if self._client_events_handler:
+                    _log_aclose_trace(
+                        "step_start", step="client_events_handler.aclose"
+                    )
+                    await self._client_events_handler.aclose()
+                    _log_aclose_trace(
+                        "step_done", step="client_events_handler.aclose"
+                    )
+                    self._client_events_handler = None
 
+                # close room io after close event is emitted
+                if self._room_io:
+                    _log_aclose_trace("step_start", step="room_io.aclose")
+                    await self._room_io.aclose()
+                    _log_aclose_trace("step_done", step="room_io.aclose")
+                    self._room_io = None
+        except Exception as e:
+            _log_aclose_trace("aclose_error", error=str(e))
+            raise
+
+        _log_aclose_trace("aclose_end")
         logger.debug("session closed", extra={"reason": reason.value, "error": error})
 
     async def aclose(self) -> None:

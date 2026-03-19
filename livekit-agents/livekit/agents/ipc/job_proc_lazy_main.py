@@ -296,6 +296,20 @@ class _JobProc:
         job_ctx_token = _JobContextVar.set(self._job_ctx)
         http_context._new_session_ctx()
 
+        shutdown_trace_id = f"{id(self)}-{asyncio.get_running_loop().time():.6f}"
+
+        def _log_shutdown_stage(event: str, **extra: object) -> None:
+            fields = {
+                "trace_id": shutdown_trace_id,
+                "event": event,
+                "job_id": self._job_ctx.job.id,
+                **extra,
+            }
+            field_text = " ".join(
+                f"{key}={value!r}" for key, value in fields.items() if value is not None
+            )
+            logger.info("job_proc_shutdown_trace %s", field_text)
+
         @tracer.start_as_current_span("job_entrypoint")
         async def _traceable_entrypoint(job_ctx: JobContext) -> None:
             job = job_ctx.job
@@ -347,18 +361,32 @@ class _JobProc:
         job_entry_task.add_done_callback(_on_entry_done)
 
         shutdown_info = await self._shutdown_fut
+        _log_shutdown_stage(
+            "shutdown_fut_resolved",
+            reason=shutdown_info.reason,
+            user_initiated=shutdown_info.user_initiated,
+        )
 
         # TODO(theomonnom): move this code?
         if session := self._job_ctx._primary_agent_session:
+            _log_shutdown_stage("session_aclose_start")
             await session.aclose()
+            _log_shutdown_stage("session_aclose_done")
+        else:
+            _log_shutdown_stage("session_aclose_skipped_no_primary_session")
 
         if self._session_end_fnc:
             try:
+                _log_shutdown_stage("session_end_callback_start")
                 await self._session_end_fnc(self._job_ctx)
+                _log_shutdown_stage("session_end_callback_done")
             except Exception:
+                _log_shutdown_stage("session_end_callback_error")
                 logger.exception("error while executing the on_session_end callback")
 
+        _log_shutdown_stage("job_ctx_on_session_end_start")
         await self._job_ctx._on_session_end()
+        _log_shutdown_stage("job_ctx_on_session_end_done")
 
         logger.debug(
             "shutting down job task",
@@ -376,8 +404,11 @@ class _JobProc:
                     )
                 )
 
+            _log_shutdown_stage("shutdown_callbacks_start", count=len(shutdown_tasks))
             await asyncio.gather(*shutdown_tasks)
+            _log_shutdown_stage("shutdown_callbacks_done", count=len(shutdown_tasks))
         except Exception:
+            _log_shutdown_stage("shutdown_callbacks_error")
             logger.exception("error while shutting down the job")
 
         if tasks := self._job_ctx._pending_tasks:
