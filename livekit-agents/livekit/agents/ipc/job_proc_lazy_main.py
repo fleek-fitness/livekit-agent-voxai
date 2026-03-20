@@ -323,11 +323,34 @@ class _JobProc:
 
         shutdown_info = await self._shutdown_fut
 
-        # TODO(theomonnom): move this code?
+        # Close agent session first (stops audio processing)
         if session := self._job_ctx._primary_agent_session:
             await session.aclose()
 
-        await self._job_ctx._on_session_end()
+        # Run shutdown callbacks before non-critical cleanup.
+        # These callbacks handle DB updates, recording finalization, and
+        # concurrency release — operations that must complete for data integrity.
+        # Previously, callbacks ran after _on_session_end/send(Exiting)/room.disconnect,
+        # meaning any crash or hang in those steps would prevent DB finalization.
+        try:
+            shutdown_tasks = []
+            for callback in self._job_ctx._shutdown_callbacks:
+                shutdown_tasks.append(
+                    asyncio.create_task(
+                        callback(shutdown_info.reason), name="job_shutdown_callback"
+                    )
+                )
+
+            await asyncio.gather(*shutdown_tasks)
+        except Exception:
+            logger.exception("error while shutting down the job")
+
+        # Non-critical cleanup: session report, IPC notification, room disconnect.
+        # Failures here do not affect call data integrity.
+        try:
+            await self._job_ctx._on_session_end()
+        except Exception:
+            logger.exception("error in _on_session_end")
 
         if self._session_end_fnc:
             try:
@@ -341,19 +364,6 @@ class _JobProc:
         )
         await self._client.send(Exiting(reason=shutdown_info.reason))
         await self._room.disconnect()
-
-        try:
-            shutdown_tasks = []
-            for callback in self._job_ctx._shutdown_callbacks:
-                shutdown_tasks.append(
-                    asyncio.create_task(
-                        callback(shutdown_info.reason), name="job_shutdown_callback"
-                    )
-                )
-
-            await asyncio.gather(*shutdown_tasks)
-        except Exception:
-            logger.exception("error while shutting down the job")
 
         self._job_ctx._on_cleanup()
         await http_context._close_http_ctx()

@@ -819,8 +819,9 @@ async def run_job(
         extra={"reason": shutdown_info.reason, "user_initiated": shutdown_info.user_initiated},
     )
 
-    await room.disconnect()
-
+    # Run shutdown callbacks before room disconnect.
+    # Callbacks handle DB updates, recording finalization, and concurrency release
+    # which must complete for data integrity regardless of room disconnect outcome.
     try:
         shutdown_tasks = []
         for callback in job_ctx._shutdown_callbacks:
@@ -831,6 +832,8 @@ async def run_job(
         await asyncio.gather(*shutdown_tasks)
     except Exception:
         logger.exception("error while shutting down the job")
+
+    await room.disconnect()
 
     await http_context._close_http_ctx()
     _JobContextVar.reset(job_ctx_token)
