@@ -89,7 +89,9 @@ _SpeechHandleContextVar = contextvars.ContextVar["SpeechHandle"]("agents_speech_
 
 
 def _matches_ignore_words(text: str, ignore_words: list[str] | None) -> bool:
-    """Return True if `text` can be composed entirely of the ignore words."""
+    """Return True if `text` can be composed entirely of ignore words,
+    or is a partial (prefix) match where completed segments are ignore words
+    and the trailing segment is a prefix of an ignore word."""
     import string
 
     if not text:
@@ -128,7 +130,20 @@ def _matches_ignore_words(text: str, ignore_words: list[str] | None) -> bool:
             if i >= len(word) and dp[i - len(word)] and text_cleaned[i - len(word) : i] == word:
                 dp[i] = True
                 break
-    return dp[len(text_cleaned)]
+
+    # Exact match: text is fully composed of ignore words
+    if dp[len(text_cleaned)]:
+        return True
+
+    # Partial match: completed ignore words + trailing prefix of an ignore word
+    for i in range(len(text_cleaned)):
+        if dp[i]:
+            suffix = text_cleaned[i:]
+            for word in cleaned_ignore_words:
+                if word.startswith(suffix) and word != suffix:
+                    return True
+
+    return False
 
 
 @dataclass
