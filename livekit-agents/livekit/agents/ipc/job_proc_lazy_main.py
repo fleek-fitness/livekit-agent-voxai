@@ -17,6 +17,7 @@ if current_process().name == "job_proc":
 import asyncio
 import contextlib
 import socket
+import time
 from collections.abc import Awaitable
 from dataclasses import dataclass
 from typing import Any, Callable, cast
@@ -323,10 +324,39 @@ class _JobProc:
 
         shutdown_info = await self._shutdown_fut
 
-        # TODO(theomonnom): move this code?
-        if session := self._job_ctx._primary_agent_session:
-            await session.aclose()
+        _ACLOSE_TIMEOUT_SECONDS = 15.0
 
+        _room_name = self._room.name if self._room else None
+        if session := self._job_ctx._primary_agent_session:
+            _aclose_start = time.monotonic()
+            logger.info(
+                "shutdown: session.aclose() starting",
+                extra={"room": _room_name},
+            )
+            try:
+                await asyncio.wait_for(session.aclose(), timeout=_ACLOSE_TIMEOUT_SECONDS)
+                _aclose_elapsed_ms = round((time.monotonic() - _aclose_start) * 1000, 1)
+                logger.info(
+                    "shutdown: session.aclose() completed",
+                    extra={"elapsed_ms": _aclose_elapsed_ms, "room": _room_name},
+                )
+            except asyncio.TimeoutError:
+                _aclose_elapsed_ms = round((time.monotonic() - _aclose_start) * 1000, 1)
+                logger.error(
+                    "shutdown: session.aclose() timed out -- proceeding with shutdown chain",
+                    extra={
+                        "timeout_seconds": _ACLOSE_TIMEOUT_SECONDS,
+                        "elapsed_ms": _aclose_elapsed_ms,
+                        "room": _room_name,
+                    },
+                )
+            except Exception:
+                logger.exception(
+                    "shutdown: session.aclose() raised -- proceeding with shutdown chain",
+                    extra={"room": _room_name},
+                )
+
+        logger.info("shutdown: session_end phase starting")
         await self._job_ctx._on_session_end()
 
         if self._session_end_fnc:
@@ -340,8 +370,11 @@ class _JobProc:
             extra={"reason": shutdown_info.reason, "user_initiated": shutdown_info.user_initiated},
         )
         await self._client.send(Exiting(reason=shutdown_info.reason))
+
+        logger.info("shutdown: room.disconnect() starting")
         await self._room.disconnect()
 
+        logger.info("shutdown: shutdown_callbacks starting")
         try:
             shutdown_tasks = []
             for callback in self._job_ctx._shutdown_callbacks:
@@ -354,6 +387,7 @@ class _JobProc:
             await asyncio.gather(*shutdown_tasks)
         except Exception:
             logger.exception("error while shutting down the job")
+        logger.info("shutdown: shutdown_callbacks completed")
 
         self._job_ctx._on_cleanup()
         await http_context._close_http_ctx()

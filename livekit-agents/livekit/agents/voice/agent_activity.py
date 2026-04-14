@@ -701,14 +701,67 @@ class AgentActivity(RecognitionHooks):
         if isinstance(self.vad, vad.VAD):
             self.vad.off("metrics_collected", self._on_metrics_collected)
 
+        _RT_SESSION_CLOSE_TIMEOUT = 8.0
+        _AUDIO_RECOGNITION_CLOSE_TIMEOUT = 5.0
+
         if self._rt_session is not None:
-            await self._rt_session.aclose()
+            _start = time.monotonic()
+            logger.debug("closing rt_session")
+            try:
+                await asyncio.wait_for(
+                    self._rt_session.aclose(), timeout=_RT_SESSION_CLOSE_TIMEOUT
+                )
+                _elapsed_ms = round((time.monotonic() - _start) * 1000, 1)
+                if _elapsed_ms > 5000:
+                    logger.warning(
+                        "rt_session.aclose() slow", extra={"elapsed_ms": _elapsed_ms}
+                    )
+                else:
+                    logger.debug(
+                        "rt_session.aclose() completed", extra={"elapsed_ms": _elapsed_ms}
+                    )
+            except asyncio.TimeoutError:
+                logger.error(
+                    "rt_session.aclose() timed out",
+                    extra={
+                        "timeout_seconds": _RT_SESSION_CLOSE_TIMEOUT,
+                        "elapsed_ms": round((time.monotonic() - _start) * 1000, 1),
+                    },
+                )
+            except Exception:
+                logger.exception("rt_session.aclose() raised")
 
         if self._realtime_spans is not None:
             self._realtime_spans.clear()
 
         if self._audio_recognition is not None:
-            await self._audio_recognition.aclose()
+            _start = time.monotonic()
+            logger.debug("closing audio_recognition")
+            try:
+                await asyncio.wait_for(
+                    self._audio_recognition.aclose(), timeout=_AUDIO_RECOGNITION_CLOSE_TIMEOUT
+                )
+                _elapsed_ms = round((time.monotonic() - _start) * 1000, 1)
+                if _elapsed_ms > 3000:
+                    logger.warning(
+                        "audio_recognition.aclose() slow",
+                        extra={"elapsed_ms": _elapsed_ms},
+                    )
+                else:
+                    logger.debug(
+                        "audio_recognition.aclose() completed",
+                        extra={"elapsed_ms": _elapsed_ms},
+                    )
+            except asyncio.TimeoutError:
+                logger.error(
+                    "audio_recognition.aclose() timed out",
+                    extra={
+                        "timeout_seconds": _AUDIO_RECOGNITION_CLOSE_TIMEOUT,
+                        "elapsed_ms": round((time.monotonic() - _start) * 1000, 1),
+                    },
+                )
+            except Exception:
+                logger.exception("audio_recognition.aclose() raised")
 
         await self._interrupt_paused_speech(old_task=self._interrupt_paused_speech_task)
         self._interrupt_paused_speech_task = None
