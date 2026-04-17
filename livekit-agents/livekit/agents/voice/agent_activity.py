@@ -1219,7 +1219,13 @@ class AgentActivity(RecognitionHooks):
 
     def _on_metrics_collected(
         self,
-        ev: STTMetrics | TTSMetrics | VADMetrics | LLMMetrics | RealtimeModelMetrics | AgentLLMMetrics | ToolExecutionMetrics,
+        ev: STTMetrics
+        | TTSMetrics
+        | VADMetrics
+        | LLMMetrics
+        | RealtimeModelMetrics
+        | AgentLLMMetrics
+        | ToolExecutionMetrics,
     ) -> None:
         # Attach speech_id when possible (for LLM/TTS/AgentLLM)
         if speech_handle := _SpeechHandleContextVar.get(None):
@@ -1644,6 +1650,14 @@ class AgentActivity(RecognitionHooks):
                     info.new_transcript, self._session.options.interruption_ignore_words
                 ):
                     self._cancel_preemptive_generation()
+                    # PROD-1419: An ignored turn (typically a brief noise like
+                    # "네"/"예" caught during agent speech) must not leak its
+                    # timestamps into the next real turn's latency metrics.
+                    # Reset the EOU clock and the audio recognition turn state
+                    # so the next user speech starts with fresh timing.
+                    self._last_eou_timestamp = None
+                    if self._audio_recognition is not None:
+                        self._audio_recognition.reset_user_turn_state()
                     return False
 
         old_task = self._user_turn_completed_atask

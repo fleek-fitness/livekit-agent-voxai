@@ -28,6 +28,11 @@ if TYPE_CHECKING:
 MIN_LANGUAGE_DETECTION_LENGTH = 5
 # Mirrors turn_detector.base.MAX_HISTORY_TURNS for tracing
 _EOU_MAX_HISTORY_TURNS = 6
+# If STT emits a final transcript more than this many seconds after the last
+# VAD speech event, treat the VAD timestamp as stale (likely missed speech due
+# to AEC/low volume) and fall back to the STT arrival time for latency
+# metrics. See PROD-1419.
+_VAD_STT_DESYNC_THRESHOLD_SEC = 3.0
 
 
 @dataclass
@@ -249,6 +254,23 @@ class AudioRecognition:
         self.update_stt(None)
         self.update_stt(stt)
 
+    def reset_user_turn_state(self) -> None:
+        """Reset in-memory user turn state without flushing STT.
+
+        Used when a detected turn is filtered out (e.g., matched by
+        ``interruption_ignore_words``) so its timestamps and transcript do
+        not pollute the next turn's latency metrics. Unlike
+        :meth:`clear_user_turn`, this does not rebuild the STT stream.
+        """
+        self._last_speaking_time = None
+        self._speech_start_time = None
+        self._last_final_transcript_time = None
+        self._audio_transcript = ""
+        self._audio_interim_transcript = ""
+        self._audio_preflight_transcript = ""
+        self._final_transcript_confidence = []
+        self._user_turn_committed = False
+
     def commit_user_turn(
         self,
         *,
@@ -406,6 +428,21 @@ class AudioRecognition:
                 # the correct way is to ensure STT fires SpeechEventType.END_OF_SPEECH
                 # and using that timestamp for _last_speaking_time
                 self._last_speaking_time = time.time()
+            elif time.time() - self._last_speaking_time > _VAD_STT_DESYNC_THRESHOLD_SEC:
+                # PROD-1419: VAD has been silent for longer than any realistic
+                # STT processing delay, yet STT just produced a final transcript.
+                # This typically means VAD missed the user's speech (e.g. AEC
+                # suppressed it, or an earlier noise "turn" left the timestamp
+                # stale). Fall back to the STT arrival time so the EOU/
+                # transcription metrics reflect real STT latency instead of
+                # the gap back to the stale VAD event.
+                vad_lag = time.time() - self._last_speaking_time
+                logger.debug(
+                    "VAD-STT desync detected; using STT timestamp for _last_speaking_time",
+                    extra={"vad_lag_sec": vad_lag},
+                )
+                self._last_speaking_time = time.time()
+                self._speech_start_time = time.time()
 
             if self._vad_base_turn_detection or self._user_turn_committed:
                 if transcript_changed:

@@ -713,6 +713,57 @@ async def test_unknown_function_call() -> None:
     assert "Unknown function: nonexistent_tool" in error_outputs[0].output
 
 
+async def test_interruption_ignore_words_resets_turn_state() -> None:
+    """PROD-1419: A turn filtered by interruption_ignore_words must not leak
+    its transcript or metric timestamps into the next real turn.
+
+    Repro: a brief "yes" noise is caught while the agent greeting is playing.
+    Because "yes" is in interruption_ignore_words, on_end_of_turn returns
+    False and no LLM reply is generated. Before the fix, the ignored turn's
+    transcript was left in _audio_transcript, so the NEXT real user turn
+    committed as "yes <real_text>" instead of just "<real_text>".
+    """
+    speed = 5.0
+
+    actions = FakeActions()
+    # agent initial greeting (triggered by on_enter)
+    actions.add_llm("Hi there!", input="instructions:say hello to the user")
+    actions.add_tts(2.0)
+    # ignored noise during/right after greeting
+    actions.add_user_speech(1.0, 1.2, "yes", stt_delay=0.2)
+    # real user query some time later
+    actions.add_user_speech(4.0, 5.5, "tell me a joke", stt_delay=0.2)
+    actions.add_llm("Here is a joke for you.")
+    actions.add_tts(1.0)
+
+    session = create_session(
+        actions,
+        speed_factor=speed,
+        extra_kwargs={
+            "min_interruption_words": 1,
+            "interruption_ignore_words": ["yes"],
+        },
+    )
+    agent = MyAgent(generate_reply_on_enter=True)
+
+    conversation_events: list[ConversationItemAddedEvent] = []
+    session.on("conversation_item_added", conversation_events.append)
+
+    await asyncio.wait_for(run_session(session, agent, drain_delay=0.5), timeout=SESSION_TIMEOUT)
+
+    user_items = [ev.item for ev in conversation_events if ev.item.role == "user"]
+    # only the real user query should commit; "yes" is filtered out
+    assert len(user_items) == 1, (
+        f"expected exactly 1 user message, got {len(user_items)}: "
+        f"{[i.text_content for i in user_items]}"
+    )
+    assert user_items[0].text_content == "tell me a joke", (
+        f"expected 'tell me a joke', got '{user_items[0].text_content}'. "
+        f"A leading 'yes ' means the ignored turn's transcript leaked into "
+        f"the next turn (PROD-1419 regression)."
+    )
+
+
 # helpers
 
 
