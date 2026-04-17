@@ -729,9 +729,9 @@ async def test_interruption_ignore_words_resets_turn_state() -> None:
     # agent initial greeting (triggered by on_enter)
     actions.add_llm("Hi there!", input="instructions:say hello to the user")
     actions.add_tts(2.0)
-    # ignored noise during/right after greeting
+    # ignored noise during greeting
     actions.add_user_speech(1.0, 1.2, "yes", stt_delay=0.2)
-    # real user query some time later
+    # real user query after greeting
     actions.add_user_speech(4.0, 5.5, "tell me a joke", stt_delay=0.2)
     actions.add_llm("Here is a joke for you.")
     actions.add_tts(1.0)

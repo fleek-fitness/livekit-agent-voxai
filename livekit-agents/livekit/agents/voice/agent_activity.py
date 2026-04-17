@@ -1652,12 +1652,13 @@ class AgentActivity(RecognitionHooks):
                     self._cancel_preemptive_generation()
                     # PROD-1419: An ignored turn (typically a brief noise like
                     # "네"/"예" caught during agent speech) must not leak its
-                    # timestamps into the next real turn's latency metrics.
-                    # Reset the EOU clock and the audio recognition turn state
-                    # so the next user speech starts with fresh timing.
+                    # timestamps into the next real turn's latency metrics,
+                    # nor its audio into the STT provider's buffer (some
+                    # providers otherwise concatenate the ignored utterance
+                    # with the user's next one).
                     self._last_eou_timestamp = None
                     if self._audio_recognition is not None:
-                        self._audio_recognition.reset_user_turn_state()
+                        self._audio_recognition.reset_user_turn_state(reset_stt=True)
                     return False
 
         old_task = self._user_turn_completed_atask

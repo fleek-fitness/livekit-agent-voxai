@@ -254,13 +254,19 @@ class AudioRecognition:
         self.update_stt(None)
         self.update_stt(stt)
 
-    def reset_user_turn_state(self) -> None:
-        """Reset in-memory user turn state without flushing STT.
+    def reset_user_turn_state(self, *, reset_stt: bool = False) -> None:
+        """Reset in-memory user turn state after a turn is discarded.
 
         Used when a detected turn is filtered out (e.g., matched by
         ``interruption_ignore_words``) so its timestamps and transcript do
-        not pollute the next turn's latency metrics. Unlike
-        :meth:`clear_user_turn`, this does not rebuild the STT stream.
+        not pollute the next turn's latency metrics.
+
+        When ``reset_stt`` is true, the STT stream is also rebuilt. This is
+        needed for providers (e.g. RTZR) that otherwise concatenate the
+        discarded utterance with whatever the user says next (e.g.
+        "안녕하세요" + "들리시나요" → "안 들리시나요"). It is off by default
+        because rebuilding the stream is heavier and not every STT needs
+        it.
         """
         self._last_speaking_time = None
         self._speech_start_time = None
@@ -270,6 +276,12 @@ class AudioRecognition:
         self._audio_preflight_transcript = ""
         self._final_transcript_confidence = []
         self._user_turn_committed = False
+
+        if reset_stt:
+            stt = self._stt
+            if stt is not None:
+                self.update_stt(None)
+                self.update_stt(stt)
 
     def commit_user_turn(
         self,

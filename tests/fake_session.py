@@ -87,15 +87,30 @@ async def run_session(session: AgentSession, agent: Agent, *, drain_delay: float
 
     # start the fake vad and stt
     t_origin = time.time()
-    audio_input.push(0.1)
 
-    # wait for the user speeches to be processed
-    await stt.fake_user_speeches_done
+    # Push audio periodically. FakeVAD/FakeSTT only need one frame each to
+    # start their internal timers, but if the STT stream is rebuilt mid-test
+    # (e.g. by an interruption_ignore_words reset), the new stream needs a
+    # fresh frame too. A steady drip covers both cases.
+    async def _push_audio() -> None:
+        while True:
+            audio_input.push(0.05)
+            await asyncio.sleep(0.05)
 
-    await asyncio.sleep(drain_delay)
-    with contextlib.suppress(RuntimeError):
-        await session.drain()
-    await session.aclose()
+    push_task = asyncio.create_task(_push_audio())
+
+    try:
+        # wait for the user speeches to be processed
+        await stt.fake_user_speeches_done
+
+        await asyncio.sleep(drain_delay)
+        with contextlib.suppress(RuntimeError):
+            await session.drain()
+        await session.aclose()
+    finally:
+        push_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await push_task
 
     if transcription_sync is not None:
         await transcription_sync.aclose()

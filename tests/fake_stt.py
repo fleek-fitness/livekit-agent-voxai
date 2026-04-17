@@ -67,6 +67,11 @@ class FakeSTT(STT):
                     raise ValueError("fake user speeches overlap")
         self._fake_user_speeches = fake_user_speeches
         self._done_fut = asyncio.Future[None]()
+        # Track emitted speeches across streams so that if the caller rebuilds
+        # the STT stream mid-test (e.g. AudioRecognition.reset_user_turn_state
+        # with reset_stt=True) the new stream does not replay speeches that
+        # were already handled by the previous stream.
+        self._emitted_speeches: set[int] = set()
 
         self._recognize_ch = utils.aio.Chan[RecognizeSentinel]()
         self._stream_ch = utils.aio.Chan[FakeRecognizeStream]()
@@ -213,6 +218,8 @@ class FakeRecognizeStream(RecognizeStream):
             return time.perf_counter() - start_time
 
         for fake_speech in self._stt._fake_user_speeches:
+            if id(fake_speech) in self._stt._emitted_speeches:
+                continue
             interim_transcript_time = fake_speech.end_time + fake_speech.stt_delay * 0.5
             if curr_time() < interim_transcript_time:
                 await asyncio.sleep(interim_transcript_time - curr_time())
@@ -222,6 +229,7 @@ class FakeRecognizeStream(RecognizeStream):
             if curr_time() < final_transcript_time:
                 await asyncio.sleep(final_transcript_time - curr_time())
             self.send_fake_transcript(fake_speech.transcript, is_final=True)
+            self._stt._emitted_speeches.add(id(fake_speech))
 
         with contextlib.suppress(asyncio.InvalidStateError):
             self._stt._done_fut.set_result(None)
