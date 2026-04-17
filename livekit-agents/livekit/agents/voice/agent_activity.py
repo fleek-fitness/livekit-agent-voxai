@@ -1597,6 +1597,14 @@ class AgentActivity(RecognitionHooks):
         # IMPORTANT: This method is sync to avoid it being cancelled by the AudioRecognition
         # We explicitly create a new task here
 
+        # PROD-1419: `_last_eou_timestamp` is normally set by on_end_of_speech
+        # (VAD end-of-speech). If VAD missed the user's speech (e.g. AEC
+        # suppression, or we reset state after an ignore_words filter), it
+        # stays None and e2e_latency can't be computed when TTS metrics arrive.
+        # Fall back to the speech-end time captured by the EOU task.
+        if self._last_eou_timestamp is None and info.stopped_speaking_at is not None:
+            self._last_eou_timestamp = info.stopped_speaking_at
+
         if self._scheduling_paused:
             self._cancel_preemptive_generation()
             logger.warning(
