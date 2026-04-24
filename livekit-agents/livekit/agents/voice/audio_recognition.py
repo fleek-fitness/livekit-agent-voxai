@@ -364,7 +364,8 @@ class AudioRecognition:
                 extra["transcript_delay"] = time.time() - self._last_speaking_time
             logger.debug("received user transcript", extra=extra)
 
-            self._last_final_transcript_time = time.time()
+            if self._should_advance_final_transcript_clock():
+                self._last_final_transcript_time = time.time()
             self._audio_transcript += f" {transcript}"
             self._audio_transcript = self._audio_transcript.lstrip()
             self._final_transcript_confidence.append(confidence)
@@ -420,7 +421,8 @@ class AudioRecognition:
             )
 
             # still need to increment it as it's used for turn detection,
-            self._last_final_transcript_time = time.time()
+            if self._should_advance_final_transcript_clock():
+                self._last_final_transcript_time = time.time()
             # preflight transcript includes all pre-committed transcripts (including final transcript from the previous STT run)
             self._audio_preflight_transcript = (self._audio_transcript + " " + transcript).lstrip()
             self._audio_interim_transcript = transcript
@@ -698,3 +700,24 @@ class AudioRecognition:
             _set_participant_attributes(self._user_turn_span, room_io.linked_participant)
 
         return self._user_turn_span
+
+    def _should_advance_final_transcript_clock(self) -> bool:
+        # STT can emit final/preflight transcripts long after the user has
+        # actually stopped speaking (agent-TTS echo, late buffer flushes from
+        # providers that don't emit END_OF_SPEECH, ghost events during silence).
+        # If we blindly advance _last_final_transcript_time on every such event,
+        # transcription_delay (= last_final - last_speaking) grows without bound
+        # while _last_speaking_time stays pinned to the true VAD end, producing
+        # inflated metrics attributed to the wrong turn.
+        #
+        # Only advance the clock when the event plausibly belongs to the
+        # current user turn:
+        #   - no prior speech tracked yet (first event of the turn), or
+        #   - VAD currently reports speech, or
+        #   - the event arrived within the max endpointing window (legit
+        #     late STT arrival for a turn that's still being endpointed).
+        if self._last_speaking_time is None:
+            return True
+        if self._speaking:
+            return True
+        return time.time() - self._last_speaking_time <= self._max_endpointing_delay
