@@ -622,6 +622,17 @@ class AudioRecognition:
                 self._last_speaking_time = None
                 self._last_final_transcript_time = None
                 self._speech_start_time = None
+            else:
+                # Rejected turn (e.g. transcript below min_interruption_words,
+                # typical for short noise/filler during agent speech).
+                # Reset the metric reference timestamps so the next real turn's
+                # transcription_delay / end_of_turn_delay / started_speaking_at
+                # are not anchored to this rejected event. Transcript is kept
+                # so a follow-up utterance can still accumulate into the same
+                # logical user turn.
+                self._last_speaking_time = None
+                self._last_final_transcript_time = None
+                self._speech_start_time = None
 
             self._user_turn_committed = False
 
