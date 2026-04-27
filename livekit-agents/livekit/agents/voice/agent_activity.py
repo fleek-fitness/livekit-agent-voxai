@@ -674,6 +674,15 @@ class AgentActivity(RecognitionHooks):
 
     async def _close_session(self) -> None:
         assert self._lock.locked(), "_close_session should only be used when locked."
+        logger.info(
+            "AgentActivity._close_session start",
+            extra={
+                "has_rt_session": self._rt_session is not None,
+                "has_audio_recognition": self._audio_recognition is not None,
+                "has_interrupt_paused_speech_task": self._interrupt_paused_speech_task
+                is not None,
+            },
+        )
 
         if isinstance(self.llm, llm.LLM):
             self.llm.off("metrics_collected", self._on_metrics_collected)
@@ -702,34 +711,72 @@ class AgentActivity(RecognitionHooks):
             self.vad.off("metrics_collected", self._on_metrics_collected)
 
         if self._rt_session is not None:
+            logger.info("AgentActivity._close_session rt_session.aclose start")
             await self._rt_session.aclose()
+            logger.info("AgentActivity._close_session rt_session.aclose done")
 
         if self._realtime_spans is not None:
             self._realtime_spans.clear()
 
         if self._audio_recognition is not None:
+            logger.info("AgentActivity._close_session audio_recognition.aclose start")
             await self._audio_recognition.aclose()
+            logger.info("AgentActivity._close_session audio_recognition.aclose done")
 
+        logger.info("AgentActivity._close_session interrupt_paused_speech start")
         await self._interrupt_paused_speech(old_task=self._interrupt_paused_speech_task)
         self._interrupt_paused_speech_task = None
+        logger.info("AgentActivity._close_session interrupt_paused_speech done")
 
     async def aclose(self) -> None:
         # `aclose` must only be called by AgentSession
 
         async with self._lock:
             if self._closed:
+                logger.info("AgentActivity.aclose skipped: already closed")
                 return
 
+            logger.info(
+                "AgentActivity.aclose start",
+                extra={
+                    "has_current_speech": self._current_speech is not None,
+                    "current_speech_done": (
+                        bool(self._current_speech.done()) if self._current_speech else None
+                    ),
+                    "background_speeches_count": len(self._background_speeches),
+                    "speech_tasks_count": len(self._speech_tasks),
+                    "has_scheduling_task": self._scheduling_atask is not None,
+                    "scheduling_task_done": (
+                        bool(self._scheduling_atask.done())
+                        if self._scheduling_atask
+                        else None
+                    ),
+                },
+            )
             self._closed = True
             self._cancel_preemptive_generation()
 
             await self._close_session()
-            await asyncio.gather(*self._interrupt_background_speeches(force=False))
+            logger.info("AgentActivity.aclose close_session done")
+
+            interrupted_speeches = self._interrupt_background_speeches(force=False)
+            logger.info(
+                "AgentActivity.aclose interrupt_background_speeches start",
+                extra={"interrupted_speeches_count": len(interrupted_speeches)},
+            )
+            await asyncio.gather(*interrupted_speeches)
+            logger.info("AgentActivity.aclose interrupt_background_speeches done")
 
             if self._scheduling_atask is not None:
+                logger.info(
+                    "AgentActivity.aclose scheduling_task cancel start",
+                    extra={"scheduling_task_done": self._scheduling_atask.done()},
+                )
                 await utils.aio.cancel_and_wait(self._scheduling_atask)
+                logger.info("AgentActivity.aclose scheduling_task cancel done")
 
             self._agent._activity = None
+            logger.info("AgentActivity.aclose done")
 
     def push_audio(self, frame: rtc.AudioFrame) -> None:
         if not self._started:
