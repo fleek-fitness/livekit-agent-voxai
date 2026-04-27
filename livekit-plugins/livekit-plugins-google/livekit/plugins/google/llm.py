@@ -20,6 +20,7 @@ import os
 from dataclasses import dataclass
 from typing import Any, cast
 
+import google.auth.credentials
 from google.auth._default_async import default_async
 from google.genai import Client, types
 from google.genai.errors import APIError, ClientError, ServerError
@@ -47,6 +48,18 @@ def _is_gemini_3_model(model: str) -> bool:
 def _is_gemini_3_flash_model(model: str) -> bool:
     """Check if model is Gemini 3 Flash"""
     return "gemini-3-flash" in model.lower() or model.lower().startswith("gemini-3-flash")
+
+
+def _requires_thought_signatures(model: str) -> bool:
+    """Check if model requires thought_signature handling for multi-turn function calling.
+
+    Gemini 2.5+ models require thought signatures to be stored from responses and
+    passed back in subsequent requests for proper multi-turn function calling.
+    """
+    if _is_gemini_3_model(model):
+        return True
+    model_lower = model.lower()
+    return "gemini-2.5" in model_lower or model_lower.startswith("gemini-2.5")
 
 
 @dataclass
@@ -104,6 +117,7 @@ class LLM(llm.LLM):
         http_options: NotGivenOr[types.HttpOptions] = NOT_GIVEN,
         seed: NotGivenOr[int] = NOT_GIVEN,
         safety_settings: NotGivenOr[list[types.SafetySettingOrDict]] = NOT_GIVEN,
+        credentials: google.auth.credentials.Credentials | None = None,
     ) -> None:
         """
         Create a new instance of Google GenAI LLM.
@@ -163,6 +177,11 @@ class LLM(llm.LLM):
         else:
             gcp_project = None
             gcp_location = None
+            if credentials is not None:
+                logger.warning(
+                    "'credentials' is only applicable to VertexAI and will be ignored for the Gemini API"
+                )
+                credentials = None
             if not gemini_api_key:
                 raise ValueError(
                     "API key is required for Google API either via api_key or GOOGLE_API_KEY environment variable"  # noqa: E501
@@ -207,8 +226,9 @@ class LLM(llm.LLM):
             vertexai=use_vertexai,
             project=gcp_project,
             location=gcp_location,
+            credentials=credentials,
         )
-        # Store thought_signatures for Gemini 3 multi-turn function calling
+        # Store thought_signatures for Gemini 2.5+ multi-turn function calling
         self._thought_signatures: dict[str, bytes] = {}
 
     @property
@@ -240,9 +260,7 @@ class LLM(llm.LLM):
         if is_given(extra_kwargs):
             extra.update(extra_kwargs)
 
-        tool_choice = (
-            cast(ToolChoice, tool_choice) if is_given(tool_choice) else self._opts.tool_choice
-        )
+        tool_choice = tool_choice if is_given(tool_choice) else self._opts.tool_choice
         retrieval_config = (
             self._opts.retrieval_config if is_given(self._opts.retrieval_config) else None
         )
@@ -296,7 +314,7 @@ class LLM(llm.LLM):
             )
 
         if is_given(response_format):
-            extra["response_schema"] = to_response_format(response_format)  # type: ignore
+            extra["response_schema"] = to_response_format(response_format)
             extra["response_mime_type"] = "application/json"
 
         if is_given(self._opts.temperature):
@@ -322,7 +340,7 @@ class LLM(llm.LLM):
 
             # Extract both parameters
             _budget = None
-            _level = None
+            _level: str | types.ThinkingLevel | None = None
             if isinstance(thinking_cfg, dict):
                 _budget = thinking_cfg.get("thinking_budget")
                 _level = thinking_cfg.get("thinking_level")
@@ -401,9 +419,9 @@ class LLMStream(llm.LLMStream):
         request_id = utils.shortuuid()
 
         try:
-            # Pass thought_signatures for Gemini 3 multi-turn function calling
+            # Pass thought_signatures for Gemini 2.5+ multi-turn function calling
             thought_sigs = (
-                self._llm._thought_signatures if _is_gemini_3_model(self._model) else None
+                self._llm._thought_signatures if _requires_thought_signatures(self._model) else None
             )
             turns_dict, extra_data = self._chat_ctx.to_provider_format(
                 format="google", thought_signatures=thought_sigs
@@ -456,9 +474,6 @@ class LLMStream(llm.LLMStream):
 
                 candidate = response.candidates[0]
 
-                if not candidate.content or not candidate.content.parts:
-                    continue
-
                 if candidate.finish_reason is not None:
                     finish_reason = candidate.finish_reason
                     if candidate.finish_reason in BLOCKED_REASONS:
@@ -467,6 +482,9 @@ class LLMStream(llm.LLMStream):
                             retryable=False,
                             request_id=request_id,
                         )
+
+                if not candidate.content or not candidate.content.parts:
+                    continue
 
                 for part in candidate.content.parts:
                     chat_chunk = self._parse_part(request_id, part)
@@ -503,7 +521,7 @@ class LLMStream(llm.LLMStream):
                 status_code=e.code,
                 body=f"{e.message} {e.status}",
                 request_id=request_id,
-                retryable=False if e.code != 429 else True,
+                retryable=True if e.code in {429, 499} else False,
             ) from e
         except ServerError as e:
             raise APIStatusError(
@@ -521,6 +539,8 @@ class LLMStream(llm.LLMStream):
                 request_id=request_id,
                 retryable=retryable,
             ) from e
+        except (APIStatusError, APIConnectionError):
+            raise
         except Exception as e:
             raise APIConnectionError(
                 f"gemini llm: error generating content {str(e)}",
@@ -535,9 +555,9 @@ class LLMStream(llm.LLMStream):
                 call_id=part.function_call.id or utils.shortuuid("function_call_"),
             )
 
-            # Store thought_signature for Gemini 3 multi-turn function calling
+            # Store thought_signature for Gemini 2.5+ multi-turn function calling
             if (
-                _is_gemini_3_model(self._model)
+                _requires_thought_signatures(self._model)
                 and hasattr(part, "thought_signature")
                 and part.thought_signature
             ):
@@ -548,7 +568,7 @@ class LLMStream(llm.LLMStream):
                 delta=llm.ChoiceDelta(
                     role="assistant",
                     tool_calls=[tool_call],
-                    content=part.text,
+                    content=None,
                 ),
             )
             return chat_chunk

@@ -5,9 +5,9 @@ import functools
 import inspect
 import json
 import time
-from collections.abc import AsyncGenerator, AsyncIterable, Sequence
+from collections.abc import AsyncGenerator, AsyncIterable, Callable, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, Optional, Protocol, Union, runtime_checkable
+from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
 from opentelemetry import trace
 from pydantic import ValidationError
@@ -23,19 +23,22 @@ from ..llm import (
     ToolError,
     utils as llm_utils,
 )
+from ..llm.chat_context import Instructions
 from ..log import logger
+from ..metrics import AgentLLMMetrics, ToolExecutionMetrics
 from ..telemetry import trace_types, tracer
 from ..types import USERDATA_TIMED_TRANSCRIPT, FlushSentinel, NotGivenOr
 from ..utils import aio, is_given
 from ..utils.aio import itertools
 from . import io
+from .events import MetricsCollectedEvent
 from .speech_handle import SpeechHandle
-from .transcription.filters import apply_text_transforms
+from .transcription.text_transforms import _apply_text_transforms
 
 if TYPE_CHECKING:
     from .agent import Agent, ModelSettings
     from .agent_session import AgentSession
-    from .transcription.filters import TextTransforms
+    from .transcription.text_transforms import TextTransforms
 
 
 @runtime_checkable
@@ -60,12 +63,13 @@ def perform_llm_inference(
     chat_ctx: ChatContext,
     tool_ctx: ToolContext,
     model_settings: ModelSettings,
+    session: "AgentSession | None" = None,
 ) -> tuple[asyncio.Task[bool], _LLMGenerationData]:
-    text_ch = aio.Chan[Union[str, FlushSentinel]]()
+    text_ch = aio.Chan[str | FlushSentinel]()
     function_ch = aio.Chan[llm.FunctionCall]()
     data = _LLMGenerationData(text_ch=text_ch, function_ch=function_ch)
     llm_task = asyncio.create_task(
-        _llm_inference_task(node, chat_ctx, tool_ctx, model_settings, data)
+        _llm_inference_task(node, chat_ctx, tool_ctx, model_settings, data, session=session)
     )
     llm_task.add_done_callback(lambda _: text_ch.close())
     llm_task.add_done_callback(lambda _: function_ch.close())
@@ -87,18 +91,30 @@ async def _llm_inference_task(
     tool_ctx: ToolContext,
     model_settings: ModelSettings,
     data: _LLMGenerationData,
+    *,
+    session: "AgentSession | None" = None,
 ) -> bool:
     start_time = time.perf_counter()
     current_span = trace.get_current_span()
     data.started_fut.set_result(None)
 
+    agent_llm_start_time = time.time()
+    ttft_captured = False
+
     text_ch, function_ch = data.text_ch, data.function_ch
+    tools_start = time.time()
     tools = tool_ctx.flatten()
+    tools_prep_time = time.time() - tools_start
 
     current_span.set_attributes(
         {
             trace_types.ATTR_CHAT_CTX: json.dumps(
-                chat_ctx.to_dict(exclude_audio=True, exclude_image=True, exclude_timestamp=False)
+                chat_ctx.to_dict(
+                    exclude_audio=True,
+                    exclude_image=True,
+                    exclude_timestamp=True,
+                    exclude_metrics=True,
+                )
             ),
             trace_types.ATTR_FUNCTION_TOOLS: list(tool_ctx.function_tools.keys()),
             trace_types.ATTR_PROVIDER_TOOLS: [
@@ -108,18 +124,57 @@ async def _llm_inference_task(
         }
     )
 
+    llm_node_start = time.time()
     llm_node = node(chat_ctx, tools, model_settings)
     if asyncio.iscoroutine(llm_node):
         llm_node = await llm_node
+    node_exec_time = time.time() - llm_node_start
 
     # store any updated tools, to ensure subsequent tool calls in the same turn (nested calls)
     # are using the newer tools.
     # tool_ctx here is ephemeral for this turn, and we allow manipulations
+    tool_update_start = time.time()
     tool_ctx.update_tools(tools)
+    tools_snapshot = tools.copy()
+    tool_update_time = time.time() - tool_update_start
+
+    total_prep_overhead = tools_prep_time + node_exec_time + tool_update_time
+    logger.debug(
+        "Agent LLM Preparation Overhead: %.1fms (Tools: %.1fms, Node: %.1fms, Update: %.1fms)",
+        total_prep_overhead * 1000,
+        tools_prep_time * 1000,
+        node_exec_time * 1000,
+        tool_update_time * 1000,
+    )
 
     if isinstance(llm_node, str):
         data.generated_text = llm_node
         text_ch.send_nowait(llm_node)
+
+        if not ttft_captured and session is not None:
+            ttft_captured = True
+            agent_ttft = time.time() - agent_llm_start_time
+            logger.debug(
+                "Agent LLM TTFT: %.1fms (prep: %.1fms, network: %.1fms)",
+                agent_ttft * 1000,
+                total_prep_overhead * 1000,
+                (agent_ttft - total_prep_overhead) * 1000,
+            )
+            try:
+                session.emit(
+                    "metrics_collected",
+                    MetricsCollectedEvent(
+                        metrics=AgentLLMMetrics(
+                            timestamp=time.time(),
+                            speech_id=None,
+                            agent_ttft=agent_ttft,
+                            llm_node_await=node_exec_time,
+                        )
+                    ),
+                )
+            except Exception:
+                pass
+
         current_span.set_attribute(trace_types.ATTR_RESPONSE_TEXT, data.generated_text)
         return True
 
@@ -137,6 +192,31 @@ async def _llm_inference_task(
                 data.generated_text += chunk
                 text_ch.send_nowait(chunk)
 
+                if not ttft_captured and chunk.strip() and session is not None:
+                    ttft_captured = True
+                    first_chunk_elapsed = time.time() - agent_llm_start_time
+                    agent_ttft = first_chunk_elapsed
+                    logger.debug(
+                        "Agent LLM TTFT: %.1fms (prep: %.1fms, network: %.1fms)",
+                        agent_ttft * 1000,
+                        total_prep_overhead * 1000,
+                        (agent_ttft - total_prep_overhead) * 1000,
+                    )
+                    try:
+                        session.emit(
+                            "metrics_collected",
+                            MetricsCollectedEvent(
+                                metrics=AgentLLMMetrics(
+                                    timestamp=time.time(),
+                                    speech_id=None,
+                                    agent_ttft=agent_ttft,
+                                    llm_node_await=node_exec_time,
+                                )
+                            ),
+                        )
+                    except Exception:
+                        pass
+
             elif isinstance(chunk, ChatChunk):
                 if not chunk.delta:
                     continue
@@ -145,6 +225,14 @@ async def _llm_inference_task(
                     for tool in chunk.delta.tool_calls:
                         if tool.type != "function":
                             continue
+
+                        # lazily update the tool_ctx in case tools changed in the middle of `llm_node`
+                        if (
+                            tool_ctx.get_function_tool(tool.name) is None
+                            and tools != tools_snapshot
+                        ):
+                            tool_ctx.update_tools(tools)
+                            tools_snapshot = tools.copy()
 
                         fnc_call = llm.FunctionCall(
                             id=f"{data.id}/fnc_{len(data.generated_functions)}",
@@ -159,6 +247,35 @@ async def _llm_inference_task(
                 if chunk.delta.content:
                     data.generated_text += chunk.delta.content
                     text_ch.send_nowait(chunk.delta.content)
+
+                    if (
+                        not ttft_captured
+                        and chunk.delta.content.strip()
+                        and session is not None
+                    ):
+                        ttft_captured = True
+                        first_chunk_elapsed = time.time() - agent_llm_start_time
+                        agent_ttft = first_chunk_elapsed
+                        logger.debug(
+                            "Agent LLM TTFT: %.1fms (prep: %.1fms, network: %.1fms)",
+                            agent_ttft * 1000,
+                            total_prep_overhead * 1000,
+                            (agent_ttft - total_prep_overhead) * 1000,
+                        )
+                        try:
+                            session.emit(
+                                "metrics_collected",
+                                MetricsCollectedEvent(
+                                    metrics=AgentLLMMetrics(
+                                        timestamp=time.time(),
+                                        speech_id=None,
+                                        agent_ttft=agent_ttft,
+                                        llm_node_await=node_exec_time,
+                                    )
+                                ),
+                            )
+                        except Exception:
+                            pass
 
             elif isinstance(chunk, FlushSentinel):
                 text_ch.send_nowait(chunk)
@@ -195,7 +312,7 @@ def perform_tts_inference(
     text_transforms: Sequence[TextTransforms] | None,
 ) -> tuple[asyncio.Task[bool], _TTSGenerationData]:
     audio_ch = aio.Chan[rtc.AudioFrame]()
-    timed_texts_fut = asyncio.Future[Optional[aio.Chan[io.TimedString]]]()
+    timed_texts_fut = asyncio.Future[aio.Chan[io.TimedString] | None]()
     data = _TTSGenerationData(audio_ch=audio_ch, timed_texts_fut=timed_texts_fut)
 
     tts_task = asyncio.create_task(
@@ -227,7 +344,7 @@ async def _tts_inference_task(
     @tracer.start_as_current_span("tts_node")
     async def _tts_node_inference(input: AsyncIterable[str], pushed_duration: float) -> float:
         if text_transforms:
-            input = apply_text_transforms(input, text_transforms)
+            input = _apply_text_transforms(input, text_transforms)
 
         tts_node = node(input, model_settings)
         if asyncio.iscoroutine(tts_node):
@@ -336,7 +453,12 @@ async def _text_forwarding_task(
 @dataclass
 class _AudioOutput:
     audio: list[rtc.AudioFrame]
-    first_frame_fut: asyncio.Future[None]
+    first_frame_fut: asyncio.Future[float]
+    """Future that will be set with the timestamp of the first frame's capture"""
+
+    def _resolve_first_frame_fut(self, ev: io.PlaybackStartedEvent) -> None:
+        if not self.first_frame_fut.done():
+            self.first_frame_fut.set_result(ev.created_at)
 
 
 def perform_audio_forwarding(
@@ -345,6 +467,11 @@ def perform_audio_forwarding(
     tts_output: AsyncIterable[rtc.AudioFrame],
 ) -> tuple[asyncio.Task[None], _AudioOutput]:
     out = _AudioOutput(audio=[], first_frame_fut=asyncio.Future())
+    # out.first_frame_fut should be cancelled in the caller after the playout is finished or interrupted
+    audio_output.on("playback_started", out._resolve_first_frame_fut)
+    out.first_frame_fut.add_done_callback(
+        lambda _: audio_output.off("playback_started", out._resolve_first_frame_fut)
+    )
     task = asyncio.create_task(_audio_forwarding_task(audio_output, tts_output, out))
     return task, out
 
@@ -356,8 +483,10 @@ async def _audio_forwarding_task(
     out: _AudioOutput,
 ) -> None:
     resampler: rtc.AudioResampler | None = None
+
     try:
         audio_output.resume()
+
         async for frame in tts_output:
             out.audio.append(frame)
 
@@ -378,11 +507,6 @@ async def _audio_forwarding_task(
                     await audio_output.capture_frame(f)
             else:
                 await audio_output.capture_frame(frame)
-
-            # set the first frame future if not already set
-            # (after completing the first frame)
-            if not out.first_frame_fut.done():
-                out.first_frame_fut.set_result(None)
 
         if resampler:
             for frame in resampler.flush():
@@ -453,8 +577,12 @@ async def _execute_tools_task(
         tool_output.output.append(out)
 
     tasks: list[asyncio.Task[Any]] = []
+    tool_exec_start = time.time()
+    executed_any_tool = False
+    tool_durations: dict[str, float] = {}
     try:
         async for fnc_call in function_stream:
+            executed_any_tool = True
             if tool_choice == "none":
                 logger.error(
                     "received a tool call with tool_choice set to 'none', ignoring",
@@ -475,15 +603,29 @@ async def _execute_tools_task(
                         "speech_id": speech_handle.id,
                     },
                 )
+                _tool_completed(
+                    make_tool_output(
+                        fnc_call=fnc_call,
+                        output=None,
+                        exception=ToolError(f"Unknown function: {fnc_call.name}"),
+                    )
+                )
                 continue
 
-            if not isinstance(function_tool, (llm.FunctionTool, llm.RawFunctionTool)):
+            if not isinstance(function_tool, llm.FunctionTool | llm.RawFunctionTool):
                 logger.error(
                     f"unknown tool type: {type(function_tool)}",
                     extra={
                         "function": fnc_call.name,
                         "speech_id": speech_handle.id,
                     },
+                )
+                _tool_completed(
+                    make_tool_output(
+                        fnc_call=fnc_call,
+                        output=None,
+                        exception=ToolError(f"Unknown tool type for function: {fnc_call.name}"),
+                    )
                 )
                 continue
 
@@ -562,7 +704,7 @@ async def _execute_tools_task(
                         bound = sig.bind_partial(*trimmed_args, **trimmed_kwargs)
                         bound.apply_defaults()
 
-                        if asyncio.iscoroutinefunction(mock):
+                        if inspect.iscoroutinefunction(mock):
                             return await mock(*bound.args, **bound.kwargs)
                         else:
                             return mock(*bound.args, **bound.kwargs)
@@ -596,7 +738,16 @@ async def _execute_tools_task(
                         val = await function_callable()
                         output = make_tool_output(fnc_call=fnc_call, output=val, exception=None)
                     except BaseException as e:
-                        if not isinstance(e, StopResponse):
+                        if isinstance(e, ToolError):
+                            logger.warning(
+                                "ToolError while executing tool: %s",
+                                e.message,
+                                extra={
+                                    "function": fnc_call.name,
+                                    "speech_id": speech_handle.id,
+                                },
+                            )
+                        elif not isinstance(e, StopResponse):
                             logger.exception(
                                 "exception occurred while executing tool",
                                 extra={"function": fnc_call.name, "speech_id": speech_handle.id},
@@ -615,7 +766,26 @@ async def _execute_tools_task(
                     # TODO(theomonnom): Add the agent handoff inside the current_span
                     _tool_completed(output)
 
-                task = asyncio.create_task(_traceable_fnc_tool(function_callable, fnc_call))
+                started_at = time.time()
+                task = asyncio.create_task(
+                    _traceable_fnc_tool(function_callable, fnc_call),
+                    name=f"func_exec_{fnc_call.name}",  # task name is used for logging when the task is cancelled
+                )
+
+                def _record_tool_duration(
+                    _: asyncio.Task[Any], *, name: str, started_at: float
+                ) -> None:
+                    try:
+                        tool_durations[name] = time.time() - started_at
+                    except Exception:
+                        pass
+
+                task.add_done_callback(
+                    lambda t, _name=fnc_call.name, _started=started_at: _record_tool_duration(
+                        t, name=_name, started_at=_started
+                    )
+                )
+
                 _set_activity_task_info(
                     task, speech_handle=speech_handle, function_call=fnc_call, inline_task=True
                 )
@@ -657,25 +827,22 @@ async def _execute_tools_task(
                 extra={"speech_id": speech_handle.id},
             )
 
-
-def _is_valid_function_output(value: Any) -> bool:
-    VALID_TYPES = (str, int, float, bool, complex, type(None))
-
-    if isinstance(value, VALID_TYPES):
-        return True
-    elif (
-        isinstance(value, list)
-        or isinstance(value, set)
-        or isinstance(value, frozenset)
-        or isinstance(value, tuple)
-    ):
-        return all(_is_valid_function_output(item) for item in value)
-    elif isinstance(value, dict):
-        return all(
-            isinstance(key, VALID_TYPES) and _is_valid_function_output(val)
-            for key, val in value.items()
-        )
-    return False
+        # Emit tool execution metrics (only if at least one tool was invoked)
+        if executed_any_tool:
+            try:
+                session.emit(
+                    "metrics_collected",
+                    MetricsCollectedEvent(
+                        metrics=ToolExecutionMetrics(
+                            timestamp=time.time(),
+                            speech_id=None,
+                            total_execution_time=time.time() - tool_exec_start,
+                            tool_durations=tool_durations,
+                        )
+                    ),
+                )
+            except Exception:
+                pass
 
 
 @dataclass
@@ -693,43 +860,17 @@ def make_tool_output(
 ) -> ToolExecutionOutput:
     from .agent import Agent
 
-    # support returning Exception instead of raising them (for devex purposes inside evals)
     if isinstance(output, BaseException):
         exception = output
         output = None
 
-    if isinstance(exception, ToolError):
-        return ToolExecutionOutput(
-            fnc_call=fnc_call.model_copy(),
-            fnc_call_out=llm.FunctionCallOutput(
-                name=fnc_call.name,
-                call_id=fnc_call.call_id,
-                output=exception.message,
-                is_error=True,
-            ),
-            agent_task=None,
-            raw_output=output,
-            raw_exception=exception,
-        )
-
-    if isinstance(exception, StopResponse):
-        return ToolExecutionOutput(
-            fnc_call=fnc_call.model_copy(),
-            fnc_call_out=None,
-            agent_task=None,
-            raw_output=output,
-            raw_exception=exception,
-        )
-
     if exception is not None:
+        base_result = llm_utils.make_function_call_output(
+            fnc_call=fnc_call, output=None, exception=exception
+        )
         return ToolExecutionOutput(
             fnc_call=fnc_call.model_copy(),
-            fnc_call_out=llm.FunctionCallOutput(
-                name=fnc_call.name,
-                call_id=fnc_call.call_id,
-                output="An internal error occurred",  # Don't send the actual error message, as it may contain sensitive information  # noqa: E501
-                is_error=True,
-            ),
+            fnc_call_out=base_result.fnc_call_out,
             agent_task=None,
             raw_output=output,
             raw_exception=exception,
@@ -748,12 +889,8 @@ def make_tool_output(
         if len(agent_tasks) > 1:
             logger.error(
                 f"AI function `{fnc_call.name}` returned multiple AgentTask instances, ignoring the output",  # noqa: E501
-                extra={
-                    "call_id": fnc_call.call_id,
-                    "output": output,
-                },
+                extra={"call_id": fnc_call.call_id, "output": output},
             )
-
             return ToolExecutionOutput(
                 fnc_call=fnc_call.model_copy(),
                 fnc_call_out=None,
@@ -777,32 +914,13 @@ def make_tool_output(
         task = fnc_out
         fnc_out = None
 
-    if not _is_valid_function_output(fnc_out):
-        logger.error(
-            f"AI function `{fnc_call.name}` returned an invalid output",
-            extra={
-                "call_id": fnc_call.call_id,
-                "output": output,
-            },
-        )
-        return ToolExecutionOutput(
-            fnc_call=fnc_call.model_copy(),
-            fnc_call_out=None,
-            agent_task=None,
-            raw_output=output,
-            raw_exception=exception,
-        )
+    base_result = llm_utils.make_function_call_output(
+        fnc_call=fnc_call, output=fnc_out, exception=None
+    )
 
     return ToolExecutionOutput(
         fnc_call=fnc_call.model_copy(),
-        fnc_call_out=(
-            llm.FunctionCallOutput(
-                name=fnc_call.name,
-                call_id=fnc_call.call_id,
-                output=str(fnc_out or ""),  # take the string representation of the output
-                is_error=False,
-            )
-        ),
+        fnc_call_out=base_result.fnc_call_out,
         reply_required=fnc_out is not None,  # require a reply if the tool returned an output
         agent_task=task,
         raw_output=output,
@@ -816,7 +934,9 @@ The ID of the instructions message in the chat context. (only for stateless LLMs
 """
 
 
-def update_instructions(chat_ctx: ChatContext, *, instructions: str, add_if_missing: bool) -> None:
+def update_instructions(
+    chat_ctx: ChatContext, *, instructions: str | Instructions, add_if_missing: bool
+) -> None:
     """
     Update the instruction message in the chat context or insert a new one if missing.
 
@@ -846,6 +966,23 @@ def update_instructions(chat_ctx: ChatContext, *, instructions: str, add_if_miss
             0,
             llm.ChatMessage(id=INSTRUCTIONS_MESSAGE_ID, role="system", content=[instructions]),
         )
+
+
+def apply_instructions_modality(
+    chat_ctx: ChatContext, *, modality: Literal["audio", "text"]
+) -> None:
+    idx = chat_ctx.index_by_id(INSTRUCTIONS_MESSAGE_ID)
+    if idx is not None and (item := chat_ctx.items[idx]).type == "message":
+        has_modality_specific = any(isinstance(c, Instructions) for c in item.content)
+        if not has_modality_specific:
+            return
+
+        # ChatContext.copy shadows the original item, create a new instance to avoid mutating the original
+        new_item = item.model_copy()
+        new_item.content = [
+            c.as_modality(modality) if isinstance(c, Instructions) else c for c in new_item.content
+        ]
+        chat_ctx.items[idx] = new_item
 
 
 def remove_instructions(chat_ctx: ChatContext) -> None:

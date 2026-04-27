@@ -11,8 +11,10 @@ from livekit.agents import (
     MetricsCollectedEvent,
     RunContext,
     cli,
+    inference,
     metrics,
     room_io,
+    text_transforms,
 )
 from livekit.agents.llm import function_tool
 from livekit.plugins import silero
@@ -29,7 +31,7 @@ load_dotenv()
 class MyAgent(Agent):
     def __init__(self) -> None:
         super().__init__(
-            instructions="Your name is Kelly. You would interact with users via voice."
+            instructions="Your name is Kelly, built by LiveKit. You would interact with users via voice."
             "with that in mind keep your responses concise and to the point."
             "do not use emojis, asterisks, markdown, or other special characters in your responses."
             "You are curious and friendly, and have a sense of humor."
@@ -39,8 +41,7 @@ class MyAgent(Agent):
     async def on_enter(self):
         # when the agent is added to the session, it'll generate a reply
         # according to its instructions
-        # Keep it uninterruptible so the client has time to calibrate AEC (Acoustic Echo Cancellation).
-        self.session.generate_reply(allow_interruptions=False)
+        self.session.generate_reply(instructions="greet the user and introduce yourself")
 
     # all functions annotated with @function_tool will be passed to the LLM when this
     # agent is active
@@ -83,13 +84,13 @@ async def entrypoint(ctx: JobContext):
     session = AgentSession(
         # Speech-to-text (STT) is your agent's ears, turning the user's speech into text that the LLM can understand
         # See all available models at https://docs.livekit.io/agents/models/stt/
-        stt="deepgram/nova-3",
+        stt=inference.STT("deepgram/nova-3", language="multi"),
         # A Large Language Model (LLM) is your agent's brain, processing user input and generating a response
         # See all available models at https://docs.livekit.io/agents/models/llm/
-        llm="openai/gpt-4.1-mini",
+        llm=inference.LLM("openai/gpt-4.1-mini"),
         # Text-to-speech (TTS) is your agent's voice, turning the LLM's text into speech that the user can hear
         # See all available models as well as voice selections at https://docs.livekit.io/agents/models/tts/
-        tts="cartesia/sonic-2:9626c31c-bec5-4cca-baa8-f8ba9e84c8bc",
+        tts=inference.TTS("cartesia/sonic-3", voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"),
         # VAD and turn detection are used to determine when the user is speaking and when the agent should respond
         # See more at https://docs.livekit.io/agents/build/turns
         turn_detection=MultilingualModel(),
@@ -101,6 +102,13 @@ async def entrypoint(ctx: JobContext):
         # when it's detected, you may resume the agent's speech
         resume_false_interruption=True,
         false_interruption_timeout=1.0,
+        # blocks interruptions for a few seconds after the agent starts speaking to allow client to calibrate AEC
+        aec_warmup_duration=3.0,
+        tts_text_transforms=[
+            "filter_emoji",
+            "filter_markdown",
+            text_transforms.replace({"LiveKit": "<<ˈ|l|aɪ|v>> <<ˈ|k|ɪ|t>>"}),
+        ],
     )
 
     # log metrics as they are emitted, and total usage after session is over

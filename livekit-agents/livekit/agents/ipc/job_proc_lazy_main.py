@@ -17,9 +17,9 @@ if current_process().name == "job_proc":
 import asyncio
 import contextlib
 import socket
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Callable, cast
+from typing import Any, cast
 
 from opentelemetry import trace
 
@@ -131,18 +131,29 @@ class _InfClient(InferenceExecutor):
     async def do_inference(self, method: str, data: bytes) -> bytes | None:
         request_id = shortuuid("inference_job_")
         fut = asyncio.Future[InferenceResponse]()
-
-        await self._client.send(
-            InferenceRequest(request_id=request_id, method=method, data=data),
-        )
-
         self._active_requests[request_id] = fut
+
+        try:
+            await self._client.send(
+                InferenceRequest(request_id=request_id, method=method, data=data),
+            )
+        except Exception:
+            if not fut.done():
+                fut.cancel()
+            self._active_requests.pop(request_id, None)
+            raise
 
         inf_resp = await fut
         if inf_resp.error:
             raise RuntimeError(f"inference of {method} failed: {inf_resp.error}")
 
         return inf_resp.data
+
+    def close(self) -> None:
+        for fut in self._active_requests.values():
+            if not fut.done():
+                fut.cancel()
+        self._active_requests.clear()
 
     def _on_inference_response(self, resp: InferenceResponse) -> None:
         fut = self._active_requests.pop(resp.request_id, None)
@@ -224,10 +235,17 @@ class _JobProc:
                 if isinstance(msg, DumpStackTraceRequest):
                     _dump_stack_traces_impl()
 
-        read_task = asyncio.create_task(_read_ipc_task(), name="job_ipc_read")
+            # unblock any pending do_inference() calls
+            self._inf_client.close()
 
-        await self._exit_proc_flag.wait()
-        await aio.cancel_and_wait(read_task)
+        read_task = asyncio.create_task(_read_ipc_task(), name="job_ipc_read")
+        try:
+            await self._exit_proc_flag.wait()
+        finally:
+            # ensure cleanup on cancellation (e.g. parent channel closes)
+            if self._job_task is not None:
+                await aio.cancel_and_wait(self._job_task)
+            await aio.cancel_and_wait(read_task)
 
     def _start_job(self, msg: StartJobRequest) -> None:
         if msg.running_job.fake_job:
@@ -273,9 +291,24 @@ class _JobProc:
     @log_exceptions(logger=logger)
     async def _run_job_task(self) -> None:
         self._job_ctx._on_setup()
+        self._job_ctx._start_log_buffering()
 
         job_ctx_token = _JobContextVar.set(self._job_ctx)
         http_context._new_session_ctx()
+
+        shutdown_trace_id = f"{id(self)}-{asyncio.get_running_loop().time():.6f}"
+
+        def _log_shutdown_stage(event: str, **extra: object) -> None:
+            fields = {
+                "trace_id": shutdown_trace_id,
+                "event": event,
+                "job_id": self._job_ctx.job.id,
+                **extra,
+            }
+            field_text = " ".join(
+                f"{key}={value!r}" for key, value in fields.items() if value is not None
+            )
+            logger.info("job_proc_shutdown_trace %s", field_text)
 
         @tracer.start_as_current_span("job_entrypoint")
         async def _traceable_entrypoint(job_ctx: JobContext) -> None:
@@ -304,12 +337,18 @@ class _JobProc:
         warn_unconnected_task = asyncio.create_task(_warn_not_connected_task())
         job_entry_task.add_done_callback(lambda _: warn_unconnected_task.cancel())
 
-        def log_exception(t: asyncio.Task[Any]) -> None:
+        def _on_entry_done(t: asyncio.Task[Any]) -> None:
             if not t.cancelled() and t.exception():
                 logger.error(
                     "unhandled exception while running the job task",
                     exc_info=t.exception(),
                 )
+                # if the process crashes before ctx.connect(), shutdown_fut will never resolve
+                # we'll force it to trigger shutdown so _on_cleanup can flush crash logs
+                with contextlib.suppress(asyncio.InvalidStateError):
+                    self._shutdown_fut.set_result(
+                        _ShutdownInfo(user_initiated=False, reason="job crashed")
+                    )
             elif not self._ctx_connect_called and not self._ctx_shutdown_called:
                 if self._job_ctx.is_fake_job():
                     return
@@ -319,21 +358,35 @@ class _JobProc:
                     "Ensure that job_ctx.connect()/job_ctx.shutdown() is called and the job is correctly finalized."  # noqa: E501
                 )
 
-        job_entry_task.add_done_callback(log_exception)
+        job_entry_task.add_done_callback(_on_entry_done)
 
         shutdown_info = await self._shutdown_fut
+        _log_shutdown_stage(
+            "shutdown_fut_resolved",
+            reason=shutdown_info.reason,
+            user_initiated=shutdown_info.user_initiated,
+        )
 
         # TODO(theomonnom): move this code?
         if session := self._job_ctx._primary_agent_session:
+            _log_shutdown_stage("session_aclose_start")
             await session.aclose()
-
-        await self._job_ctx._on_session_end()
+            _log_shutdown_stage("session_aclose_done")
+        else:
+            _log_shutdown_stage("session_aclose_skipped_no_primary_session")
 
         if self._session_end_fnc:
             try:
+                _log_shutdown_stage("session_end_callback_start")
                 await self._session_end_fnc(self._job_ctx)
+                _log_shutdown_stage("session_end_callback_done")
             except Exception:
+                _log_shutdown_stage("session_end_callback_error")
                 logger.exception("error while executing the on_session_end callback")
+
+        _log_shutdown_stage("job_ctx_on_session_end_start")
+        await self._job_ctx._on_session_end()
+        _log_shutdown_stage("job_ctx_on_session_end_done")
 
         logger.debug(
             "shutting down job task",
@@ -351,9 +404,15 @@ class _JobProc:
                     )
                 )
 
+            _log_shutdown_stage("shutdown_callbacks_start", count=len(shutdown_tasks))
             await asyncio.gather(*shutdown_tasks)
+            _log_shutdown_stage("shutdown_callbacks_done", count=len(shutdown_tasks))
         except Exception:
+            _log_shutdown_stage("shutdown_callbacks_error")
             logger.exception("error while shutting down the job")
+
+        if tasks := self._job_ctx._pending_tasks:
+            await aio.cancel_and_wait(*tasks)
 
         self._job_ctx._on_cleanup()
         await http_context._close_http_ctx()
