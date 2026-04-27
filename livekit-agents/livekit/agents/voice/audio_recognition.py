@@ -193,21 +193,63 @@ class AudioRecognition:
             self._vad_ch.send_nowait(frame)
 
     async def aclose(self) -> None:
+        def _task_state(task: asyncio.Task[Any] | None) -> dict[str, bool | None]:
+            return {
+                "exists": task is not None,
+                "done": bool(task.done()) if task else None,
+                "cancelled": bool(task.cancelled()) if task else None,
+            }
+
+        logger.info(
+            "AudioRecognition.aclose start",
+            extra={
+                "commit_user_turn_task": _task_state(self._commit_user_turn_atask),
+                "stt_task": _task_state(self._stt_atask),
+                "vad_task": _task_state(self._vad_atask),
+                "end_of_turn_task": _task_state(self._end_of_turn_task),
+                "aux_tasks_count": len(self._tasks),
+                "closing_already_set": self._closing.is_set(),
+            },
+        )
         self._closing.set()
 
         if self._commit_user_turn_atask is not None:
+            logger.info("AudioRecognition.aclose commit_user_turn_task await start")
             await self._commit_user_turn_atask
+            logger.info("AudioRecognition.aclose commit_user_turn_task await done")
 
+        logger.info(
+            "AudioRecognition.aclose aux_tasks cancel start",
+            extra={"aux_tasks_count": len(self._tasks)},
+        )
         await aio.cancel_and_wait(*self._tasks)
+        logger.info("AudioRecognition.aclose aux_tasks cancel done")
 
         if self._stt_atask is not None:
+            logger.info(
+                "AudioRecognition.aclose stt_task cancel start",
+                extra={"stt_task_done": self._stt_atask.done()},
+            )
             await aio.cancel_and_wait(self._stt_atask)
+            logger.info("AudioRecognition.aclose stt_task cancel done")
 
         if self._vad_atask is not None:
+            logger.info(
+                "AudioRecognition.aclose vad_task cancel start",
+                extra={"vad_task_done": self._vad_atask.done()},
+            )
             await aio.cancel_and_wait(self._vad_atask)
+            logger.info("AudioRecognition.aclose vad_task cancel done")
 
         if self._end_of_turn_task is not None:
+            logger.info(
+                "AudioRecognition.aclose end_of_turn_task await start",
+                extra={"end_of_turn_task_done": self._end_of_turn_task.done()},
+            )
             await self._end_of_turn_task
+            logger.info("AudioRecognition.aclose end_of_turn_task await done")
+
+        logger.info("AudioRecognition.aclose done")
 
     def update_stt(self, stt: io.STTNode | None) -> None:
         self._stt = stt
