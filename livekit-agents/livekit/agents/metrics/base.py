@@ -132,9 +132,6 @@ class RealtimeModelMetrics(BaseModel):
     metadata: Metadata | None = None
 
 
-AgentMetrics = STTMetrics | LLMMetrics | TTSMetrics | VADMetrics | EOUMetrics | RealtimeModelMetrics
-
-
 # --- Extended metrics (adaptive endpointing & tooling visibility) ---
 
 
@@ -167,8 +164,7 @@ class ToolExecutionMetrics(BaseModel):
     metadata: Metadata | None = None
 
 
-# Extend AgentMetrics union with new metric types
-AgentMetrics = (  # type: ignore[misc]
+AgentMetrics = (
     STTMetrics
     | LLMMetrics
     | TTSMetrics

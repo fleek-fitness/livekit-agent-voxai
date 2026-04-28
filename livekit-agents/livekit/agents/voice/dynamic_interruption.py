@@ -7,7 +7,7 @@ from ..log import logger
 
 # Typed only for clarity; avoid importing to reduce risk of circular imports at import time
 try:  # pragma: no cover - type hint convenience
-    from .agent_session import AgentSessionOptions  # type: ignore
+    from .agent_session import AgentSessionOptions
 except Exception:  # pragma: no cover
     AgentSessionOptions = object  # type: ignore
 
