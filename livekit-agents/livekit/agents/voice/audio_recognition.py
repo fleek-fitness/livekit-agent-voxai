@@ -242,11 +242,26 @@ class AudioRecognition:
             logger.info("AudioRecognition.aclose vad_task cancel done")
 
         if self._end_of_turn_task is not None:
+            end_of_turn_task = self._end_of_turn_task
             logger.info(
                 "AudioRecognition.aclose end_of_turn_task await start",
-                extra={"end_of_turn_task_done": self._end_of_turn_task.done()},
+                extra={
+                    "end_of_turn_task_done": end_of_turn_task.done(),
+                    "end_of_turn_task_cancelled": end_of_turn_task.cancelled(),
+                },
             )
-            await self._end_of_turn_task
+            if end_of_turn_task.cancelled():
+                logger.info("AudioRecognition.aclose end_of_turn_task already cancelled")
+            else:
+                try:
+                    await asyncio.shield(end_of_turn_task)
+                except asyncio.CancelledError:
+                    if end_of_turn_task.cancelled():
+                        logger.info(
+                            "AudioRecognition.aclose end_of_turn_task cancelled during close"
+                        )
+                    else:
+                        raise
             logger.info("AudioRecognition.aclose end_of_turn_task await done")
 
         logger.info("AudioRecognition.aclose done")
