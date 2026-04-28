@@ -11,8 +11,8 @@ from .base import (
     RealtimeModelMetrics,
     ResponseLatencyMetrics,
     STTMetrics,
-    TTSMetrics,
     ToolExecutionMetrics,
+    TTSMetrics,
 )
 
 

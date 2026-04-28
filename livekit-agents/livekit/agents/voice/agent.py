@@ -3,14 +3,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
-from collections.abc import AsyncGenerator, AsyncIterable, Coroutine, Generator
+from collections.abc import AsyncGenerator, AsyncIterable, Callable, Coroutine, Generator
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 from livekit import rtc
 
 from .. import inference, llm, stt, tokenize, tts, utils, vad
-from ..llm import ChatContext, RealtimeModel, ToolError, find_function_tools
+from ..llm import ChatContext, ChatItem, RealtimeModel, ToolError, find_function_tools
 from ..llm.chat_context import Instructions, _ReadOnlyChatContext
 from ..log import logger
 from ..types import NOT_GIVEN, FlushSentinel, NotGivenOr
@@ -88,9 +88,9 @@ class Agent:
         self._mcp_servers = mcp_servers
         self._activity: AgentActivity | None = None
         # Reply callback tracking
-        self._reply_chat_ctx: llm.ChatContext | None = None
-        self._reply_messages: list[llm.ChatItem] = []
-        self._reply_callbacks: list[Callable[[llm.ChatContext, list[llm.ChatItem]], None]] = []
+        self._reply_chat_ctx: ChatContext | None = None
+        self._reply_messages: list[ChatItem] = []
+        self._reply_callbacks: list[Callable[[ChatContext, list[ChatItem]], None]] = []
 
     @property
     def id(self) -> str:
@@ -212,20 +212,20 @@ class Agent:
     # -- Reply callbacks --
     def add_reply_callback(
         self,
-        callback: Callable[[llm.ChatContext, list[llm.ChatItem]], None],
+        callback: Callable[[ChatContext, list[ChatItem]], None],
     ) -> None:
         self._reply_callbacks.append(callback)
 
     def remove_reply_callback(
         self,
-        callback: Callable[[llm.ChatContext, list[llm.ChatItem]], None],
+        callback: Callable[[ChatContext, list[ChatItem]], None],
     ) -> None:
         try:
             self._reply_callbacks.remove(callback)
         except ValueError:
             pass
 
-    def reply_callback(self, chat_ctx: llm.ChatContext, replies: list[llm.ChatItem]) -> None:
+    def reply_callback(self, chat_ctx: ChatContext, replies: list[ChatItem]) -> None:
         if not replies:
             return
         for cb in self._reply_callbacks:

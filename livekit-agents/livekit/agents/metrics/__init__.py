@@ -6,8 +6,8 @@ from .base import (
     RealtimeModelMetrics,
     ResponseLatencyMetrics,
     STTMetrics,
-    TTSMetrics,
     ToolExecutionMetrics,
+    TTSMetrics,
     VADMetrics,
 )
 from .usage_collector import UsageCollector, UsageSummary

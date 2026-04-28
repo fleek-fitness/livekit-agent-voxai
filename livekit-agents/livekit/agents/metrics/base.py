@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class Metadata(BaseModel):
@@ -132,9 +132,6 @@ class RealtimeModelMetrics(BaseModel):
     metadata: Metadata | None = None
 
 
-AgentMetrics = STTMetrics | LLMMetrics | TTSMetrics | VADMetrics | EOUMetrics | RealtimeModelMetrics
-
-
 # --- Extended metrics (adaptive endpointing & tooling visibility) ---
 
 
@@ -158,9 +155,6 @@ class AgentLLMMetrics(BaseModel):
     metadata: Metadata | None = None
 
 
-from pydantic import Field
-
-
 class ToolExecutionMetrics(BaseModel):
     type: Literal["tool_execution_metrics"] = "tool_execution_metrics"
     timestamp: float
@@ -170,8 +164,7 @@ class ToolExecutionMetrics(BaseModel):
     metadata: Metadata | None = None
 
 
-# Extend AgentMetrics union with new metric types
-AgentMetrics = (  # type: ignore[misc]
+AgentMetrics = (
     STTMetrics
     | LLMMetrics
     | TTSMetrics

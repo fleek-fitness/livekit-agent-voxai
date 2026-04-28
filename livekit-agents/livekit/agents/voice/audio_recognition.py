@@ -215,7 +215,10 @@ class AudioRecognition:
 
         if self._commit_user_turn_atask is not None:
             logger.info("AudioRecognition.aclose commit_user_turn_task await start")
-            await self._commit_user_turn_atask
+            try:
+                await self._commit_user_turn_atask
+            except asyncio.CancelledError:
+                logger.info("AudioRecognition.aclose commit_user_turn_task cancelled")
             logger.info("AudioRecognition.aclose commit_user_turn_task await done")
 
         logger.info(
@@ -242,11 +245,18 @@ class AudioRecognition:
             logger.info("AudioRecognition.aclose vad_task cancel done")
 
         if self._end_of_turn_task is not None:
+            end_of_turn_task = self._end_of_turn_task
             logger.info(
                 "AudioRecognition.aclose end_of_turn_task await start",
-                extra={"end_of_turn_task_done": self._end_of_turn_task.done()},
+                extra={
+                    "end_of_turn_task_done": end_of_turn_task.done(),
+                    "end_of_turn_task_cancelled": end_of_turn_task.cancelled(),
+                },
             )
-            await self._end_of_turn_task
+            try:
+                await end_of_turn_task
+            except asyncio.CancelledError:
+                logger.info("AudioRecognition.aclose end_of_turn_task cancelled")
             logger.info("AudioRecognition.aclose end_of_turn_task await done")
 
         logger.info("AudioRecognition.aclose done")

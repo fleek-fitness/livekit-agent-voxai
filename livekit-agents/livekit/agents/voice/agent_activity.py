@@ -41,7 +41,6 @@ from ..tokenize.basic import split_words
 from ..types import NOT_GIVEN, FlushSentinel, NotGivenOr
 from ..utils.misc import is_given
 from ._utils import _set_participant_attributes
-from .dynamic_interruption import DynamicInterruptionManager
 from .agent import (
     Agent,
     ModelSettings,
@@ -55,6 +54,7 @@ from .audio_recognition import (
     _EndOfTurnInfo,
     _PreemptiveGenerationInfo,
 )
+from .dynamic_interruption import DynamicInterruptionManager
 from .events import (
     AgentFalseInterruptionEvent,
     AgentState,
@@ -877,9 +877,7 @@ class AgentActivity(RecognitionHooks):
                     "speech_tasks_count": len(self._speech_tasks),
                     "has_scheduling_task": self._scheduling_atask is not None,
                     "scheduling_task_done": (
-                        bool(self._scheduling_atask.done())
-                        if self._scheduling_atask
-                        else None
+                        bool(self._scheduling_atask.done()) if self._scheduling_atask else None
                     ),
                 },
             )
@@ -1271,7 +1269,13 @@ class AgentActivity(RecognitionHooks):
 
     def _on_metrics_collected(
         self,
-        ev: STTMetrics | TTSMetrics | VADMetrics | LLMMetrics | RealtimeModelMetrics | AgentLLMMetrics | ToolExecutionMetrics,
+        ev: STTMetrics
+        | TTSMetrics
+        | VADMetrics
+        | LLMMetrics
+        | RealtimeModelMetrics
+        | AgentLLMMetrics
+        | ToolExecutionMetrics,
     ) -> None:
         # Attach speech_id when possible (for LLM/TTS/AgentLLM)
         if speech_handle := _SpeechHandleContextVar.get(None):
@@ -1895,7 +1899,7 @@ class AgentActivity(RecognitionHooks):
     # endregion
 
     # Ensure agent state updates always trigger dynamic hooks
-    def _update_agent_state(self, state: "AgentState", **kwargs) -> None:
+    def _update_agent_state(self, state: AgentState, **kwargs: Any) -> None:
         self._session._update_agent_state(state, **kwargs)
         if state == "speaking":
             self._dynamic_interruption.on_agent_speech_started()
