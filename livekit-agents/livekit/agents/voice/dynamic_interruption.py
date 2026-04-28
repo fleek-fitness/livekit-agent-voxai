@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+
 from ..log import logger
 
 # Typed only for clarity; avoid importing to reduce risk of circular imports at import time

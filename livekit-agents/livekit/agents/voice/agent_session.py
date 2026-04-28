@@ -900,13 +900,9 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
                     if not drain:
                         try:
                             # force interrupt speeches when closing the session
-                            _log_aclose_trace(
-                                "step_start", step="activity.interrupt(force=True)"
-                            )
+                            _log_aclose_trace("step_start", step="activity.interrupt(force=True)")
                             await activity.interrupt(force=True)
-                            _log_aclose_trace(
-                                "step_done", step="activity.interrupt(force=True)"
-                            )
+                            _log_aclose_trace("step_done", step="activity.interrupt(force=True)")
                         except RuntimeError:
                             # uninterruptible speech
                             _log_aclose_trace(
@@ -954,13 +950,9 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
                     self._user_speaking_span = None
 
                 if self._forward_audio_atask is not None:
-                    _log_aclose_trace(
-                        "step_start", step="forward_audio.cancel_and_wait"
-                    )
+                    _log_aclose_trace("step_start", step="forward_audio.cancel_and_wait")
                     await utils.aio.cancel_and_wait(self._forward_audio_atask)
-                    _log_aclose_trace(
-                        "step_done", step="forward_audio.cancel_and_wait"
-                    )
+                    _log_aclose_trace("step_done", step="forward_audio.cancel_and_wait")
 
                 if self._recorder_io:
                     _log_aclose_trace("step_start", step="recorder_io.aclose")
@@ -989,13 +981,9 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
 
                 # close client events handler before room io
                 if self._client_events_handler:
-                    _log_aclose_trace(
-                        "step_start", step="client_events_handler.aclose"
-                    )
+                    _log_aclose_trace("step_start", step="client_events_handler.aclose")
                     await self._client_events_handler.aclose()
-                    _log_aclose_trace(
-                        "step_done", step="client_events_handler.aclose"
-                    )
+                    _log_aclose_trace("step_done", step="client_events_handler.aclose")
                     self._client_events_handler = None
 
                 # close room io after close event is emitted

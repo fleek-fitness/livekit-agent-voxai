@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class Metadata(BaseModel):
@@ -156,9 +156,6 @@ class AgentLLMMetrics(BaseModel):
     llm_node_await: float | None = None
     request_id: str | None = None
     metadata: Metadata | None = None
-
-
-from pydantic import Field
 
 
 class ToolExecutionMetrics(BaseModel):

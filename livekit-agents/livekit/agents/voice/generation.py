@@ -63,7 +63,7 @@ def perform_llm_inference(
     chat_ctx: ChatContext,
     tool_ctx: ToolContext,
     model_settings: ModelSettings,
-    session: "AgentSession | None" = None,
+    session: AgentSession | None = None,
 ) -> tuple[asyncio.Task[bool], _LLMGenerationData]:
     text_ch = aio.Chan[str | FlushSentinel]()
     function_ch = aio.Chan[llm.FunctionCall]()
@@ -92,7 +92,7 @@ async def _llm_inference_task(
     model_settings: ModelSettings,
     data: _LLMGenerationData,
     *,
-    session: "AgentSession | None" = None,
+    session: AgentSession | None = None,
 ) -> bool:
     start_time = time.perf_counter()
     current_span = trace.get_current_span()
@@ -248,11 +248,7 @@ async def _llm_inference_task(
                     data.generated_text += chunk.delta.content
                     text_ch.send_nowait(chunk.delta.content)
 
-                    if (
-                        not ttft_captured
-                        and chunk.delta.content.strip()
-                        and session is not None
-                    ):
+                    if not ttft_captured and chunk.delta.content.strip() and session is not None:
                         ttft_captured = True
                         first_chunk_elapsed = time.time() - agent_llm_start_time
                         agent_ttft = first_chunk_elapsed
