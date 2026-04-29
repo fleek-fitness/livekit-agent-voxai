@@ -1508,8 +1508,6 @@ class AgentActivity(RecognitionHooks):
         else:
             self._stt_eos_received = True
 
-        self._last_eou_timestamp = speech_end_time
-
         self._session._update_user_state(
             "listening",
             last_speaking_time=speech_end_time,
@@ -1701,17 +1699,15 @@ class AgentActivity(RecognitionHooks):
             and not self._current_speech.interrupted
         )
         delayed_interruption_context = (
-            not current_speech_interruptible
+            not info.transcript_clock_suppressed
+            and not current_speech_interruptible
             and self._user_speech_started_during_interruptible_agent_speech
         )
 
         if (
             self.stt is not None
             and self._turn_detection != "manual"
-            and (
-                current_speech_interruptible
-                or self._user_speech_started_during_interruptible_agent_speech
-            )
+            and (current_speech_interruptible or delayed_interruption_context)
         ):
             # Dynamic min_interruption_words
             dyn_min_words = 0
@@ -1755,6 +1751,12 @@ class AgentActivity(RecognitionHooks):
                             reason="interruption_ignore_words",
                         )
                     return False
+
+        self._last_eou_timestamp = (
+            info.stopped_speaking_at
+            if not info.transcript_clock_suppressed and info.stopped_speaking_at is not None
+            else None
+        )
 
         old_task = self._user_turn_completed_atask
         self._user_turn_completed_atask = self._create_speech_task(
