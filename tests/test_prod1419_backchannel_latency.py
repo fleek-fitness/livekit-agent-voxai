@@ -1,3 +1,4 @@
+import asyncio
 import time
 from types import SimpleNamespace
 
@@ -56,15 +57,24 @@ def test_suppressed_final_transcript_still_updates_recency_clock() -> None:
     assert recognition._last_final_transcript_time is not None
 
 
-def _activity_for_end_of_turn() -> tuple[AgentActivity, object]:
+def _activity_for_end_of_turn(
+    *,
+    min_interruption_words: int = 0,
+    dyn_min_words: int = 0,
+) -> tuple[AgentActivity, object, list[object]]:
     activity = AgentActivity.__new__(AgentActivity)
-    activity._agent = SimpleNamespace(stt=object())
+    chat_items: list[object] = []
+    activity._agent = SimpleNamespace(
+        stt=object(),
+        _chat_ctx=SimpleNamespace(items=chat_items),
+    )
     activity._session = SimpleNamespace(
         options=SimpleNamespace(
-            min_interruption_words=0,
+            min_interruption_words=min_interruption_words,
             interruption_ignore_words=["네", "예"],
         ),
         _closing=False,
+        _conversation_item_added=lambda *a, **k: None,
     )
     activity._turn_detection = "vad"
     activity._current_speech = None
@@ -74,7 +84,7 @@ def _activity_for_end_of_turn() -> tuple[AgentActivity, object]:
     activity._user_turn_completed_atask = None
     activity._user_speech_started_during_interruptible_agent_speech = True
     activity._dynamic_interruption = SimpleNamespace(
-        get_current_min_interruption_words=lambda: 0,
+        get_current_min_interruption_words=lambda: dyn_min_words,
     )
     task = object()
 
@@ -83,7 +93,7 @@ def _activity_for_end_of_turn() -> tuple[AgentActivity, object]:
         return task
 
     activity._create_speech_task = create_speech_task
-    return activity, task
+    return activity, task, chat_items
 
 
 def test_vad_end_does_not_create_response_latency_anchor() -> None:
@@ -126,7 +136,7 @@ def test_vad_start_keeps_context_when_speech_was_already_interrupted() -> None:
 
 
 def test_suppressed_transcript_commits_without_latency_anchor() -> None:
-    activity, task = _activity_for_end_of_turn()
+    activity, task, _ = _activity_for_end_of_turn()
 
     committed = activity.on_end_of_turn(
         _EndOfTurnInfo(
@@ -148,7 +158,7 @@ def test_suppressed_transcript_commits_without_latency_anchor() -> None:
 
 
 def test_committed_turn_sets_response_latency_anchor_from_reliable_stop_time() -> None:
-    activity, task = _activity_for_end_of_turn()
+    activity, task, _ = _activity_for_end_of_turn()
     activity._user_speech_started_during_interruptible_agent_speech = False
 
     committed = activity.on_end_of_turn(
@@ -170,7 +180,7 @@ def test_committed_turn_sets_response_latency_anchor_from_reliable_stop_time() -
 
 
 def test_non_suppressed_delayed_ignored_backchannel_is_consumed_without_reply_or_anchor() -> None:
-    activity, _ = _activity_for_end_of_turn()
+    activity, _, chat_items = _activity_for_end_of_turn()
 
     committed = activity.on_end_of_turn(
         _EndOfTurnInfo(
@@ -189,3 +199,138 @@ def test_non_suppressed_delayed_ignored_backchannel_is_consumed_without_reply_or
     assert activity._user_turn_completed_atask is None
     assert activity._last_eou_timestamp is None
     assert activity._user_speech_started_during_interruptible_agent_speech is False
+    assert len(chat_items) == 1
+    assert chat_items[0].role == "user"
+
+
+def test_delayed_short_transcript_consumed_via_min_interruption_words_branch() -> None:
+    activity, _, chat_items = _activity_for_end_of_turn(dyn_min_words=3)
+    activity._current_speech = SimpleNamespace(allow_interruptions=False, interrupted=False)
+
+    committed = activity.on_end_of_turn(
+        _EndOfTurnInfo(
+            skip_reply=False,
+            new_transcript="아",
+            transcript_confidence=1.0,
+            transcript_clock_suppressed=False,
+            started_speaking_at=400.0,
+            stopped_speaking_at=456.0,
+            transcription_delay=0.1,
+            end_of_turn_delay=0.2,
+        )
+    )
+
+    assert committed is True
+    assert activity._user_turn_completed_atask is None
+    assert activity._last_eou_timestamp is None
+    assert activity._user_speech_started_during_interruptible_agent_speech is False
+    assert len(chat_items) == 1
+    assert chat_items[0].text_content == "아"
+
+
+def test_delayed_empty_transcript_consumed_via_empty_interruption_branch() -> None:
+    activity, _, chat_items = _activity_for_end_of_turn(dyn_min_words=2)
+    activity._current_speech = SimpleNamespace(allow_interruptions=False, interrupted=False)
+
+    committed = activity.on_end_of_turn(
+        _EndOfTurnInfo(
+            skip_reply=False,
+            new_transcript="",
+            transcript_confidence=0.0,
+            transcript_clock_suppressed=False,
+            started_speaking_at=400.0,
+            stopped_speaking_at=456.0,
+            transcription_delay=0.1,
+            end_of_turn_delay=0.2,
+        )
+    )
+
+    assert committed is True
+    assert activity._user_turn_completed_atask is None
+    assert activity._last_eou_timestamp is None
+    assert activity._user_speech_started_during_interruptible_agent_speech is False
+    # Empty transcript should not pollute chat history.
+    assert chat_items == []
+
+
+def _build_user_turn_completed_activity(
+    emitted: list[tuple[str, object]],
+) -> AgentActivity:
+    activity = AgentActivity.__new__(AgentActivity)
+    # `llm` is a property reading from `_agent.llm`; setting a non-NotGiven value
+    # makes `is_given` return True so the property resolves to a real object that
+    # is neither None nor a RealtimeModel — both early-return gates we must clear
+    # to reach the metrics emit site.
+    activity._agent = SimpleNamespace(
+        chat_ctx=SimpleNamespace(copy=lambda: SimpleNamespace(items=[])),
+        on_user_turn_completed=_async_noop,
+        _chat_ctx=SimpleNamespace(items=[]),
+        llm=SimpleNamespace(),
+    )
+    activity._session = SimpleNamespace(
+        emit=lambda evt, payload: emitted.append((evt, payload)),
+        _closing=False,
+        _conversation_item_added=lambda *a, **k: None,
+        llm=None,
+    )
+    activity._rt_session = None
+    activity._current_speech = None
+    activity._scheduling_paused = False
+    activity._preemptive_generation = None
+    activity._turn_detection = "vad"
+    speech_handle = SimpleNamespace(id="test-speech", interrupt=_async_noop)
+    activity._generate_reply = lambda **kwargs: speech_handle
+    activity._interrupt_background_speeches = lambda force=False: []
+    return activity
+
+
+async def _async_noop(*args: object, **kwargs: object) -> None:
+    return None
+
+
+def test_metrics_collected_emitted_when_clock_not_suppressed() -> None:
+    emitted: list[tuple[str, object]] = []
+    activity = _build_user_turn_completed_activity(emitted)
+
+    info = _EndOfTurnInfo(
+        skip_reply=False,
+        new_transcript="안녕하세요",
+        transcript_confidence=1.0,
+        transcript_clock_suppressed=False,
+        started_speaking_at=1.0,
+        stopped_speaking_at=2.0,
+        transcription_delay=0.1,
+        end_of_turn_delay=0.2,
+    )
+
+    async def run() -> None:
+        activity._user_turn_completed_atask = asyncio.current_task()
+        await activity._user_turn_completed_task(None, info)
+
+    asyncio.run(run())
+
+    assert any(evt == "metrics_collected" for evt, _ in emitted), emitted
+
+
+def test_metrics_collected_suppressed_when_clock_suppressed() -> None:
+    emitted: list[tuple[str, object]] = []
+    activity = _build_user_turn_completed_activity(emitted)
+
+    info = _EndOfTurnInfo(
+        skip_reply=False,
+        new_transcript="네",
+        transcript_confidence=1.0,
+        transcript_clock_suppressed=True,
+        started_speaking_at=None,
+        stopped_speaking_at=None,
+        transcription_delay=None,
+        end_of_turn_delay=None,
+    )
+
+    async def run() -> None:
+        activity._user_turn_completed_atask = asyncio.current_task()
+        await activity._user_turn_completed_task(None, info)
+
+    asyncio.run(run())
+
+    assert not any(evt == "metrics_collected" for evt, _ in emitted), emitted

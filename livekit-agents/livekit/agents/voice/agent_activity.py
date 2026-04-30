@@ -1649,13 +1649,23 @@ class AgentActivity(RecognitionHooks):
     def _clear_user_speech_interruption_context(self) -> None:
         self._user_speech_started_during_interruptible_agent_speech = False
 
-    def _consume_delayed_interruption_turn(self, transcript: str, *, reason: str) -> bool:
+    def _consume_delayed_interruption_turn(self, info: _EndOfTurnInfo, *, reason: str) -> bool:
         self._cancel_preemptive_generation()
         self._last_eou_timestamp = None
         self._clear_user_speech_interruption_context()
-        logger.debug(
+        # Preserve the consumed transcript in chat history so the LLM has memory
+        # of a late user utterance even when we choose not to interrupt.
+        if info.new_transcript:
+            user_message = llm.ChatMessage(
+                role="user",
+                content=[info.new_transcript],
+                transcript_confidence=info.transcript_confidence,
+            )
+            self._agent._chat_ctx.items.append(user_message)
+            self._session._conversation_item_added(user_message)
+        logger.warning(
             "consuming delayed interruption transcript",
-            extra={"user_input": transcript, "reason": reason},
+            extra={"user_input": info.new_transcript, "reason": reason},
         )
         return True
 
@@ -1720,7 +1730,7 @@ class AgentActivity(RecognitionHooks):
                 # avoid interruption if the new_transcript is too short
                 if delayed_interruption_context:
                     return self._consume_delayed_interruption_turn(
-                        info.new_transcript,
+                        info,
                         reason="min_interruption_words",
                     )
                 return False
@@ -1733,7 +1743,7 @@ class AgentActivity(RecognitionHooks):
                     self._cancel_preemptive_generation()
                     if delayed_interruption_context:
                         return self._consume_delayed_interruption_turn(
-                            info.new_transcript,
+                            info,
                             reason="empty_interruption",
                         )
                     return False
@@ -1744,7 +1754,7 @@ class AgentActivity(RecognitionHooks):
                     self._cancel_preemptive_generation()
                     if delayed_interruption_context:
                         return self._consume_delayed_interruption_turn(
-                            info.new_transcript,
+                            info,
                             reason="interruption_ignore_words",
                         )
                     return False
@@ -1946,6 +1956,17 @@ class AgentActivity(RecognitionHooks):
                 metadata=metadata,
             )
             self._session.emit("metrics_collected", MetricsCollectedEvent(metrics=eou_metrics))
+        else:
+            # Operators must be able to see when EOU metrics are dropped, otherwise a
+            # regression that mass-suppresses turns would silently zero out the
+            # response-latency dashboard.
+            logger.debug(
+                "skipping EOU metrics for suppressed transcript",
+                extra={
+                    "speech_id": speech_handle.id,
+                    "user_input": info.new_transcript,
+                },
+            )
 
     # AudioRecognition is calling this method to retrieve the chat context before running the TurnDetector model  # noqa: E501
     def retrieve_chat_ctx(self) -> llm.ChatContext:

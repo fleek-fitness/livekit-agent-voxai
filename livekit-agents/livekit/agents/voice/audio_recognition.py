@@ -746,13 +746,15 @@ class AudioRecognition:
                 self._audio_transcript = ""
                 self._final_transcript_confidence = []
                 self._last_final_transcript_time = None
-                self._final_transcript_clock_suppressed = False
                 # concurrent user speech might have changed it
                 # only reset if there is no new speech
                 if self._last_speaking_time == last_speaking_time:
                     self._speech_start_time = None
                     self._last_speaking_time = None
 
+            # Always reset the suppression flag so a non-committed turn does not
+            # leak its suspect-clock state into the next EOU bounce.
+            self._final_transcript_clock_suppressed = False
             self._user_turn_committed = False
 
         if self._end_of_turn_task is not None:
