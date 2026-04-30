@@ -445,10 +445,7 @@ class AudioRecognition:
                 extra["transcript_delay"] = time.time() - self._last_speaking_time
             logger.debug("received user transcript", extra=extra)
 
-            if self._should_advance_final_transcript_clock():
-                self._last_final_transcript_time = time.time()
-            else:
-                self._final_transcript_clock_suppressed = True
+            self._record_final_transcript_time()
             self._audio_transcript += f" {transcript}"
             self._audio_transcript = self._audio_transcript.lstrip()
             self._final_transcript_confidence.append(confidence)
@@ -508,11 +505,7 @@ class AudioRecognition:
                 extra={"user_transcript": transcript, "language": self._last_language},
             )
 
-            # still need to increment it as it's used for turn detection,
-            if self._should_advance_final_transcript_clock():
-                self._last_final_transcript_time = time.time()
-            else:
-                self._final_transcript_clock_suppressed = True
+            self._record_final_transcript_time()
             # preflight transcript includes all pre-committed transcripts (including final transcript from the previous STT run)
             self._audio_preflight_transcript = (self._audio_transcript + " " + transcript).lstrip()
             self._audio_interim_transcript = transcript
@@ -782,6 +775,11 @@ class AudioRecognition:
         if self._speaking:
             return True
         return time.time() - self._last_speaking_time <= self._max_endpointing_delay
+
+    def _record_final_transcript_time(self) -> None:
+        if not self._should_advance_final_transcript_clock():
+            self._final_transcript_clock_suppressed = True
+        self._last_final_transcript_time = time.time()
 
     @utils.log_exceptions(logger=logger)
     async def _stt_task(

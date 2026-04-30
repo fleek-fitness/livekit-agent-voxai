@@ -37,6 +37,25 @@ def test_final_transcript_clock_advances_while_user_is_speaking() -> None:
     assert recognition._should_advance_final_transcript_clock() is True
 
 
+def test_suppressed_final_transcript_still_updates_recency_clock() -> None:
+    recognition = AudioRecognition(
+        SimpleNamespace(),
+        hooks=SimpleNamespace(),
+        stt=None,
+        vad=SimpleNamespace(),
+        turn_detection="vad",
+        min_endpointing_delay=0.1,
+        max_endpointing_delay=0.5,
+    )
+    recognition._last_speaking_time = time.time() - 1.0
+    recognition._speaking = False
+
+    recognition._record_final_transcript_time()
+
+    assert recognition._final_transcript_clock_suppressed is True
+    assert recognition._last_final_transcript_time is not None
+
+
 def _activity_for_end_of_turn() -> tuple[AgentActivity, object]:
     activity = AgentActivity.__new__(AgentActivity)
     activity._agent = SimpleNamespace(stt=object())
