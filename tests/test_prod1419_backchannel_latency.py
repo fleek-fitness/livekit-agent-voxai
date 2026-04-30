@@ -106,6 +106,25 @@ def test_vad_end_does_not_create_response_latency_anchor() -> None:
     assert isinstance(updates[-1][1]["last_speaking_time"], float)
 
 
+def test_vad_start_keeps_context_when_speech_was_already_interrupted() -> None:
+    updates = []
+    activity = AgentActivity.__new__(AgentActivity)
+    activity._current_speech = SimpleNamespace(interrupted=True, allow_interruptions=True)
+    activity._session = SimpleNamespace(
+        _update_user_state=lambda state, **kwargs: updates.append((state, kwargs))
+    )
+    activity._user_silence_event = SimpleNamespace(clear=lambda: None)
+    activity._stt_eos_received = True
+    activity._dynamic_interruption = SimpleNamespace(on_user_speech_started=lambda: None)
+    activity._false_interruption_timer = None
+
+    activity.on_start_of_speech(None)
+
+    assert activity._user_speech_started_during_interruptible_agent_speech is True
+    assert activity._stt_eos_received is False
+    assert updates[-1][0] == "speaking"
+
+
 def test_suppressed_transcript_commits_without_latency_anchor() -> None:
     activity, task = _activity_for_end_of_turn()
 

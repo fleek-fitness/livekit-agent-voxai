@@ -1485,11 +1485,8 @@ class AgentActivity(RecognitionHooks):
         if ev:
             speech_start_time = speech_start_time - ev.speech_duration
         current_speech = self._current_speech
-        started_during_agent_speech = current_speech is not None and not current_speech.interrupted
         self._user_speech_started_during_interruptible_agent_speech = (
-            started_during_agent_speech
-            and current_speech is not None
-            and current_speech.allow_interruptions
+            current_speech is not None and current_speech.allow_interruptions
         )
         self._session._update_user_state("speaking", last_speaking_time=speech_start_time)
         self._user_silence_event.clear()
