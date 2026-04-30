@@ -1,0 +1,474 @@
+import asyncio
+import time
+from types import SimpleNamespace
+
+from livekit.agents.metrics import ResponseLatencyMetrics, TTSMetrics
+from livekit.agents.voice.agent_activity import AgentActivity
+from livekit.agents.voice.audio_recognition import AudioRecognition, _EndOfTurnInfo
+
+
+def test_final_transcript_clock_does_not_advance_after_endpointing_window() -> None:
+    recognition = AudioRecognition(
+        SimpleNamespace(),
+        hooks=SimpleNamespace(),
+        stt=None,
+        vad=SimpleNamespace(),
+        turn_detection="vad",
+        min_endpointing_delay=0.1,
+        max_endpointing_delay=0.5,
+    )
+    recognition._last_speaking_time = time.time() - 1.0
+    recognition._speaking = False
+
+    assert recognition._should_advance_final_transcript_clock() is False
+
+
+def test_final_transcript_clock_advances_while_user_is_speaking() -> None:
+    recognition = AudioRecognition(
+        SimpleNamespace(),
+        hooks=SimpleNamespace(),
+        stt=None,
+        vad=SimpleNamespace(),
+        turn_detection="vad",
+        min_endpointing_delay=0.1,
+        max_endpointing_delay=0.5,
+    )
+    recognition._last_speaking_time = time.time() - 1.0
+    recognition._speaking = True
+
+    assert recognition._should_advance_final_transcript_clock() is True
+
+
+def test_suppressed_final_transcript_still_updates_recency_clock() -> None:
+    recognition = AudioRecognition(
+        SimpleNamespace(),
+        hooks=SimpleNamespace(),
+        stt=None,
+        vad=SimpleNamespace(),
+        turn_detection="vad",
+        min_endpointing_delay=0.1,
+        max_endpointing_delay=0.5,
+    )
+    recognition._last_speaking_time = time.time() - 1.0
+    recognition._speaking = False
+
+    recognition._record_final_transcript_time()
+
+    assert recognition._final_transcript_clock_suppressed is True
+    assert recognition._last_final_transcript_time is not None
+
+
+def _activity_for_end_of_turn(
+    *,
+    min_interruption_words: int = 0,
+    dyn_min_words: int = 0,
+) -> tuple[AgentActivity, object, list[object]]:
+    activity = AgentActivity.__new__(AgentActivity)
+    chat_items: list[object] = []
+    activity._agent = SimpleNamespace(
+        stt=object(),
+        _chat_ctx=SimpleNamespace(items=chat_items),
+    )
+    activity._session = SimpleNamespace(
+        options=SimpleNamespace(
+            min_interruption_words=min_interruption_words,
+            interruption_ignore_words=["네", "예"],
+        ),
+        _closing=False,
+        _conversation_item_added=lambda *a, **k: None,
+    )
+    activity._turn_detection = "vad"
+    activity._current_speech = None
+    activity._scheduling_paused = False
+    activity._preemptive_generation = None
+    activity._last_eou_timestamp = None
+    activity._response_latency_anchors_by_speech = {}
+    activity._agent_ttft_by_speech = {}
+    activity._user_turn_completed_atask = None
+    activity._user_speech_started_during_interruptible_agent_speech = True
+    activity._dynamic_interruption = SimpleNamespace(
+        get_current_min_interruption_words=lambda: dyn_min_words,
+    )
+    task = object()
+
+    def create_speech_task(coro, *, speech_handle=None, name=None):  # noqa: ANN001
+        coro.close()
+        return task
+
+    activity._create_speech_task = create_speech_task
+    return activity, task, chat_items
+
+
+def test_vad_end_does_not_create_response_latency_anchor() -> None:
+    updates = []
+    activity = AgentActivity.__new__(AgentActivity)
+    activity._session = SimpleNamespace(
+        options=SimpleNamespace(false_interruption_timeout=None),
+        _update_user_state=lambda state, **kwargs: updates.append((state, kwargs)),
+    )
+    activity._user_silence_event = SimpleNamespace(set=lambda: None)
+    activity._dynamic_interruption = SimpleNamespace(on_user_speech_ended=lambda: None)
+    activity._paused_speech = None
+    activity._stt_eos_received = False
+    activity._last_eou_timestamp = None
+
+    activity.on_end_of_speech(None)
+
+    assert activity._last_eou_timestamp is None
+    assert updates[-1][0] == "listening"
+    assert isinstance(updates[-1][1]["last_speaking_time"], float)
+
+
+def test_vad_start_keeps_context_when_speech_was_already_interrupted() -> None:
+    updates = []
+    activity = AgentActivity.__new__(AgentActivity)
+    activity._current_speech = SimpleNamespace(interrupted=True, allow_interruptions=True)
+    activity._session = SimpleNamespace(
+        _update_user_state=lambda state, **kwargs: updates.append((state, kwargs))
+    )
+    activity._user_silence_event = SimpleNamespace(clear=lambda: None)
+    activity._stt_eos_received = True
+    activity._dynamic_interruption = SimpleNamespace(on_user_speech_started=lambda: None)
+    activity._false_interruption_timer = None
+
+    activity.on_start_of_speech(None)
+
+    assert activity._user_speech_started_during_interruptible_agent_speech is True
+    assert activity._stt_eos_received is False
+    assert updates[-1][0] == "speaking"
+
+
+def test_suppressed_transcript_commits_without_latency_anchor() -> None:
+    activity, task, _ = _activity_for_end_of_turn()
+
+    committed = activity.on_end_of_turn(
+        _EndOfTurnInfo(
+            skip_reply=False,
+            new_transcript="네",
+            transcript_confidence=1.0,
+            transcript_clock_suppressed=True,
+            started_speaking_at=None,
+            stopped_speaking_at=None,
+            transcription_delay=None,
+            end_of_turn_delay=None,
+        )
+    )
+
+    assert committed is True
+    assert activity._user_turn_completed_atask is task
+    assert activity._last_eou_timestamp is None
+    assert activity._user_speech_started_during_interruptible_agent_speech is False
+
+
+def test_suppressed_transcript_bypasses_interruption_filters() -> None:
+    activity, task, chat_items = _activity_for_end_of_turn(dyn_min_words=3)
+    activity._current_speech = SimpleNamespace(allow_interruptions=True, interrupted=False)
+
+    committed = activity.on_end_of_turn(
+        _EndOfTurnInfo(
+            skip_reply=False,
+            new_transcript="네",
+            transcript_confidence=1.0,
+            transcript_clock_suppressed=True,
+            started_speaking_at=None,
+            stopped_speaking_at=None,
+            transcription_delay=None,
+            end_of_turn_delay=None,
+        )
+    )
+
+    assert committed is True
+    assert activity._user_turn_completed_atask is task
+    assert activity._last_eou_timestamp is None
+    assert activity._user_speech_started_during_interruptible_agent_speech is False
+    assert chat_items == []
+
+
+def test_committed_turn_waits_for_reply_before_setting_response_latency_anchor() -> None:
+    activity, task, _ = _activity_for_end_of_turn()
+    activity._user_speech_started_during_interruptible_agent_speech = False
+
+    committed = activity.on_end_of_turn(
+        _EndOfTurnInfo(
+            skip_reply=False,
+            new_transcript="예약 문의요",
+            transcript_confidence=1.0,
+            transcript_clock_suppressed=False,
+            started_speaking_at=400.0,
+            stopped_speaking_at=456.0,
+            transcription_delay=0.1,
+            end_of_turn_delay=0.2,
+        )
+    )
+
+    assert committed is True
+    assert activity._user_turn_completed_atask is task
+    assert activity._last_eou_timestamp is None
+    assert activity._response_latency_anchors_by_speech == {}
+
+
+def test_skip_reply_turn_does_not_set_response_latency_anchor() -> None:
+    activity, task, _ = _activity_for_end_of_turn()
+    activity._user_speech_started_during_interruptible_agent_speech = False
+
+    committed = activity.on_end_of_turn(
+        _EndOfTurnInfo(
+            skip_reply=True,
+            new_transcript="예약 문의요",
+            transcript_confidence=1.0,
+            transcript_clock_suppressed=False,
+            started_speaking_at=400.0,
+            stopped_speaking_at=456.0,
+            transcription_delay=0.1,
+            end_of_turn_delay=0.2,
+        )
+    )
+
+    assert committed is True
+    assert activity._user_turn_completed_atask is task
+    assert activity._last_eou_timestamp is None
+    assert activity._response_latency_anchors_by_speech == {}
+
+
+def test_non_interruptible_no_reply_turn_does_not_set_response_latency_anchor() -> None:
+    activity, task, _ = _activity_for_end_of_turn()
+    activity._current_speech = SimpleNamespace(allow_interruptions=False, interrupted=False)
+    activity._user_speech_started_during_interruptible_agent_speech = False
+
+    committed = activity.on_end_of_turn(
+        _EndOfTurnInfo(
+            skip_reply=False,
+            new_transcript="예약 문의요",
+            transcript_confidence=1.0,
+            transcript_clock_suppressed=False,
+            started_speaking_at=400.0,
+            stopped_speaking_at=456.0,
+            transcription_delay=0.1,
+            end_of_turn_delay=0.2,
+        )
+    )
+
+    assert committed is True
+    assert activity._user_turn_completed_atask is task
+    assert activity._last_eou_timestamp is None
+    assert activity._response_latency_anchors_by_speech == {}
+
+
+def test_non_suppressed_delayed_ignored_backchannel_is_consumed_without_reply_or_anchor() -> None:
+    activity, _, chat_items = _activity_for_end_of_turn()
+
+    committed = activity.on_end_of_turn(
+        _EndOfTurnInfo(
+            skip_reply=False,
+            new_transcript="네",
+            transcript_confidence=1.0,
+            transcript_clock_suppressed=False,
+            started_speaking_at=400.0,
+            stopped_speaking_at=456.0,
+            transcription_delay=0.1,
+            end_of_turn_delay=0.2,
+        )
+    )
+
+    assert committed is True
+    assert activity._user_turn_completed_atask is None
+    assert activity._last_eou_timestamp is None
+    assert activity._user_speech_started_during_interruptible_agent_speech is False
+    assert len(chat_items) == 1
+    assert chat_items[0].role == "user"
+
+
+def test_delayed_short_transcript_consumed_via_min_interruption_words_branch() -> None:
+    activity, _, chat_items = _activity_for_end_of_turn(dyn_min_words=3)
+    activity._current_speech = SimpleNamespace(allow_interruptions=False, interrupted=False)
+
+    committed = activity.on_end_of_turn(
+        _EndOfTurnInfo(
+            skip_reply=False,
+            new_transcript="아",
+            transcript_confidence=1.0,
+            transcript_clock_suppressed=False,
+            started_speaking_at=400.0,
+            stopped_speaking_at=456.0,
+            transcription_delay=0.1,
+            end_of_turn_delay=0.2,
+        )
+    )
+
+    assert committed is True
+    assert activity._user_turn_completed_atask is None
+    assert activity._last_eou_timestamp is None
+    assert activity._user_speech_started_during_interruptible_agent_speech is False
+    assert len(chat_items) == 1
+    assert chat_items[0].text_content == "아"
+
+
+def test_delayed_empty_transcript_consumed_via_empty_interruption_branch() -> None:
+    activity, _, chat_items = _activity_for_end_of_turn(dyn_min_words=2)
+    activity._current_speech = SimpleNamespace(allow_interruptions=False, interrupted=False)
+
+    committed = activity.on_end_of_turn(
+        _EndOfTurnInfo(
+            skip_reply=False,
+            new_transcript="",
+            transcript_confidence=0.0,
+            transcript_clock_suppressed=False,
+            started_speaking_at=400.0,
+            stopped_speaking_at=456.0,
+            transcription_delay=0.1,
+            end_of_turn_delay=0.2,
+        )
+    )
+
+    assert committed is True
+    assert activity._user_turn_completed_atask is None
+    assert activity._last_eou_timestamp is None
+    assert activity._user_speech_started_during_interruptible_agent_speech is False
+    # Empty transcript should not pollute chat history.
+    assert chat_items == []
+
+
+class _TestSpeechHandle:
+    def __init__(self, speech_id: str = "test-speech") -> None:
+        self.id = speech_id
+        self.interrupted = False
+        self.done_callbacks = []
+
+    async def interrupt(self) -> None:
+        self.interrupted = True
+
+    def add_done_callback(self, callback) -> None:  # noqa: ANN001
+        self.done_callbacks.append(callback)
+
+
+def _build_user_turn_completed_activity(
+    emitted: list[tuple[str, object]],
+) -> tuple[AgentActivity, _TestSpeechHandle]:
+    activity = AgentActivity.__new__(AgentActivity)
+    # `llm` is a property reading from `_agent.llm`; setting a non-NotGiven value
+    # makes `is_given` return True so the property resolves to a real object that
+    # is neither None nor a RealtimeModel — both early-return gates we must clear
+    # to reach the metrics emit site.
+    activity._agent = SimpleNamespace(
+        chat_ctx=SimpleNamespace(copy=lambda: SimpleNamespace(items=[])),
+        on_user_turn_completed=_async_noop,
+        _chat_ctx=SimpleNamespace(items=[]),
+        llm=SimpleNamespace(),
+    )
+    activity._session = SimpleNamespace(
+        emit=lambda evt, payload: emitted.append((evt, payload)),
+        _closing=False,
+        _conversation_item_added=lambda *a, **k: None,
+        llm=None,
+    )
+    activity._rt_session = None
+    activity._current_speech = None
+    activity._scheduling_paused = False
+    activity._preemptive_generation = None
+    activity._turn_detection = "vad"
+    activity._last_eou_timestamp = None
+    activity._response_latency_anchors_by_speech = {}
+    activity._agent_ttft_by_speech = {}
+    activity._dynamic_interruption = SimpleNamespace(reset_collisions=lambda: None)
+    speech_handle = _TestSpeechHandle()
+    activity._generate_reply = lambda **kwargs: speech_handle
+    activity._interrupt_background_speeches = lambda force=False: []
+    return activity, speech_handle
+
+
+async def _async_noop(*args: object, **kwargs: object) -> None:
+    return None
+
+
+def test_metrics_collected_emitted_when_clock_not_suppressed() -> None:
+    emitted: list[tuple[str, object]] = []
+    activity, speech_handle = _build_user_turn_completed_activity(emitted)
+
+    info = _EndOfTurnInfo(
+        skip_reply=False,
+        new_transcript="안녕하세요",
+        transcript_confidence=1.0,
+        transcript_clock_suppressed=False,
+        started_speaking_at=1.0,
+        stopped_speaking_at=2.0,
+        transcription_delay=0.1,
+        end_of_turn_delay=0.2,
+    )
+
+    async def run() -> None:
+        activity._user_turn_completed_atask = asyncio.current_task()
+        await activity._user_turn_completed_task(None, info)
+
+    asyncio.run(run())
+
+    assert any(evt == "metrics_collected" for evt, _ in emitted), emitted
+    assert activity._last_eou_timestamp == 2.0
+    assert activity._response_latency_anchors_by_speech == {speech_handle.id: 2.0}
+
+
+def test_metrics_collected_suppressed_when_clock_suppressed() -> None:
+    emitted: list[tuple[str, object]] = []
+    activity, _ = _build_user_turn_completed_activity(emitted)
+
+    info = _EndOfTurnInfo(
+        skip_reply=False,
+        new_transcript="네",
+        transcript_confidence=1.0,
+        transcript_clock_suppressed=True,
+        started_speaking_at=None,
+        stopped_speaking_at=None,
+        transcription_delay=None,
+        end_of_turn_delay=None,
+    )
+
+    async def run() -> None:
+        activity._user_turn_completed_atask = asyncio.current_task()
+        await activity._user_turn_completed_task(None, info)
+
+    asyncio.run(run())
+
+    assert not any(evt == "metrics_collected" for evt, _ in emitted), emitted
+    assert activity._last_eou_timestamp is None
+    assert activity._response_latency_anchors_by_speech == {}
+
+
+def _tts_metrics(*, speech_id: str, timestamp: float = 10.0) -> TTSMetrics:
+    return TTSMetrics(
+        label="test-tts",
+        request_id=f"tts-{speech_id}",
+        timestamp=timestamp,
+        ttfb=0.2,
+        duration=1.0,
+        audio_duration=1.0,
+        cancelled=False,
+        characters_count=10,
+        streamed=True,
+        speech_id=speech_id,
+    )
+
+
+def test_response_latency_waits_for_matching_reply_tts_metrics() -> None:
+    emitted: list[tuple[str, object]] = []
+    activity, speech_handle = _build_user_turn_completed_activity(emitted)
+    activity._response_latency_anchors_by_speech[speech_handle.id] = 2.0
+    activity._last_eou_timestamp = 2.0
+
+    activity._on_metrics_collected(_tts_metrics(speech_id="unrelated-speech"))
+
+    assert not any(isinstance(payload.metrics, ResponseLatencyMetrics) for _, payload in emitted), (
+        emitted
+    )
+    assert activity._response_latency_anchors_by_speech == {speech_handle.id: 2.0}
+
+    activity._on_metrics_collected(_tts_metrics(speech_id=speech_handle.id))
+
+    response_latency = [
+        payload.metrics
+        for _, payload in emitted
+        if isinstance(payload.metrics, ResponseLatencyMetrics)
+    ]
+    assert len(response_latency) == 1
+    assert response_latency[0].speech_id == speech_handle.id
+    assert response_latency[0].eou_timestamp == 2.0
+    assert activity._last_eou_timestamp is None
+    assert activity._response_latency_anchors_by_speech == {}
