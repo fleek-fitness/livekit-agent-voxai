@@ -2,6 +2,7 @@ import asyncio
 import time
 from types import SimpleNamespace
 
+from livekit.agents.metrics import ResponseLatencyMetrics, TTSMetrics
 from livekit.agents.voice.agent_activity import AgentActivity
 from livekit.agents.voice.audio_recognition import AudioRecognition, _EndOfTurnInfo
 
@@ -80,7 +81,9 @@ def _activity_for_end_of_turn(
     activity._current_speech = None
     activity._scheduling_paused = False
     activity._preemptive_generation = None
-    activity._last_eou_timestamp = 123.0
+    activity._last_eou_timestamp = None
+    activity._response_latency_anchors_by_speech = {}
+    activity._agent_ttft_by_speech = {}
     activity._user_turn_completed_atask = None
     activity._user_speech_started_during_interruptible_agent_speech = True
     activity._dynamic_interruption = SimpleNamespace(
@@ -181,7 +184,7 @@ def test_suppressed_transcript_bypasses_interruption_filters() -> None:
     assert chat_items == []
 
 
-def test_committed_turn_sets_response_latency_anchor_from_reliable_stop_time() -> None:
+def test_committed_turn_waits_for_reply_before_setting_response_latency_anchor() -> None:
     activity, task, _ = _activity_for_end_of_turn()
     activity._user_speech_started_during_interruptible_agent_speech = False
 
@@ -200,7 +203,55 @@ def test_committed_turn_sets_response_latency_anchor_from_reliable_stop_time() -
 
     assert committed is True
     assert activity._user_turn_completed_atask is task
-    assert activity._last_eou_timestamp == 456.0
+    assert activity._last_eou_timestamp is None
+    assert activity._response_latency_anchors_by_speech == {}
+
+
+def test_skip_reply_turn_does_not_set_response_latency_anchor() -> None:
+    activity, task, _ = _activity_for_end_of_turn()
+    activity._user_speech_started_during_interruptible_agent_speech = False
+
+    committed = activity.on_end_of_turn(
+        _EndOfTurnInfo(
+            skip_reply=True,
+            new_transcript="예약 문의요",
+            transcript_confidence=1.0,
+            transcript_clock_suppressed=False,
+            started_speaking_at=400.0,
+            stopped_speaking_at=456.0,
+            transcription_delay=0.1,
+            end_of_turn_delay=0.2,
+        )
+    )
+
+    assert committed is True
+    assert activity._user_turn_completed_atask is task
+    assert activity._last_eou_timestamp is None
+    assert activity._response_latency_anchors_by_speech == {}
+
+
+def test_non_interruptible_no_reply_turn_does_not_set_response_latency_anchor() -> None:
+    activity, task, _ = _activity_for_end_of_turn()
+    activity._current_speech = SimpleNamespace(allow_interruptions=False, interrupted=False)
+    activity._user_speech_started_during_interruptible_agent_speech = False
+
+    committed = activity.on_end_of_turn(
+        _EndOfTurnInfo(
+            skip_reply=False,
+            new_transcript="예약 문의요",
+            transcript_confidence=1.0,
+            transcript_clock_suppressed=False,
+            started_speaking_at=400.0,
+            stopped_speaking_at=456.0,
+            transcription_delay=0.1,
+            end_of_turn_delay=0.2,
+        )
+    )
+
+    assert committed is True
+    assert activity._user_turn_completed_atask is task
+    assert activity._last_eou_timestamp is None
+    assert activity._response_latency_anchors_by_speech == {}
 
 
 def test_non_suppressed_delayed_ignored_backchannel_is_consumed_without_reply_or_anchor() -> None:
@@ -277,9 +328,22 @@ def test_delayed_empty_transcript_consumed_via_empty_interruption_branch() -> No
     assert chat_items == []
 
 
+class _TestSpeechHandle:
+    def __init__(self, speech_id: str = "test-speech") -> None:
+        self.id = speech_id
+        self.interrupted = False
+        self.done_callbacks = []
+
+    async def interrupt(self) -> None:
+        self.interrupted = True
+
+    def add_done_callback(self, callback) -> None:  # noqa: ANN001
+        self.done_callbacks.append(callback)
+
+
 def _build_user_turn_completed_activity(
     emitted: list[tuple[str, object]],
-) -> AgentActivity:
+) -> tuple[AgentActivity, _TestSpeechHandle]:
     activity = AgentActivity.__new__(AgentActivity)
     # `llm` is a property reading from `_agent.llm`; setting a non-NotGiven value
     # makes `is_given` return True so the property resolves to a real object that
@@ -302,10 +366,14 @@ def _build_user_turn_completed_activity(
     activity._scheduling_paused = False
     activity._preemptive_generation = None
     activity._turn_detection = "vad"
-    speech_handle = SimpleNamespace(id="test-speech", interrupt=_async_noop)
+    activity._last_eou_timestamp = None
+    activity._response_latency_anchors_by_speech = {}
+    activity._agent_ttft_by_speech = {}
+    activity._dynamic_interruption = SimpleNamespace(reset_collisions=lambda: None)
+    speech_handle = _TestSpeechHandle()
     activity._generate_reply = lambda **kwargs: speech_handle
     activity._interrupt_background_speeches = lambda force=False: []
-    return activity
+    return activity, speech_handle
 
 
 async def _async_noop(*args: object, **kwargs: object) -> None:
@@ -314,7 +382,7 @@ async def _async_noop(*args: object, **kwargs: object) -> None:
 
 def test_metrics_collected_emitted_when_clock_not_suppressed() -> None:
     emitted: list[tuple[str, object]] = []
-    activity = _build_user_turn_completed_activity(emitted)
+    activity, speech_handle = _build_user_turn_completed_activity(emitted)
 
     info = _EndOfTurnInfo(
         skip_reply=False,
@@ -334,11 +402,13 @@ def test_metrics_collected_emitted_when_clock_not_suppressed() -> None:
     asyncio.run(run())
 
     assert any(evt == "metrics_collected" for evt, _ in emitted), emitted
+    assert activity._last_eou_timestamp == 2.0
+    assert activity._response_latency_anchors_by_speech == {speech_handle.id: 2.0}
 
 
 def test_metrics_collected_suppressed_when_clock_suppressed() -> None:
     emitted: list[tuple[str, object]] = []
-    activity = _build_user_turn_completed_activity(emitted)
+    activity, _ = _build_user_turn_completed_activity(emitted)
 
     info = _EndOfTurnInfo(
         skip_reply=False,
@@ -358,3 +428,47 @@ def test_metrics_collected_suppressed_when_clock_suppressed() -> None:
     asyncio.run(run())
 
     assert not any(evt == "metrics_collected" for evt, _ in emitted), emitted
+    assert activity._last_eou_timestamp is None
+    assert activity._response_latency_anchors_by_speech == {}
+
+
+def _tts_metrics(*, speech_id: str, timestamp: float = 10.0) -> TTSMetrics:
+    return TTSMetrics(
+        label="test-tts",
+        request_id=f"tts-{speech_id}",
+        timestamp=timestamp,
+        ttfb=0.2,
+        duration=1.0,
+        audio_duration=1.0,
+        cancelled=False,
+        characters_count=10,
+        streamed=True,
+        speech_id=speech_id,
+    )
+
+
+def test_response_latency_waits_for_matching_reply_tts_metrics() -> None:
+    emitted: list[tuple[str, object]] = []
+    activity, speech_handle = _build_user_turn_completed_activity(emitted)
+    activity._response_latency_anchors_by_speech[speech_handle.id] = 2.0
+    activity._last_eou_timestamp = 2.0
+
+    activity._on_metrics_collected(_tts_metrics(speech_id="unrelated-speech"))
+
+    assert not any(
+        isinstance(payload.metrics, ResponseLatencyMetrics) for _, payload in emitted
+    ), emitted
+    assert activity._response_latency_anchors_by_speech == {speech_handle.id: 2.0}
+
+    activity._on_metrics_collected(_tts_metrics(speech_id=speech_handle.id))
+
+    response_latency = [
+        payload.metrics
+        for _, payload in emitted
+        if isinstance(payload.metrics, ResponseLatencyMetrics)
+    ]
+    assert len(response_latency) == 1
+    assert response_latency[0].speech_id == speech_handle.id
+    assert response_latency[0].eou_timestamp == 2.0
+    assert activity._last_eou_timestamp is None
+    assert activity._response_latency_anchors_by_speech == {}

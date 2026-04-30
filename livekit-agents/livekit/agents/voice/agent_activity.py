@@ -206,6 +206,7 @@ class AgentActivity(RecognitionHooks):
         self._dynamic_interruption = DynamicInterruptionManager(sess.options)
         # For response latency metrics tracking
         self._last_eou_timestamp: float | None = None
+        self._response_latency_anchors_by_speech: dict[str, float] = {}
         self._agent_ttft_by_speech: dict[str, float] = {}
         self._user_speech_started_during_interruptible_agent_speech = False
 
@@ -771,6 +772,33 @@ class AgentActivity(RecognitionHooks):
     def _wake_up_scheduling_task(self) -> None:
         self._q_updated.set()
 
+    def _response_latency_anchors(self) -> dict[str, float]:
+        anchors = getattr(self, "_response_latency_anchors_by_speech", None)
+        if anchors is None:
+            anchors = {}
+            self._response_latency_anchors_by_speech = anchors
+        return anchors
+
+    def _sync_latest_response_latency_anchor(self) -> None:
+        anchors = self._response_latency_anchors()
+        self._last_eou_timestamp = next(reversed(anchors.values()), None) if anchors else None
+
+    def _register_response_latency_anchor(
+        self, speech_handle: SpeechHandle, info: _EndOfTurnInfo
+    ) -> None:
+        if info.transcript_clock_suppressed or info.stopped_speaking_at is None:
+            return
+        if speech_handle.interrupted:
+            return
+
+        self._response_latency_anchors()[speech_handle.id] = info.stopped_speaking_at
+        self._sync_latest_response_latency_anchor()
+        speech_handle.add_done_callback(self._discard_response_latency_anchor)
+
+    def _discard_response_latency_anchor(self, speech_handle: SpeechHandle) -> None:
+        self._response_latency_anchors().pop(speech_handle.id, None)
+        self._sync_latest_response_latency_anchor()
+
     async def pause(self, *, blocked_tasks: list[asyncio.Task]) -> None:
         # `pause` must only be called by AgentSession
 
@@ -1295,19 +1323,27 @@ class AgentActivity(RecognitionHooks):
         if isinstance(ev, AgentLLMMetrics) and ev.speech_id and ev.agent_ttft is not None:
             self._agent_ttft_by_speech[ev.speech_id] = ev.agent_ttft
 
-        # Compute and emit response latency when TTS metrics arrive
-        if self._last_eou_timestamp is not None and isinstance(ev, TTSMetrics) and ev.ttfb > 0:
+        # Compute and emit response latency when the matching reply TTS metrics arrive.
+        if isinstance(ev, TTSMetrics) and ev.ttfb > 0:
             first_audio_timestamp = ev.timestamp - ev.duration + ev.ttfb
             speech_handle = _SpeechHandleContextVar.get(None)
-            speech_id = speech_handle.id if speech_handle else None
+            speech_id = ev.speech_id or (speech_handle.id if speech_handle else None)
+            eou_timestamp = (
+                self._response_latency_anchors().pop(speech_id, None) if speech_id else None
+            )
+            self._sync_latest_response_latency_anchor()
+            if eou_timestamp is None:
+                self._session.emit("metrics_collected", MetricsCollectedEvent(metrics=ev))
+                return
+
             agent_ttft = self._agent_ttft_by_speech.get(speech_id) if speech_id else None
-            e2e_latency = first_audio_timestamp - self._last_eou_timestamp
+            e2e_latency = first_audio_timestamp - eou_timestamp
 
             response_latency_metrics = ResponseLatencyMetrics(
                 timestamp=time.time(),
                 speech_id=speech_id,
                 e2e_latency=e2e_latency,
-                eou_timestamp=self._last_eou_timestamp,
+                eou_timestamp=eou_timestamp,
                 first_audio_timestamp=first_audio_timestamp,
             )
             self._session.emit(
@@ -1319,7 +1355,6 @@ class AgentActivity(RecognitionHooks):
             )
 
             # Reset tracking for next response
-            self._last_eou_timestamp = None
             if speech_id and speech_id in self._agent_ttft_by_speech:
                 del self._agent_ttft_by_speech[speech_id]
             # Reset collision backoff at turn completion
@@ -1651,7 +1686,6 @@ class AgentActivity(RecognitionHooks):
 
     def _consume_delayed_interruption_turn(self, info: _EndOfTurnInfo, *, reason: str) -> bool:
         self._cancel_preemptive_generation()
-        self._last_eou_timestamp = None
         self._clear_user_speech_interruption_context()
         # Preserve the consumed transcript in chat history so the LLM has memory
         # of a late user utterance even when we choose not to interrupt.
@@ -1672,12 +1706,6 @@ class AgentActivity(RecognitionHooks):
     def on_end_of_turn(self, info: _EndOfTurnInfo) -> bool:
         # IMPORTANT: This method is sync to avoid it being cancelled by the AudioRecognition
         # We explicitly create a new task here
-
-        if info.transcript_clock_suppressed:
-            # The transcript arrived after the endpointing window for the VAD speech
-            # that started this turn. Do not let the stale VAD timestamp anchor the
-            # next TTS response latency.
-            self._last_eou_timestamp = None
 
         if self._scheduling_paused:
             self._cancel_preemptive_generation()
@@ -1759,12 +1787,6 @@ class AgentActivity(RecognitionHooks):
                             reason="interruption_ignore_words",
                         )
                     return False
-
-        self._last_eou_timestamp = (
-            info.stopped_speaking_at
-            if not info.transcript_clock_suppressed and info.stopped_speaking_at is not None
-            else None
-        )
 
         old_task = self._user_turn_completed_atask
         self._user_turn_completed_atask = self._create_speech_task(
@@ -1932,12 +1954,15 @@ class AgentActivity(RecognitionHooks):
                 input_details=InputDetails(modality="audio"),
             )
 
-        if self._user_turn_completed_atask != asyncio.current_task():
+        current_user_turn_task = self._user_turn_completed_atask == asyncio.current_task()
+        if not current_user_turn_task:
             # If a new user turn has already started, interrupt this one since it's now outdated
             # (We still create the SpeechHandle and the generate_reply coroutine, otherwise we may
             # lose data like the beginning of a user speech).
             # await the interrupt to make sure user message is added to the chat context before the new task starts
             await speech_handle.interrupt()
+        else:
+            self._register_response_latency_anchor(speech_handle, info)
 
         metadata: Metadata | None = None
         if isinstance(self._turn_detection, str):
