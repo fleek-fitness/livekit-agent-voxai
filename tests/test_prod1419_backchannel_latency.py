@@ -455,9 +455,9 @@ def test_response_latency_waits_for_matching_reply_tts_metrics() -> None:
 
     activity._on_metrics_collected(_tts_metrics(speech_id="unrelated-speech"))
 
-    assert not any(
-        isinstance(payload.metrics, ResponseLatencyMetrics) for _, payload in emitted
-    ), emitted
+    assert not any(isinstance(payload.metrics, ResponseLatencyMetrics) for _, payload in emitted), (
+        emitted
+    )
     assert activity._response_latency_anchors_by_speech == {speech_handle.id: 2.0}
 
     activity._on_metrics_collected(_tts_metrics(speech_id=speech_handle.id))
