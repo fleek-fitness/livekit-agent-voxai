@@ -157,6 +157,30 @@ def test_suppressed_transcript_commits_without_latency_anchor() -> None:
     assert activity._user_speech_started_during_interruptible_agent_speech is False
 
 
+def test_suppressed_transcript_bypasses_interruption_filters() -> None:
+    activity, task, chat_items = _activity_for_end_of_turn(dyn_min_words=3)
+    activity._current_speech = SimpleNamespace(allow_interruptions=True, interrupted=False)
+
+    committed = activity.on_end_of_turn(
+        _EndOfTurnInfo(
+            skip_reply=False,
+            new_transcript="네",
+            transcript_confidence=1.0,
+            transcript_clock_suppressed=True,
+            started_speaking_at=None,
+            stopped_speaking_at=None,
+            transcription_delay=None,
+            end_of_turn_delay=None,
+        )
+    )
+
+    assert committed is True
+    assert activity._user_turn_completed_atask is task
+    assert activity._last_eou_timestamp is None
+    assert activity._user_speech_started_during_interruptible_agent_speech is False
+    assert chat_items == []
+
+
 def test_committed_turn_sets_response_latency_anchor_from_reliable_stop_time() -> None:
     activity, task, _ = _activity_for_end_of_turn()
     activity._user_speech_started_during_interruptible_agent_speech = False

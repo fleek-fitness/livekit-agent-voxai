@@ -1714,6 +1714,7 @@ class AgentActivity(RecognitionHooks):
         if (
             self.stt is not None
             and self._turn_detection != "manual"
+            and not info.transcript_clock_suppressed
             and (current_speech_interruptible or delayed_interruption_context)
         ):
             # Dynamic min_interruption_words
