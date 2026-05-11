@@ -358,6 +358,27 @@ class _JobProc:
 
         shutdown_info = await self._shutdown_fut
 
+        # voxai: shutdown trace logging (aclose diagnostics)
+        shutdown_trace_id = f"{id(self)}-{asyncio.get_running_loop().time():.6f}"
+
+        def _log_shutdown_stage(event: str, **extra: object) -> None:
+            fields = {
+                "trace_id": shutdown_trace_id,
+                "event": event,
+                "job_id": self._job_ctx.job.id,
+                **extra,
+            }
+            field_text = " ".join(
+                f"{key}={value!r}" for key, value in fields.items() if value is not None
+            )
+            logger.info("job_proc_shutdown_trace %s", field_text)
+
+        _log_shutdown_stage(
+            "shutdown_fut_resolved",
+            reason=shutdown_info.reason,
+            user_initiated=shutdown_info.user_initiated,
+        )
+
         # wait for the entrypoint to finish, cancel if it takes too long
         if not job_entry_task.done():
             try:
@@ -367,20 +388,30 @@ class _JobProc:
                 await aio.cancel_and_wait(job_entry_task)
 
         if session := self._job_ctx._primary_agent_session:
+            _log_shutdown_stage("session_aclose_start")
             await session.aclose()
+            _log_shutdown_stage("session_aclose_done")
+        else:
+            _log_shutdown_stage("session_aclose_skipped_no_primary_session")
 
         if self._session_end_fnc:
             try:
+                _log_shutdown_stage("session_end_callback_start")
                 await asyncio.wait_for(
                     self._session_end_fnc(self._job_ctx),
                     timeout=self._session_end_timeout,
                 )
+                _log_shutdown_stage("session_end_callback_done")
             except asyncio.TimeoutError:
+                _log_shutdown_stage("session_end_callback_timeout")
                 logger.error("on_session_end timed out after %ds", self._session_end_timeout)
             except Exception:
+                _log_shutdown_stage("session_end_callback_error")
                 logger.exception("error while executing the on_session_end callback")
 
+        _log_shutdown_stage("job_ctx_on_session_end_start")
         await self._job_ctx._on_session_end()
+        _log_shutdown_stage("job_ctx_on_session_end_done")
 
         await self._client.send(ShuttingDown())
 
