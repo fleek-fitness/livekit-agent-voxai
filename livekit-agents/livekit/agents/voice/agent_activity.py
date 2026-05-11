@@ -2028,9 +2028,10 @@ class AgentActivity(RecognitionHooks):
         ):
             opts = self._session.options
             min_words = opts.interruption["min_words"]
-            if min_words > 0 and len(
-                split_words(info.new_transcript, split_character=True)
-            ) < min_words:
+            if (
+                min_words > 0
+                and len(split_words(info.new_transcript, split_character=True)) < min_words
+            ):
                 self._cancel_preemptive_generation()
                 # avoid interruption if the new_transcript is too short
                 return False

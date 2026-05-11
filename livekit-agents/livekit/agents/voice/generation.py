@@ -72,7 +72,9 @@ def perform_llm_inference(
     function_ch = aio.Chan[llm.FunctionCall]()
     data = _LLMGenerationData(text_ch=text_ch, function_ch=function_ch)
     llm_task = asyncio.create_task(
-        _llm_inference_task(node, chat_ctx, tool_ctx, model_settings, data, model, provider, session)
+        _llm_inference_task(
+            node, chat_ctx, tool_ctx, model_settings, data, model, provider, session
+        )
     )
     llm_task.add_done_callback(lambda _: text_ch.close())
     llm_task.add_done_callback(lambda _: function_ch.close())
@@ -221,11 +223,7 @@ async def _llm_inference_task(
                     data.generated_text += chunk.delta.content
                     text_ch.send_nowait(chunk.delta.content)
 
-                    if (
-                        not ttft_captured
-                        and chunk.delta.content.strip()
-                        and session is not None
-                    ):
+                    if not ttft_captured and chunk.delta.content.strip() and session is not None:
                         ttft_captured = True
                         agent_ttft = time.time() - agent_llm_start_time
                         _emit_agent_ttft(agent_ttft, node_exec_time)

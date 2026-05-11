@@ -1118,9 +1118,7 @@ class AudioRecognition:
                         multiplier = 1.0
                     if multiplier > 1.0:
                         max_delay = self._endpointing.max_delay
-                        endpointing_delay = min(
-                            max(endpointing_delay, 1.0) * multiplier, max_delay
-                        )
+                        endpointing_delay = min(max(endpointing_delay, 1.0) * multiplier, max_delay)
                         logger.debug(
                             "adaptive endpointing: multiplier=%s, delay=%s",
                             round(multiplier, 2),

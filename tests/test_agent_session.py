@@ -141,11 +141,13 @@ async def test_events_and_metrics() -> None:
     check_timestamp(agent_state_events[3].created_at - t_origin, 5.5, speed_factor=speed)
 
     # metrics — filter out voxai-specific metrics that are not part of the baseline test
-    _VOXAI_METRIC_TYPES = {"agent_llm_metrics", "response_latency_metrics", "tool_execution_metrics"}
+    _VOXAI_METRIC_TYPES = {
+        "agent_llm_metrics",
+        "response_latency_metrics",
+        "tool_execution_metrics",
+    }
     metrics_events = [
-        ev
-        for ev in metrics_events
-        if ev.metrics.type not in ("vad_metrics", *_VOXAI_METRIC_TYPES)
+        ev for ev in metrics_events if ev.metrics.type not in ("vad_metrics", *_VOXAI_METRIC_TYPES)
     ]
     assert len(metrics_events) == 3
     assert metrics_events[0].metrics.type == "eou_metrics"
