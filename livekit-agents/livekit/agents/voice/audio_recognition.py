@@ -545,10 +545,28 @@ class AudioRecognition:
             await aio.cancel_and_wait(self._interruption_atask)
 
         if self._end_of_turn_task is not None:
-            try:
-                await self._end_of_turn_task
-            except asyncio.CancelledError:
-                pass
+            # voxai: log and handle cancelled EOU task gracefully during shutdown
+            end_of_turn_task = self._end_of_turn_task
+            logger.debug(
+                "AudioRecognition.aclose end_of_turn_task await start",
+                extra={
+                    "end_of_turn_task_done": end_of_turn_task.done(),
+                    "end_of_turn_task_cancelled": end_of_turn_task.cancelled(),
+                },
+            )
+            if end_of_turn_task.cancelled():
+                logger.debug("AudioRecognition.aclose end_of_turn_task already cancelled")
+            else:
+                try:
+                    await asyncio.shield(end_of_turn_task)
+                except asyncio.CancelledError:
+                    if end_of_turn_task.cancelled():
+                        logger.debug(
+                            "AudioRecognition.aclose end_of_turn_task cancelled during close"
+                        )
+                    else:
+                        raise
+            logger.debug("AudioRecognition.aclose end_of_turn_task await done")
 
         if self._backchannel_boundary_timer is not None:
             self._backchannel_boundary_timer.cancel()
@@ -1085,6 +1103,28 @@ class AudioRecognition:
                                 trace_types.ATTR_EOU_DELAY: endpointing_delay,
                                 trace_types.ATTR_EOU_LANGUAGE: self._last_language or "",
                             }
+                        )
+
+            # voxai: adaptive endpointing multiplier
+            opts = getattr(self._hooks, "_session", None)
+            if opts is not None:
+                opts = getattr(opts, "options", None)
+            if opts is not None and getattr(opts, "enable_adaptive_endpointing", False):
+                dyn_mgr = getattr(self._hooks, "_dynamic_interruption_state", None)
+                if dyn_mgr is not None:
+                    try:
+                        multiplier = float(dyn_mgr.get("endpointing_multiplier", 1.0))
+                    except Exception:
+                        multiplier = 1.0
+                    if multiplier > 1.0:
+                        max_delay = self._endpointing.max_delay
+                        endpointing_delay = min(
+                            max(endpointing_delay, 1.0) * multiplier, max_delay
+                        )
+                        logger.debug(
+                            "adaptive endpointing: multiplier=%s, delay=%s",
+                            round(multiplier, 2),
+                            round(endpointing_delay, 2),
                         )
 
             extra_sleep = endpointing_delay

@@ -33,6 +33,11 @@ class TestAudioRecognitionAclose:
         audio_recognition._vad_atask = None
         audio_recognition._commit_user_turn_atask = None
         audio_recognition._end_of_turn_task = None
+        # 1.5.8: additional attributes accessed in aclose()
+        audio_recognition._stt_pipeline = None
+        audio_recognition._stt_consumer_atask = None
+        audio_recognition._interruption_atask = None
+        audio_recognition._backchannel_boundary_timer = None
 
         return audio_recognition
 

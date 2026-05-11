@@ -25,10 +25,13 @@ from ..llm.tool_context import (
 )
 from ..log import logger
 from ..metrics import (
+    AgentLLMMetrics,
     EOUMetrics,
     LLMMetrics,
     RealtimeModelMetrics,
+    ResponseLatencyMetrics,
     STTMetrics,
+    ToolExecutionMetrics,
     TTSMetrics,
     VADMetrics,
 )
@@ -85,6 +88,64 @@ if TYPE_CHECKING:
 
 _AgentActivityContextVar = contextvars.ContextVar["AgentActivity"]("agents_activity")
 _SpeechHandleContextVar = contextvars.ContextVar["SpeechHandle"]("agents_speech_handle")
+
+
+def _matches_ignore_words(text: str, ignore_words: list[str] | None) -> bool:
+    """Return True if `text` can be composed entirely of ignore words,
+    or is a partial (prefix) match where completed segments are ignore words
+    and the trailing segment is a prefix of an ignore word."""
+    import string
+
+    if not text:
+        return False
+
+    text_cleaned = text.lower().strip().translate(str.maketrans("", "", string.punctuation))
+    if not text_cleaned:
+        return True
+
+    text_cleaned = "".join(text_cleaned.split())
+    if not text_cleaned:
+        return True
+
+    if not ignore_words:
+        return False
+
+    cleaned_ignore_words: list[str] = []
+    for w in ignore_words:
+        if w is None or not isinstance(w, str):
+            continue
+        cleaned = w.lower().strip().translate(str.maketrans("", "", string.punctuation))
+        if cleaned:
+            cleaned_ignore_words.append(cleaned)
+
+    if not cleaned_ignore_words:
+        return False
+
+    # Single character: always ignore
+    if len(text_cleaned) == 1:
+        return True
+
+    dp = [False] * (len(text_cleaned) + 1)
+    dp[0] = True
+    for i in range(1, len(text_cleaned) + 1):
+        for word in cleaned_ignore_words:
+            if i >= len(word) and dp[i - len(word)] and text_cleaned[i - len(word) : i] == word:
+                dp[i] = True
+                break
+
+    # Exact match: text is fully composed of ignore words
+    if dp[len(text_cleaned)]:
+        return True
+
+    # Partial match: completed ignore words + trailing prefix of an ignore word
+    for i in range(len(text_cleaned)):
+        if dp[i]:
+            suffix = text_cleaned[i:]
+            for word in cleaned_ignore_words:
+                if word.startswith(suffix) and word != suffix:
+                    return True
+
+    return False
 
 
 @dataclass
@@ -180,6 +241,10 @@ class AgentActivity(RecognitionHooks):
 
         self._on_enter_task: asyncio.Task | None = None
         self._on_exit_task: asyncio.Task | None = None
+
+        # voxai: response latency metrics tracking
+        self._last_eou_timestamp: float | None = None
+        self._agent_ttft_by_speech: dict[str, float] = {}
 
         if (
             isinstance(self.llm, llm.RealtimeModel)
@@ -1433,18 +1498,67 @@ class AgentActivity(RecognitionHooks):
 
     def _on_metrics_collected(
         self,
-        ev: STTMetrics | TTSMetrics | VADMetrics | LLMMetrics | RealtimeModelMetrics,
+        ev: (
+            STTMetrics
+            | TTSMetrics
+            | VADMetrics
+            | LLMMetrics
+            | RealtimeModelMetrics
+            | AgentLLMMetrics
+            | ToolExecutionMetrics
+        ),
     ) -> None:
-        if (speech_handle := _SpeechHandleContextVar.get(None)) and (
-            isinstance(ev, LLMMetrics) or isinstance(ev, TTSMetrics)
-        ):
-            ev.speech_id = speech_handle.id
+        # Attach speech_id when possible (for LLM/TTS/AgentLLM)
+        if speech_handle := _SpeechHandleContextVar.get(None):
+            if isinstance(ev, (LLMMetrics, TTSMetrics, AgentLLMMetrics)):
+                ev.speech_id = speech_handle.id
+
         if (
             isinstance(ev, RealtimeModelMetrics)
             and self._realtime_spans is not None
             and (realtime_span := self._realtime_spans.pop(ev.request_id, None))
         ):
             trace_utils.record_realtime_metrics(realtime_span, ev)
+
+        # Track agent TTFT per speech
+        if isinstance(ev, AgentLLMMetrics) and ev.speech_id and ev.agent_ttft is not None:
+            self._agent_ttft_by_speech[ev.speech_id] = ev.agent_ttft
+
+        # Compute and emit ResponseLatencyMetrics when TTS metrics arrive
+        if self._last_eou_timestamp is not None and isinstance(ev, TTSMetrics) and ev.ttfb > 0:
+            first_audio_timestamp = ev.timestamp - ev.duration + ev.ttfb
+            speech_handle = _SpeechHandleContextVar.get(None)
+            speech_id = speech_handle.id if speech_handle else None
+            agent_ttft = self._agent_ttft_by_speech.get(speech_id) if speech_id else None
+            e2e_latency = first_audio_timestamp - self._last_eou_timestamp
+
+            response_latency_metrics = ResponseLatencyMetrics(
+                timestamp=time.time(),
+                speech_id=speech_id,
+                e2e_latency=e2e_latency,
+                eou_timestamp=self._last_eou_timestamp,
+                first_audio_timestamp=first_audio_timestamp,
+            )
+            self._session.emit(
+                "metrics_collected", MetricsCollectedEvent(metrics=response_latency_metrics)
+            )
+            logger.debug(
+                "E2E Latency computed (e2e_latency: %s, agent_ttft: %s)",
+                round(e2e_latency, 3),
+                round(agent_ttft or 0.0, 3),
+            )
+
+            # Reset tracking for next response
+            self._last_eou_timestamp = None
+            if speech_id and speech_id in self._agent_ttft_by_speech:
+                del self._agent_ttft_by_speech[speech_id]
+
+        # For AgentLLMMetrics and ToolExecutionMetrics: emit but skip usage collector
+        # (not standard livekit metrics; don't pass to _usage_collector)
+        if isinstance(ev, (AgentLLMMetrics, ToolExecutionMetrics)):
+            self._session.emit("metrics_collected", MetricsCollectedEvent(metrics=ev))
+            return
+
         self._session._usage_collector.collect(ev)
         otel_metrics.collect_usage(ev)
         self._session.emit("metrics_collected", MetricsCollectedEvent(metrics=ev))
@@ -1604,16 +1718,21 @@ class AgentActivity(RecognitionHooks):
             return
 
         interruption_options = self._session.options.interruption
-        if (
-            self.stt is not None
-            and interruption_options["min_words"] > 0
-            and self._audio_recognition is not None
-        ):
+        if self.stt is not None and self._audio_recognition is not None:
             text = self._audio_recognition.current_transcript
+            if interruption_options["min_words"] > 0:
+                # TODO(long): better word splitting for multi-language
+                if len(split_words(text, split_character=True)) < interruption_options["min_words"]:
+                    return
 
-            # TODO(long): better word splitting for multi-language
-            if len(split_words(text, split_character=True)) < interruption_options["min_words"]:
-                return
+            # voxai: interruption ignore words
+            opts = self._session.options
+            if opts.interruption_ignore_words:
+                is_empty = text.strip() == ""
+                if is_empty and interruption_options["min_words"] > 0:
+                    return
+                if (not is_empty) and _matches_ignore_words(text, opts.interruption_ignore_words):
+                    return
 
         if self._rt_session is not None:
             self._rt_session.start_user_activity()
@@ -1701,6 +1820,9 @@ class AgentActivity(RecognitionHooks):
             speech_end_time = speech_end_time - ev.silence_duration - ev.inference_duration
         else:
             self._stt_eos_received = True
+
+        # voxai: record EOU timestamp for e2e latency computation
+        self._last_eou_timestamp = speech_end_time
 
         if self._audio_recognition:
             self._audio_recognition.on_end_of_speech(
@@ -1903,13 +2025,27 @@ class AgentActivity(RecognitionHooks):
             and self._current_speech is not None
             and self._current_speech.allow_interruptions
             and not self._current_speech.interrupted
-            and self._session.options.interruption["min_words"] > 0
-            and len(split_words(info.new_transcript, split_character=True))
-            < self._session.options.interruption["min_words"]
         ):
-            self._cancel_preemptive_generation()
-            # avoid interruption if the new_transcript is too short
-            return False
+            opts = self._session.options
+            min_words = opts.interruption["min_words"]
+            if min_words > 0 and len(
+                split_words(info.new_transcript, split_character=True)
+            ) < min_words:
+                self._cancel_preemptive_generation()
+                # avoid interruption if the new_transcript is too short
+                return False
+
+            # voxai: interruption ignore words
+            if opts.interruption_ignore_words:
+                is_empty = info.new_transcript.strip() == ""
+                if is_empty and min_words > 0:
+                    self._cancel_preemptive_generation()
+                    return False
+                if (not is_empty) and _matches_ignore_words(
+                    info.new_transcript, opts.interruption_ignore_words
+                ):
+                    self._cancel_preemptive_generation()
+                    return False
 
         old_task = self._user_turn_completed_atask
         self._user_turn_completed_atask = self._create_speech_task(
@@ -2424,6 +2560,7 @@ class AgentActivity(RecognitionHooks):
             model_settings=model_settings,
             model=self.llm.model if self.llm else None,
             provider=self.llm.provider if self.llm else None,
+            session=self._session,
         )
         tasks.append(llm_task)
 

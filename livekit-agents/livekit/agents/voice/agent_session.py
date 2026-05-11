@@ -143,6 +143,11 @@ class AgentSessionOptions:
     ivr_detection: bool
     aec_warmup_duration: float | None
     session_close_transcript_timeout: float
+    # voxai fork-only: dynamic interruption / adaptive endpointing (all disabled by default)
+    interruption_ignore_words: list[str] | None = None
+    enable_dynamic_interruption: bool = False
+    conversation_continuity_threshold: float = 8.0
+    enable_adaptive_endpointing: bool = False
 
     @property
     def endpointing(self) -> EndpointingOptions:
@@ -237,6 +242,11 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
         ivr_detection: bool = False,
         user_away_timeout: float | None = 15.0,
         session_close_transcript_timeout: float = 2.0,
+        # voxai fork-only: dynamic interruption / adaptive endpointing
+        interruption_ignore_words: list[str] | None = None,
+        enable_dynamic_interruption: bool = False,
+        conversation_continuity_threshold: float = 8.0,
+        enable_adaptive_endpointing: bool = False,
         # Runtime settings
         conn_options: NotGivenOr[SessionConnectOptions] = NOT_GIVEN,
         loop: asyncio.AbstractEventLoop | None = None,
@@ -378,6 +388,10 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
             else None,
             aec_warmup_duration=aec_warmup_duration,
             session_close_transcript_timeout=session_close_transcript_timeout,
+            interruption_ignore_words=interruption_ignore_words,
+            enable_dynamic_interruption=enable_dynamic_interruption,
+            conversation_continuity_threshold=conversation_continuity_threshold,
+            enable_adaptive_endpointing=enable_adaptive_endpointing,
         )
         self._conn_options = conn_options or SessionConnectOptions()
         self._started = False
@@ -1018,6 +1032,11 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
         *,
         endpointing_opts: NotGivenOr[EndpointingOptions] = NOT_GIVEN,
         turn_detection: NotGivenOr[TurnDetectionMode | None] = NOT_GIVEN,
+        # voxai fork-only
+        interruption_ignore_words: NotGivenOr[list[str] | None] = NOT_GIVEN,
+        enable_dynamic_interruption: NotGivenOr[bool] = NOT_GIVEN,
+        conversation_continuity_threshold: NotGivenOr[float] = NOT_GIVEN,
+        enable_adaptive_endpointing: NotGivenOr[bool] = NOT_GIVEN,
         # deprecated
         min_endpointing_delay: NotGivenOr[float] = NOT_GIVEN,
         max_endpointing_delay: NotGivenOr[float] = NOT_GIVEN,
@@ -1063,6 +1082,15 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
 
         if is_given(turn_detection):
             self._turn_detection = turn_detection
+
+        if is_given(interruption_ignore_words):
+            self._opts.interruption_ignore_words = interruption_ignore_words
+        if is_given(enable_dynamic_interruption):
+            self._opts.enable_dynamic_interruption = enable_dynamic_interruption
+        if is_given(conversation_continuity_threshold):
+            self._opts.conversation_continuity_threshold = conversation_continuity_threshold
+        if is_given(enable_adaptive_endpointing):
+            self._opts.enable_adaptive_endpointing = enable_adaptive_endpointing
 
         if self._activity is not None:
             self._activity.update_options(
