@@ -148,6 +148,17 @@ def _matches_ignore_words(text: str, ignore_words: list[str] | None) -> bool:
     return False
 
 
+def _truncate_interruption_text(text: str | None, limit: int = 80) -> str | None:
+    if text is None:
+        return None
+
+    normalized = " ".join(text.split())
+    if len(normalized) <= limit:
+        return normalized
+
+    return normalized[:limit] + "..."
+
+
 @dataclass
 class _OnEnterData:
     session: AgentSession
@@ -1697,7 +1708,11 @@ class AgentActivity(RecognitionHooks):
         self._schedule_speech(handle, SpeechHandle.SPEECH_PRIORITY_NORMAL)
 
     def _interrupt_by_audio_activity(
-        self, *, ignore_user_transcript_until: float | None = None
+        self,
+        *,
+        ignore_user_transcript_until: float | None = None,
+        source: str = "unknown",
+        text_hint: str | None = None,
     ) -> None:
         """
         Interrupt the current speech or generation, and optionally ignore the user transcript until the given timestamp.
@@ -1705,6 +1720,14 @@ class AgentActivity(RecognitionHooks):
         Args:
             ignore_user_transcript_until: The timestamp until which the user transcript should be ignored.
                 If None, the user transcript will be ignored until the current time.
+            source: Caller identifier ("vad" / "interim" / "preflight" / "final" /
+                "overlap" / "unknown"). Carried into the ``interruption_candidate``
+                structured log so downstream analysis can attribute interruptions
+                to the recognition path that triggered them.
+            text_hint: The transcript text carried by the event that triggered
+                this call (interim/final). Used only for observability — never
+                substituted for ``current_transcript`` when evaluating the
+                min-words / ignore-words gates.
         """
         if not self._interruption_by_audio_activity_enabled:
             return
@@ -1717,21 +1740,41 @@ class AgentActivity(RecognitionHooks):
             # ignore if realtime model has turn detection enabled
             return
 
+        # Observation vars seeded with safe defaults so the structured log below
+        # always has a complete shape, even when the STT/AR path is skipped.
+        text = ""
+        word_count = 0
+        dyn_min_words = 0
+        ignore_match: bool | None = None
+        event_ignore_match: bool | None = None
+
         interruption_options = self._session.options.interruption
         if self.stt is not None and self._audio_recognition is not None:
             text = self._audio_recognition.current_transcript
-            if interruption_options["min_words"] > 0:
+            dyn_min_words = interruption_options["min_words"]
+            word_count = len(split_words(text, split_character=True))
+            opts = self._session.options
+            event_ignore_match = (
+                _matches_ignore_words(text_hint, opts.interruption_ignore_words)
+                if text_hint is not None and opts.interruption_ignore_words
+                else None
+            )
+            if dyn_min_words > 0:
                 # TODO(long): better word splitting for multi-language
-                if len(split_words(text, split_character=True)) < interruption_options["min_words"]:
+                if word_count < dyn_min_words:
                     return
 
             # voxai: interruption ignore words
-            opts = self._session.options
             if opts.interruption_ignore_words:
                 is_empty = text.strip() == ""
-                if is_empty and interruption_options["min_words"] > 0:
+                if is_empty and dyn_min_words > 0:
                     return
-                if (not is_empty) and _matches_ignore_words(text, opts.interruption_ignore_words):
+                ignore_match = (
+                    _matches_ignore_words(text, opts.interruption_ignore_words)
+                    if not is_empty
+                    else None
+                )
+                if ignore_match:
                     return
 
         if self._rt_session is not None:
@@ -1757,7 +1800,32 @@ class AgentActivity(RecognitionHooks):
                     started_at=time.time(),
                 )
 
-            if self._pause_enabled():
+            # voxai: emit a structured "interruption_candidate" event so the
+            # turn-latency / interruption-analysis pipeline can attribute every
+            # interruption decision back to the recognition path that triggered
+            # it. The log fires once per call to _interrupt_by_audio_activity
+            # that reaches the speech-interrupt branch, regardless of pause vs
+            # interrupt path; `reason` discriminates the two.
+            will_pause = self._pause_enabled()
+            logger.info(
+                "interruption_candidate",
+                extra={
+                    "source": source,
+                    "reason": "pause_current_speech" if will_pause else "interrupt_current_speech",
+                    "event_text": _truncate_interruption_text(text_hint),
+                    "current_transcript": _truncate_interruption_text(text),
+                    "dyn_min_words": dyn_min_words,
+                    "word_count": word_count,
+                    "ignore_match": ignore_match,
+                    "event_ignore_match": event_ignore_match,
+                    "has_current_speech": True,
+                    "current_speech_interrupted": self._current_speech.interrupted,
+                    "current_speech_allow_interruptions": self._current_speech.allow_interruptions,
+                    "will_interrupt": True,
+                },
+            )
+
+            if will_pause:
                 assert (timeout := interruption_options["false_interruption_timeout"]) is not None
                 assert (audio_output := self._session.output.audio) is not None
 
@@ -1857,7 +1925,7 @@ class AgentActivity(RecognitionHooks):
             # 1. turn detection is not STT; or
             # 2. STT EOS hasn't been received yet; or
             # 3. VAD speech is still ongoing
-            self._interrupt_by_audio_activity()
+            self._interrupt_by_audio_activity(source="vad")
 
         if (
             ev.speaking
@@ -1872,7 +1940,8 @@ class AgentActivity(RecognitionHooks):
         # restore interruption by audio activity and then immediately interrupt
         self._restore_interruption_by_audio_activity()
         self._interrupt_by_audio_activity(
-            ignore_user_transcript_until=ev.overlap_started_at or ev.detected_at
+            ignore_user_transcript_until=ev.overlap_started_at or ev.detected_at,
+            source="overlap",
         )
         # flush held transcripts again if possible
         if self._audio_recognition:
@@ -1898,7 +1967,14 @@ class AgentActivity(RecognitionHooks):
             "manual",
             "realtime_llm",
         ):
-            self._interrupt_by_audio_activity()
+            self._interrupt_by_audio_activity(
+                source=(
+                    "preflight"
+                    if ev.type == stt.SpeechEventType.PREFLIGHT_TRANSCRIPT
+                    else "interim"
+                ),
+                text_hint=ev.alternatives[0].text,
+            )
 
             if (
                 speaking is False
@@ -1930,7 +2006,10 @@ class AgentActivity(RecognitionHooks):
             "manual",
             "realtime_llm",
         ):
-            self._interrupt_by_audio_activity()
+            self._interrupt_by_audio_activity(
+                source="final",
+                text_hint=ev.alternatives[0].text,
+            )
 
             if (
                 speaking is False
