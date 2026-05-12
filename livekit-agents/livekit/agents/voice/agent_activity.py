@@ -146,6 +146,17 @@ def _matches_ignore_words(text: str, ignore_words: list[str] | None) -> bool:
     return False
 
 
+def _truncate_interruption_text(text: str | None, limit: int = 80) -> str | None:
+    if text is None:
+        return None
+
+    normalized = " ".join(text.split())
+    if len(normalized) <= limit:
+        return normalized
+
+    return normalized[:limit] + "..."
+
+
 @dataclass
 class _OnEnterData:
     session: AgentSession
@@ -1448,13 +1459,20 @@ class AgentActivity(RecognitionHooks):
         )
         self._schedule_speech(handle, SpeechHandle.SPEECH_PRIORITY_NORMAL)
 
-    def _interrupt_by_audio_activity(self) -> None:
+    def _interrupt_by_audio_activity(
+        self, *, source: str = "unknown", text_hint: str | None = None
+    ) -> None:
         if self._session._aec_warmup_remaining > 0 and self._session._aec_warmup_timer is not None:
             # disable interruption from audio activity while aec warmup is active
             return
 
         opt = self._session.options
         use_pause = opt.resume_false_interruption and opt.false_interruption_timeout is not None
+        text = ""
+        dyn_min_words = opt.min_interruption_words
+        word_count = 0
+        ignore_match: bool | None = None
+        event_ignore_match: bool | None = None
 
         if isinstance(self.llm, llm.RealtimeModel) and self.llm.capabilities.turn_detection:
             # ignore if realtime model has turn detection enabled
@@ -1468,8 +1486,14 @@ class AgentActivity(RecognitionHooks):
                 dyn_min_words = opt.min_interruption_words
 
             text = self._audio_recognition.current_transcript
+            word_count = len(split_words(text, split_character=True))
+            event_ignore_match = (
+                _matches_ignore_words(text_hint, opt.interruption_ignore_words)
+                if text_hint is not None and opt.interruption_ignore_words
+                else None
+            )
             if dyn_min_words > 0:
-                if len(split_words(text, split_character=True)) < dyn_min_words:
+                if word_count < dyn_min_words:
                     return
 
             # Interruption ignore words
@@ -1479,7 +1503,12 @@ class AgentActivity(RecognitionHooks):
                 if is_empty and dyn_min_words > 0:
                     return
 
-                if (not is_empty) and _matches_ignore_words(text, opt.interruption_ignore_words):
+                ignore_match = (
+                    _matches_ignore_words(text, opt.interruption_ignore_words)
+                    if not is_empty
+                    else None
+                )
+                if ignore_match:
                     return
 
         if self._rt_session is not None:
@@ -1504,7 +1533,28 @@ class AgentActivity(RecognitionHooks):
                 self._false_interruption_timer.cancel()
                 self._false_interruption_timer = None
 
-            if use_pause and self._session.output.audio and self._session.output.audio.can_pause:
+            will_pause = bool(
+                use_pause and self._session.output.audio and self._session.output.audio.can_pause
+            )
+            logger.info(
+                "interruption_candidate",
+                extra={
+                    "source": source,
+                    "reason": "pause_current_speech" if will_pause else "interrupt_current_speech",
+                    "event_text": _truncate_interruption_text(text_hint),
+                    "current_transcript": _truncate_interruption_text(text),
+                    "dyn_min_words": dyn_min_words,
+                    "word_count": word_count,
+                    "ignore_match": ignore_match,
+                    "event_ignore_match": event_ignore_match,
+                    "has_current_speech": True,
+                    "current_speech_interrupted": self._current_speech.interrupted,
+                    "current_speech_allow_interruptions": self._current_speech.allow_interruptions,
+                    "will_interrupt": True,
+                },
+            )
+
+            if will_pause:
                 self._session.output.audio.pause()
                 self._update_agent_state("listening")
             else:
@@ -1571,7 +1621,7 @@ class AgentActivity(RecognitionHooks):
             # 1. turn detection is not STT; or
             # 2. STT EOS hasn't been received yet; or
             # 3. VAD speech is still ongoing
-            self._interrupt_by_audio_activity()
+            self._interrupt_by_audio_activity(source="vad")
 
         if (
             ev.speaking
@@ -1600,7 +1650,14 @@ class AgentActivity(RecognitionHooks):
             "manual",
             "realtime_llm",
         ):
-            self._interrupt_by_audio_activity()
+            self._interrupt_by_audio_activity(
+                source=(
+                    "preflight"
+                    if ev.type == stt.SpeechEventType.PREFLIGHT_TRANSCRIPT
+                    else "interim"
+                ),
+                text_hint=ev.alternatives[0].text,
+            )
 
             if (
                 speaking is False
@@ -1631,7 +1688,10 @@ class AgentActivity(RecognitionHooks):
             "manual",
             "realtime_llm",
         ):
-            self._interrupt_by_audio_activity()
+            self._interrupt_by_audio_activity(
+                source="final",
+                text_hint=ev.alternatives[0].text,
+            )
 
             if (
                 speaking is False
