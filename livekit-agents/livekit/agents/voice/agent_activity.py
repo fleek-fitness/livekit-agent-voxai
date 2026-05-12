@@ -1554,7 +1554,7 @@ class AgentActivity(RecognitionHooks):
                 },
             )
 
-            if will_pause:
+            if will_pause and self._session.output.audio is not None:
                 self._session.output.audio.pause()
                 self._update_agent_state("listening")
             else:
