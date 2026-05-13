@@ -46,6 +46,7 @@ class _EndOfTurnInfo:
     """If True, a reply was already triggered and should be skipped after end of turn detection."""
     new_transcript: str
     transcript_confidence: float
+    transcript_clock_suppressed: bool
 
     # metrics report
     started_speaking_at: float | None
@@ -157,6 +158,7 @@ class AudioRecognition:
         self._speaking = False
 
         self._last_final_transcript_time: float | None = None
+        self._final_transcript_clock_suppressed = False
         self._last_speaking_time: float | None = None
         self._speech_start_time: float | None = None
 
@@ -882,7 +884,7 @@ class AudioRecognition:
                 extra["transcript_delay"] = time.time() - self._last_speaking_time
             logger.debug("received user transcript", extra=extra)
 
-            self._last_final_transcript_time = time.time()
+            self._record_final_transcript_time()
             self._audio_transcript += f" {transcript}"
             self._audio_transcript = self._audio_transcript.lstrip()
             self._final_transcript_confidence.append(confidence)
@@ -941,8 +943,7 @@ class AudioRecognition:
                 extra={"user_transcript": transcript, "language": self._last_language},
             )
 
-            # still need to increment it as it's used for turn detection,
-            self._last_final_transcript_time = time.time()
+            self._record_final_transcript_time()
             # preflight transcript includes all pre-committed transcripts (including final transcript from the previous STT run)
             self._audio_preflight_transcript = (self._audio_transcript + " " + transcript).lstrip()
             self._audio_interim_transcript = transcript
@@ -1080,6 +1081,7 @@ class AudioRecognition:
             last_speaking_time: float | None = None,
             last_final_transcript_time: float | None = None,
             speech_start_time: float | None = None,
+            transcript_clock_suppressed: bool = False,
         ) -> None:
             endpointing_delay = self._endpointing.min_delay
             user_turn_span = self._ensure_user_turn_span()
@@ -1160,7 +1162,8 @@ class AudioRecognition:
             # sometimes, we can't calculate the metrics because VAD was unreliable.
             # in this case, we just ignore the calculation, it's better than providing likely wrong values
             if (
-                last_final_transcript_time is not None
+                not transcript_clock_suppressed
+                and last_final_transcript_time is not None
                 and last_speaking_time is not None
                 and speech_start_time is not None
             ):
@@ -1174,7 +1177,12 @@ class AudioRecognition:
                     skip_reply=skip_reply,
                     new_transcript=self._audio_transcript,
                     transcript_confidence=confidence_avg,
-                    transcription_delay=transcription_delay or 0,
+                    transcript_clock_suppressed=transcript_clock_suppressed,
+                    transcription_delay=(
+                        transcription_delay
+                        if transcription_delay is not None or transcript_clock_suppressed
+                        else 0
+                    ),
                     end_of_turn_delay=end_of_turn_delay,
                     started_speaking_at=started_speaking_at,
                     stopped_speaking_at=stopped_speaking_at,
@@ -1208,6 +1216,7 @@ class AudioRecognition:
                     self._vad_speech_started = False
                     self._last_speaking_time = None
 
+            self._final_transcript_clock_suppressed = False
             self._user_turn_committed = False
 
         if self._end_of_turn_task is not None:
@@ -1220,8 +1229,21 @@ class AudioRecognition:
                 self._last_speaking_time,
                 self._last_final_transcript_time,
                 self._speech_start_time,
+                self._final_transcript_clock_suppressed,
             )
         )
+
+    def _should_advance_final_transcript_clock(self) -> bool:
+        if self._last_speaking_time is None:
+            return True
+        if self._speaking:
+            return True
+        return time.time() - self._last_speaking_time <= self._endpointing.max_delay
+
+    def _record_final_transcript_time(self) -> None:
+        if not self._should_advance_final_transcript_clock():
+            self._final_transcript_clock_suppressed = True
+        self._last_final_transcript_time = time.time()
 
     @utils.log_exceptions(logger=logger)
     async def _stt_consumer(

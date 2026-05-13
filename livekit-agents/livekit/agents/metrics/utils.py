@@ -4,12 +4,15 @@ import logging
 
 from ..log import logger as default_logger
 from .base import (
+    AgentLLMMetrics,
     AgentMetrics,
     EOUMetrics,
     InterruptionMetrics,
     LLMMetrics,
     RealtimeModelMetrics,
+    ResponseLatencyMetrics,
     STTMetrics,
+    ToolExecutionMetrics,
     TTSMetrics,
 )
 
@@ -18,7 +21,7 @@ def log_metrics(metrics: AgentMetrics, *, logger: logging.Logger | None = None) 
     if logger is None:
         logger = default_logger
 
-    metadata: dict[str, str | float] = {}
+    metadata: dict[str, object] = {}
     if metrics.metadata:
         metadata |= {
             "model_name": metrics.metadata.model_name or "unknown",
@@ -81,6 +84,44 @@ def log_metrics(metrics: AgentMetrics, *, logger: logging.Logger | None = None) 
             | {
                 "end_of_utterance_delay": round(metrics.end_of_utterance_delay, 2),
                 "transcription_delay": round(metrics.transcription_delay, 2),
+            },
+        )
+    elif isinstance(metrics, ResponseLatencyMetrics):
+        logger.info(
+            "Response latency metrics",
+            extra=metadata
+            | {
+                "speech_id": metrics.speech_id or "",
+                "e2e_latency": round(metrics.e2e_latency, 2),
+                "eou_timestamp": metrics.eou_timestamp,
+                "first_audio_timestamp": metrics.first_audio_timestamp,
+            },
+        )
+    elif isinstance(metrics, AgentLLMMetrics):
+        logger.info(
+            "Agent LLM metrics",
+            extra=metadata
+            | {
+                "speech_id": metrics.speech_id or "",
+                "agent_ttft": round(metrics.agent_ttft, 2)
+                if metrics.agent_ttft is not None
+                else None,
+                "llm_node_await": round(metrics.llm_node_await, 2)
+                if metrics.llm_node_await is not None
+                else None,
+                "request_id": metrics.request_id or "",
+            },
+        )
+    elif isinstance(metrics, ToolExecutionMetrics):
+        logger.info(
+            "Tool execution metrics",
+            extra=metadata
+            | {
+                "speech_id": metrics.speech_id or "",
+                "total_execution_time": round(metrics.total_execution_time, 2),
+                "tool_durations": {
+                    name: round(duration, 2) for name, duration in metrics.tool_durations.items()
+                },
             },
         )
     elif isinstance(metrics, STTMetrics):
