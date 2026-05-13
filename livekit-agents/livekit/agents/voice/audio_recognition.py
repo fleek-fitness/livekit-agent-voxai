@@ -234,6 +234,35 @@ class AudioRecognition:
                     self._end_of_turn_task = None
                     self._user_turn_committed = False
 
+    def _adaptive_endpointing_enabled(self) -> bool:
+        return bool(
+            getattr(self._session.options, "enable_adaptive_endpointing", False)
+        )  # fork-only: adaptive endpointing (PR #18)
+
+    def _apply_adaptive_endpointing_multiplier(self, endpointing_delay: float) -> float:
+        if not self._adaptive_endpointing_enabled():
+            return endpointing_delay
+
+        dyn_mgr = getattr(self._hooks, "_dynamic_interruption", None)
+        if dyn_mgr is None:
+            return endpointing_delay
+
+        try:
+            multiplier = float(dyn_mgr.get_endpointing_multiplier())
+        except Exception:
+            multiplier = 1.0
+
+        if multiplier <= 1.0:
+            return endpointing_delay
+
+        adjusted_delay = min(max(endpointing_delay, 1.0) * multiplier, self._endpointing.max_delay)
+        logger.debug(
+            "adaptive endpointing: multiplier=%s, delay=%s",
+            round(multiplier, 2),
+            round(adjusted_delay, 2),
+        )
+        return adjusted_delay
+
     def start(self, *, stt_pipeline: _STTPipeline | None = None) -> None:
         self.update_stt(self._stt, pipeline=stt_pipeline)
         self.update_vad(self._vad)
@@ -1105,25 +1134,7 @@ class AudioRecognition:
                             }
                         )
 
-            # voxai: adaptive endpointing multiplier
-            opts = getattr(self._hooks, "_session", None)
-            if opts is not None:
-                opts = getattr(opts, "options", None)
-            if opts is not None and getattr(opts, "enable_adaptive_endpointing", False):
-                dyn_mgr = getattr(self._hooks, "_dynamic_interruption_state", None)
-                if dyn_mgr is not None:
-                    try:
-                        multiplier = float(dyn_mgr.get("endpointing_multiplier", 1.0))
-                    except Exception:
-                        multiplier = 1.0
-                    if multiplier > 1.0:
-                        max_delay = self._endpointing.max_delay
-                        endpointing_delay = min(max(endpointing_delay, 1.0) * multiplier, max_delay)
-                        logger.debug(
-                            "adaptive endpointing: multiplier=%s, delay=%s",
-                            round(multiplier, 2),
-                            round(endpointing_delay, 2),
-                        )
+            endpointing_delay = self._apply_adaptive_endpointing_multiplier(endpointing_delay)
 
             extra_sleep = endpointing_delay
             if last_speaking_time:

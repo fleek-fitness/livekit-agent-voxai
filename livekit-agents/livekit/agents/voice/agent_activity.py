@@ -53,6 +53,7 @@ from .audio_recognition import (
     _PreemptiveGenerationInfo,
     _STTPipeline,
 )
+from .dynamic_interruption import DynamicInterruptionManager
 from .endpointing import create_endpointing
 from .events import (
     AgentFalseInterruptionEvent,
@@ -211,6 +212,7 @@ class _PausedSpeechInfo:
 class AgentActivity(RecognitionHooks):
     def __init__(self, agent: Agent, sess: AgentSession) -> None:
         self._agent, self._session = agent, sess
+        self._opts = sess.options
         self._rt_session: llm.RealtimeSession | None = None
         self._realtime_spans: utils.BoundedDict[str, trace.Span] | None = None
         self._audio_recognition: AudioRecognition | None = None
@@ -256,6 +258,7 @@ class AgentActivity(RecognitionHooks):
         # voxai: response latency metrics tracking
         self._last_eou_timestamp: float | None = None
         self._agent_ttft_by_speech: dict[str, float] = {}
+        self._dynamic_interruption = DynamicInterruptionManager(self._opts)
 
         if (
             isinstance(self.llm, llm.RealtimeModel)
@@ -1707,6 +1710,40 @@ class AgentActivity(RecognitionHooks):
         )
         self._schedule_speech(handle, SpeechHandle.SPEECH_PRIORITY_NORMAL)
 
+    def _get_dynamic_min_interruption_words(self) -> int:
+        if not getattr(
+            self._opts, "enable_dynamic_interruption", False
+        ):  # fork-only: dynamic interruption / continuity (PR #18)
+            return self._opts.interruption["min_words"]
+
+        return self._dynamic_interruption.get_current_min_interruption_words()
+
+    def _capture_dynamic_continuity_at_speech_start(self) -> None:
+        if not getattr(
+            self._opts, "enable_dynamic_interruption", False
+        ):  # fork-only: dynamic interruption / continuity (PR #18)
+            self._dynamic_interruption.on_user_speech_started()
+            return
+
+        threshold = float(
+            getattr(self._opts, "conversation_continuity_threshold", 8.0) or 8.0
+        )  # fork-only: dynamic interruption / continuity (PR #18)
+        self._dynamic_interruption.on_user_speech_started(threshold=threshold)
+
+    def _record_dynamic_continuation_collision(self) -> None:
+        if not getattr(self._opts, "enable_adaptive_endpointing", False):
+            return
+
+        last_end = self._dynamic_interruption.conversation_state.last_user_speech_end_time
+        if last_end is None:
+            return
+
+        threshold = float(
+            getattr(self._opts, "conversation_continuity_threshold", 8.0) or 8.0
+        )  # fork-only: dynamic interruption / continuity (PR #18)
+        if time.time() - last_end <= threshold:
+            self._dynamic_interruption.record_continuation_collision()
+
     def _interrupt_by_audio_activity(
         self,
         *,
@@ -1751,7 +1788,7 @@ class AgentActivity(RecognitionHooks):
         interruption_options = self._session.options.interruption
         if self.stt is not None and self._audio_recognition is not None:
             text = self._audio_recognition.current_transcript
-            dyn_min_words = interruption_options["min_words"]
+            dyn_min_words = self._get_dynamic_min_interruption_words()
             word_count = len(split_words(text, split_character=True))
             opts = self._session.options
             event_ignore_match = (
@@ -1799,6 +1836,8 @@ class AgentActivity(RecognitionHooks):
                 self._audio_recognition.on_start_of_speech(
                     started_at=time.time(),
                 )
+
+            self._record_dynamic_continuation_collision()
 
             # voxai: emit a structured "interruption_candidate" event so the
             # turn-latency / interruption-analysis pipeline can attribute every
@@ -1861,6 +1900,7 @@ class AgentActivity(RecognitionHooks):
         self._user_silence_event.clear()
         self._stt_eos_received = False
         self._interruption_detected = False
+        self._capture_dynamic_continuity_at_speech_start()
 
         if self._false_interruption_timer:
             # cancel the timer when user starts speaking but leave the paused state unchanged
@@ -1906,6 +1946,7 @@ class AgentActivity(RecognitionHooks):
             last_speaking_time=speech_end_time,
         )
         self._user_silence_event.set()
+        self._dynamic_interruption.on_user_speech_ended()
 
         if self._paused_speech:
             self._start_false_interruption_timer(self._paused_speech.timeout)
@@ -2106,7 +2147,7 @@ class AgentActivity(RecognitionHooks):
             and not self._current_speech.interrupted
         ):
             opts = self._session.options
-            min_words = opts.interruption["min_words"]
+            min_words = self._get_dynamic_min_interruption_words()
             if (
                 min_words > 0
                 and len(split_words(info.new_transcript, split_character=True)) < min_words
