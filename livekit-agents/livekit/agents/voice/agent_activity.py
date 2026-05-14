@@ -1338,6 +1338,13 @@ class AgentActivity(RecognitionHooks):
             self._agent._reply_chat_ctx = None
             self._preemptive_generation = None
 
+    def _emit_reply_callback(
+        self, chat_ctx: llm.ChatContext, replies: Sequence[llm.ChatItem]
+    ) -> None:
+        self._agent._reply_chat_ctx = chat_ctx.copy()
+        self._agent._reply_messages = list(replies)
+        self._agent.reply_callback(self._agent._reply_chat_ctx, self._agent._reply_messages)
+
     def _pause_authorization(self) -> None:
         self._authorization_allowed.clear()
 
@@ -2755,7 +2762,7 @@ class AgentActivity(RecognitionHooks):
         chat_ctx = chat_ctx.copy()
         tool_ctx = llm.ToolContext(tools)
 
-        self._agent._reply_chat_ctx = self._agent._chat_ctx.copy()
+        self._agent._reply_chat_ctx = None
         self._agent._reply_messages = []
 
         if new_message is not None:
@@ -3049,9 +3056,7 @@ class AgentActivity(RecognitionHooks):
             self._agent._chat_ctx.insert(msg)
             self._session._conversation_item_added(msg)
             speech_handle._item_added([msg])
-            self._agent._reply_messages.append(msg)
-            if self._agent._reply_chat_ctx is not None:
-                self._agent.reply_callback(self._agent._reply_chat_ctx, self._agent._reply_messages)
+            self._emit_reply_callback(chat_ctx, [msg])
             current_span.set_attribute(trace_types.ATTR_RESPONSE_TEXT, forwarded_text)
 
         if not speech_handle.interrupted and len(tool_output.output) > 0:
@@ -3648,6 +3653,7 @@ class AgentActivity(RecognitionHooks):
             self._agent._chat_ctx._upsert_item(msg)
             speech_handle._item_added([msg])
             self._session._conversation_item_added(msg)
+            self._emit_reply_callback(self._agent._chat_ctx, [msg])
             current_span.set_attribute(trace_types.ATTR_RESPONSE_TEXT, forwarded_text)
 
         if audio_out is not None and not audio_out.first_frame_fut.done():

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import inspect
 import time
 from types import SimpleNamespace
 
+from livekit.agents import llm
 from livekit.agents.voice.agent_activity import AgentActivity
 from livekit.agents.voice.audio_recognition import AudioRecognition
 from livekit.agents.voice.dynamic_interruption import DynamicInterruptionManager
@@ -38,6 +40,40 @@ def _audio_recognition(opts: SimpleNamespace, multiplier: float) -> AudioRecogni
     )
     audio_recognition._endpointing = SimpleNamespace(max_delay=10.0)
     return audio_recognition
+
+
+def test_reply_callback_context_snapshots_generation_turn() -> None:
+    seen: list[tuple[llm.ChatContext, list[llm.ChatItem]]] = []
+    activity = AgentActivity.__new__(AgentActivity)
+    activity._agent = SimpleNamespace(
+        _reply_chat_ctx=None,
+        _reply_messages=[],
+        reply_callback=lambda chat_ctx, replies: seen.append((chat_ctx, list(replies))),
+    )
+
+    chat_ctx = llm.ChatContext.empty()
+    chat_ctx.add_message(role="user", content="예약 문의요")
+    assistant_msg = chat_ctx.add_message(role="assistant", content="가능합니다")
+
+    activity._emit_reply_callback(chat_ctx, [assistant_msg])
+
+    callback_ctx, replies = seen[0]
+    assert callback_ctx is activity._agent._reply_chat_ctx
+    assert callback_ctx is not chat_ctx
+    assert replies == [assistant_msg]
+    assert activity._agent._reply_messages == [assistant_msg]
+    assert [(msg.role, msg.text_content) for msg in callback_ctx.messages()] == [
+        ("user", "예약 문의요"),
+        ("assistant", "가능합니다"),
+    ]
+
+
+def test_reply_callback_hooks_cover_pipeline_and_realtime_paths() -> None:
+    pipeline_source = inspect.getsource(AgentActivity._pipeline_reply_task_impl)
+    realtime_source = inspect.getsource(AgentActivity._realtime_generation_task_impl)
+
+    assert "self._emit_reply_callback(chat_ctx, [msg])" in pipeline_source
+    assert "self._emit_reply_callback(self._agent._chat_ctx, [msg])" in realtime_source
 
 
 def test_dynamic_interruption_disabled_is_noop() -> None:
