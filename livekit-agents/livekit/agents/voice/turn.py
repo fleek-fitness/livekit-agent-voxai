@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Literal, Protocol
 
 from typing_extensions import TypedDict
@@ -109,9 +110,14 @@ class InterruptionOptions(TypedDict, total=False):
     """Seconds to suppress adaptive interruption handling when the agent
     starts or stops speaking each turn to allow for easier turn correction.
     Use tuple to apply different values for start and end separately.
-    ``None`` disables. Defaults to ``(1.0, 3.5)``. End value should be higher
-    to account for STT transcript timestamp inaccuracy."""
+    ``None`` disables. Defaults to ``None`` for 1.4.6-compatible behavior.
+    Set ``LK_BACKCHANNEL=1`` to use LiveKit 1.5.x's ``(1.0, 3.5)`` default."""
 
+
+_BACKCHANNEL_BOUNDARY_DEFAULT: tuple[float, float] = (
+    1.0,
+    3.5,  # higher value for the end as STT timestamps aren't very reliable
+)
 
 _INTERRUPTION_DEFAULTS: InterruptionOptions = {
     "enabled": True,
@@ -120,11 +126,19 @@ _INTERRUPTION_DEFAULTS: InterruptionOptions = {
     "min_words": 0,
     "resume_false_interruption": True,
     "false_interruption_timeout": 2.0,
-    "backchannel_boundary": (
-        1.0,
-        3.5,  # higher value for the end as STT timestamps aren't very reliable
-    ),
+    "backchannel_boundary": None,
 }
+
+
+def _lk_backchannel_enabled() -> bool:
+    return os.getenv("LK_BACKCHANNEL", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _interruption_defaults() -> InterruptionOptions:
+    defaults = InterruptionOptions(**_INTERRUPTION_DEFAULTS)
+    if _lk_backchannel_enabled():
+        defaults["backchannel_boundary"] = _BACKCHANNEL_BOUNDARY_DEFAULT
+    return defaults
 
 
 class PreemptiveGenerationOptions(TypedDict, total=False):
@@ -204,9 +218,10 @@ def _resolve_interruption(
     config: InterruptionOptions | None = None,
 ) -> InterruptionOptions:
     """Fill in defaults for missing keys (``mode`` stays absent if not provided)."""
+    defaults = _interruption_defaults()
     if config is None:
-        return InterruptionOptions(**_INTERRUPTION_DEFAULTS)
-    return InterruptionOptions(**{**_INTERRUPTION_DEFAULTS, **config})
+        return defaults
+    return InterruptionOptions(**{**defaults, **config})
 
 
 def _migrate_turn_handling(

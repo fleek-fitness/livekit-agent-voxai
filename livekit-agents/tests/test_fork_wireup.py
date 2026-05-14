@@ -4,10 +4,13 @@ import inspect
 import time
 from types import SimpleNamespace
 
+import pytest
+
 from livekit.agents import llm
 from livekit.agents.voice.agent_activity import AgentActivity
 from livekit.agents.voice.audio_recognition import AudioRecognition
 from livekit.agents.voice.dynamic_interruption import DynamicInterruptionManager
+from livekit.agents.voice.turn import _resolve_interruption
 
 
 def _opts(
@@ -40,6 +43,27 @@ def _audio_recognition(opts: SimpleNamespace, multiplier: float) -> AudioRecogni
     )
     audio_recognition._endpointing = SimpleNamespace(max_delay=10.0)
     return audio_recognition
+
+
+def test_backchannel_boundary_default_locked_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("LK_BACKCHANNEL", raising=False)
+
+    assert _resolve_interruption()["backchannel_boundary"] is None
+
+
+def test_backchannel_boundary_enabled_by_lk_backchannel(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LK_BACKCHANNEL", "1")
+
+    assert _resolve_interruption()["backchannel_boundary"] == (1.0, 3.5)
+
+
+def test_explicit_backchannel_boundary_overrides_lock(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("LK_BACKCHANNEL", raising=False)
+
+    assert _resolve_interruption({"backchannel_boundary": (0.05, 0.0)})["backchannel_boundary"] == (
+        0.05,
+        0.0,
+    )
 
 
 def test_reply_callback_context_snapshots_generation_turn() -> None:
