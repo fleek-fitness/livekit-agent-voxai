@@ -7,8 +7,9 @@ from types import SimpleNamespace
 import pytest
 
 from livekit.agents import llm
-from livekit.agents.voice.agent_activity import AgentActivity
-from livekit.agents.voice.audio_recognition import AudioRecognition
+from livekit.agents.voice import PreemptiveGenerationOutcomeEvent
+from livekit.agents.voice.agent_activity import AgentActivity, _PreemptiveGeneration
+from livekit.agents.voice.audio_recognition import AudioRecognition, _PreemptiveGenerationInfo
 from livekit.agents.voice.dynamic_interruption import DynamicInterruptionManager
 from livekit.agents.voice.turn import _resolve_interruption
 
@@ -142,3 +143,122 @@ def test_adaptive_endpointing_enabled_applies_multiplier() -> None:
     )
 
     assert audio_recognition._apply_adaptive_endpointing_multiplier(2.0) == 4.0
+
+
+def _preemptive_generation(
+    *,
+    transcript: str,
+    chat_ctx: llm.ChatContext,
+    tools: list[llm.Tool | llm.Toolset] | None = None,
+    tool_choice: llm.ToolChoice | None = None,
+    created_at: float | None = None,
+) -> _PreemptiveGeneration:
+    return _PreemptiveGeneration(
+        speech_handle=SimpleNamespace(id="speech-1", _cancel=lambda: None),
+        user_message=llm.ChatMessage(role="user", content=[transcript]),
+        info=_PreemptiveGenerationInfo(
+            new_transcript=transcript,
+            transcript_confidence=0.9,
+            started_speaking_at=None,
+        ),
+        chat_ctx=chat_ctx.copy(),
+        tools=tools or [],
+        tool_choice=tool_choice,
+        created_at=created_at or time.time(),
+    )
+
+
+def test_preemptive_generation_outcome_event_is_public() -> None:
+    event = PreemptiveGenerationOutcomeEvent(
+        outcome="reused",
+        reason="matched",
+        preemptive_lead_time=0.123,
+        speech_id="speech-1",
+        transcript_match=True,
+        chat_ctx_match=True,
+        tools_match=True,
+        tool_choice_match=True,
+    )
+
+    assert event.type == "preemptive_generation_outcome"
+    assert event.outcome == "reused"
+
+
+def test_preemptive_generation_mismatch_reason_reports_chat_context_change() -> None:
+    activity = AgentActivity.__new__(AgentActivity)
+    activity._session = SimpleNamespace(tools=[])
+    activity._agent = SimpleNamespace(tools=[])
+    activity._mcp_tools = []
+    activity._tool_choice = None
+    preemptive_ctx = llm.ChatContext.empty()
+    preemptive_ctx.add_message(role="system", content="original")
+    completed_ctx = llm.ChatContext.empty()
+    completed_ctx.add_message(role="system", content="mutated")
+
+    reason, checks = activity._preemptive_generation_mismatch_reason(
+        _preemptive_generation(transcript="예약 가능해요?", chat_ctx=preemptive_ctx),
+        user_message=llm.ChatMessage(role="user", content=["예약 가능해요?"]),
+        temp_mutable_chat_ctx=completed_ctx,
+    )
+
+    assert reason == "chat_ctx_changed"
+    assert checks == {
+        "transcript_match": True,
+        "chat_ctx_match": False,
+        "tools_match": True,
+        "tool_choice_match": True,
+    }
+
+
+def test_cancel_preemptive_generation_emits_discarded_outcome() -> None:
+    emitted: list[tuple[str, PreemptiveGenerationOutcomeEvent]] = []
+    activity = AgentActivity.__new__(AgentActivity)
+    activity._session = SimpleNamespace(
+        emit=lambda event, payload: emitted.append((event, payload)),
+    )
+    activity._agent = SimpleNamespace(_reply_messages=["stale"], _reply_chat_ctx=object())
+    activity._preemptive_generation = _preemptive_generation(
+        transcript="예약 가능해요?",
+        chat_ctx=llm.ChatContext.empty(),
+        created_at=time.time() - 0.25,
+    )
+
+    activity._cancel_preemptive_generation(reason="replaced_by_new_preflight")
+
+    assert emitted[0][0] == "preemptive_generation_outcome"
+    assert emitted[0][1].outcome == "discarded"
+    assert emitted[0][1].reason == "replaced_by_new_preflight"
+    assert emitted[0][1].speech_id == "speech-1"
+    assert emitted[0][1].preemptive_lead_time >= 0.0
+    assert activity._preemptive_generation is None
+    assert activity._agent._reply_messages == []
+    assert activity._agent._reply_chat_ctx is None
+
+
+def test_emit_preemptive_generation_reused_outcome() -> None:
+    emitted: list[tuple[str, PreemptiveGenerationOutcomeEvent]] = []
+    activity = AgentActivity.__new__(AgentActivity)
+    activity._session = SimpleNamespace(
+        emit=lambda event, payload: emitted.append((event, payload)),
+    )
+    preemptive = _preemptive_generation(
+        transcript="예약 가능해요?",
+        chat_ctx=llm.ChatContext.empty(),
+        created_at=time.time() - 0.25,
+    )
+
+    activity._emit_preemptive_generation_outcome(
+        preemptive,
+        outcome="reused",
+        reason="matched",
+        transcript_match=True,
+        chat_ctx_match=True,
+        tools_match=True,
+        tool_choice_match=True,
+    )
+
+    assert emitted[0][0] == "preemptive_generation_outcome"
+    assert emitted[0][1].outcome == "reused"
+    assert emitted[0][1].reason == "matched"
+    assert emitted[0][1].transcript_match is True
+    assert emitted[0][1].chat_ctx_match is True

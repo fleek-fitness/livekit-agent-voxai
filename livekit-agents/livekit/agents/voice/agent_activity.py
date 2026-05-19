@@ -8,7 +8,7 @@ import time
 from collections.abc import AsyncIterable, Coroutine, Sequence
 from dataclasses import dataclass
 from functools import partial
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from opentelemetry import context as otel_context, trace
 
@@ -61,6 +61,7 @@ from .events import (
     ErrorEvent,
     FunctionToolsExecutedEvent,
     MetricsCollectedEvent,
+    PreemptiveGenerationOutcomeEvent,
     SessionUsageUpdatedEvent,
     SpeechCreatedEvent,
     UserInputTranscribedEvent,
@@ -907,7 +908,7 @@ class AgentActivity(RecognitionHooks):
                 )
                 _set_activity_task_info(task, inline_task=True)
 
-            self._cancel_preemptive_generation()
+            self._cancel_preemptive_generation(reason="activity_draining")
 
             try:
                 await self._on_exit_task
@@ -1103,7 +1104,7 @@ class AgentActivity(RecognitionHooks):
                 return
 
             self._closed = True
-            self._cancel_preemptive_generation()
+            self._cancel_preemptive_generation(reason="activity_closing")
 
             # on_exit_task should be awaited in `drain`
             self._on_exit_task = None
@@ -1340,12 +1341,66 @@ class AgentActivity(RecognitionHooks):
 
         return handle
 
-    def _cancel_preemptive_generation(self) -> None:
+    def _cancel_preemptive_generation(self, reason: str = "cancelled") -> None:
         if self._preemptive_generation is not None:
+            self._emit_preemptive_generation_outcome(
+                self._preemptive_generation,
+                outcome="discarded",
+                reason=reason,
+            )
             self._preemptive_generation.speech_handle._cancel()
             self._agent._reply_messages = []
             self._agent._reply_chat_ctx = None
             self._preemptive_generation = None
+
+    def _emit_preemptive_generation_outcome(
+        self,
+        preemptive: _PreemptiveGeneration,
+        *,
+        outcome: Literal["reused", "discarded"],
+        reason: str,
+        transcript_match: bool | None = None,
+        chat_ctx_match: bool | None = None,
+        tools_match: bool | None = None,
+        tool_choice_match: bool | None = None,
+    ) -> None:
+        self._session.emit(
+            "preemptive_generation_outcome",
+            PreemptiveGenerationOutcomeEvent(
+                outcome=outcome,
+                reason=reason,
+                preemptive_lead_time=max(time.time() - preemptive.created_at, 0.0),
+                speech_id=getattr(preemptive.speech_handle, "id", None),
+                transcript_match=transcript_match,
+                chat_ctx_match=chat_ctx_match,
+                tools_match=tools_match,
+                tool_choice_match=tool_choice_match,
+            ),
+        )
+
+    def _preemptive_generation_mismatch_reason(
+        self,
+        preemptive: _PreemptiveGeneration,
+        *,
+        user_message: llm.ChatMessage,
+        temp_mutable_chat_ctx: llm.ChatContext,
+    ) -> tuple[str, dict[str, bool]]:
+        checks = {
+            "transcript_match": preemptive.info.new_transcript == user_message.text_content,
+            "chat_ctx_match": preemptive.chat_ctx.is_equivalent(temp_mutable_chat_ctx),
+            "tools_match": preemptive.tools == self.tools,
+            "tool_choice_match": preemptive.tool_choice == self._tool_choice,
+        }
+        for reason, matched in (
+            ("transcript_changed", checks["transcript_match"]),
+            ("chat_ctx_changed", checks["chat_ctx_match"]),
+            ("tools_changed", checks["tools_match"]),
+            ("tool_choice_changed", checks["tool_choice_match"]),
+        ):
+            if not matched:
+                return reason, checks
+
+        return "matched", checks
 
     def _emit_reply_callback(
         self, chat_ctx: llm.ChatContext, replies: Sequence[llm.ChatItem]
@@ -1375,7 +1430,7 @@ class AgentActivity(RecognitionHooks):
             An asyncio.Future that completes when the interruption is fully processed
             and chat context has been updated
         """
-        self._cancel_preemptive_generation()
+        self._cancel_preemptive_generation(reason="manual_interrupt")
 
         future = asyncio.Future[None]()
 
@@ -2138,7 +2193,7 @@ class AgentActivity(RecognitionHooks):
         ):
             return
 
-        self._cancel_preemptive_generation()
+        self._cancel_preemptive_generation(reason="replaced_by_new_preflight")
 
         if (
             info.started_speaking_at is not None
@@ -2180,7 +2235,7 @@ class AgentActivity(RecognitionHooks):
         self._user_speech_started_during_interruptible_agent_speech = False
 
     def _consume_delayed_interruption_turn(self, info: _EndOfTurnInfo, *, reason: str) -> bool:
-        self._cancel_preemptive_generation()
+        self._cancel_preemptive_generation(reason=reason)
         self._clear_user_speech_interruption_context()
         if info.new_transcript:
             user_message = llm.ChatMessage(
@@ -2201,7 +2256,7 @@ class AgentActivity(RecognitionHooks):
         # We explicitly create a new task here
 
         if self._scheduling_paused or self._new_turns_blocked:
-            self._cancel_preemptive_generation()
+            self._cancel_preemptive_generation(reason="turn_blocked")
             logger.warning(
                 "skipping user input, speech scheduling is paused",
                 extra={"user_input": info.new_transcript},
@@ -2245,7 +2300,7 @@ class AgentActivity(RecognitionHooks):
                 min_words > 0
                 and len(split_words(info.new_transcript, split_character=True)) < min_words
             ):
-                self._cancel_preemptive_generation()
+                self._cancel_preemptive_generation(reason="min_interruption_words")
                 # avoid interruption if the new_transcript is too short
                 if delayed_interruption_context:
                     return self._consume_delayed_interruption_turn(
@@ -2258,7 +2313,7 @@ class AgentActivity(RecognitionHooks):
             if opts.interruption_ignore_words:
                 is_empty = info.new_transcript.strip() == ""
                 if is_empty and min_words > 0:
-                    self._cancel_preemptive_generation()
+                    self._cancel_preemptive_generation(reason="empty_interruption")
                     if delayed_interruption_context:
                         return self._consume_delayed_interruption_turn(
                             info,
@@ -2268,7 +2323,7 @@ class AgentActivity(RecognitionHooks):
                 if (not is_empty) and _matches_ignore_words(
                     info.new_transcript, opts.interruption_ignore_words
                 ):
-                    self._cancel_preemptive_generation()
+                    self._cancel_preemptive_generation(reason="interruption_ignore_words")
                     if delayed_interruption_context:
                         return self._consume_delayed_interruption_turn(
                             info,
@@ -2399,25 +2454,38 @@ class AgentActivity(RecognitionHooks):
         if preemptive := self._preemptive_generation:
             # make sure the on_user_turn_completed didn't change some request parameters
             # otherwise invalidate the preemptive generation
-            if (
-                preemptive.info.new_transcript == user_message.text_content
-                and preemptive.chat_ctx.is_equivalent(temp_mutable_chat_ctx)
-                and preemptive.tools == self.tools
-                and preemptive.tool_choice == self._tool_choice
-            ):
+            mismatch_reason, checks = self._preemptive_generation_mismatch_reason(
+                preemptive,
+                user_message=user_message,
+                temp_mutable_chat_ctx=temp_mutable_chat_ctx,
+            )
+            if mismatch_reason == "matched":
                 speech_handle = preemptive.speech_handle
 
                 # preemptive generation is using another ChatMessage created outside of the on_end_of_turn callback,
                 # inject the metrics here.
                 preemptive.user_message.metrics = metrics_report
                 self._schedule_speech(speech_handle, priority=SpeechHandle.SPEECH_PRIORITY_NORMAL)
+                self._emit_preemptive_generation_outcome(
+                    preemptive,
+                    outcome="reused",
+                    reason="matched",
+                    **checks,
+                )
                 logger.debug(
                     "using preemptive generation",
                     extra={"preemptive_lead_time": time.time() - preemptive.created_at},
                 )
             else:
+                self._emit_preemptive_generation_outcome(
+                    preemptive,
+                    outcome="discarded",
+                    reason=mismatch_reason,
+                    **checks,
+                )
                 logger.warning(
                     "preemptive generation enabled but chat context or tools have changed after `on_user_turn_completed`",  # noqa: E501
+                    extra={"reason": mismatch_reason, **checks},
                 )
                 preemptive.speech_handle._cancel()
 
