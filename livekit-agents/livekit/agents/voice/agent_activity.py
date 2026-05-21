@@ -1370,6 +1370,7 @@ class AgentActivity(RecognitionHooks):
                 outcome=outcome,
                 reason=reason,
                 preemptive_lead_time=max(time.time() - preemptive.created_at, 0.0),
+                trigger_source=getattr(preemptive.info, "trigger_source", "unknown"),
                 speech_id=getattr(preemptive.speech_handle, "id", None),
                 transcript_match=transcript_match,
                 chat_ctx_match=chat_ctx_match,

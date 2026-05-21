@@ -7,7 +7,7 @@ import time
 from collections import deque
 from collections.abc import AsyncIterable, Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from opentelemetry import trace
 from opentelemetry.sdk.trace import ReadableSpan
@@ -60,6 +60,7 @@ class _PreemptiveGenerationInfo:
     new_transcript: str
     transcript_confidence: float
     started_speaking_at: float | None
+    trigger_source: Literal["preflight", "final_transcript"]
 
 
 class RecognitionHooks(Protocol):
@@ -923,6 +924,7 @@ class AudioRecognition:
                                 else 0
                             ),
                             started_speaking_at=self._speech_start_time,
+                            trigger_source="final_transcript",
                         )
                     )
 
@@ -970,6 +972,7 @@ class AudioRecognition:
                         new_transcript=self._audio_preflight_transcript,
                         transcript_confidence=sum(confidence_vals) / len(confidence_vals),
                         started_speaking_at=self._speech_start_time,
+                        trigger_source="preflight",
                     )
                 )
 

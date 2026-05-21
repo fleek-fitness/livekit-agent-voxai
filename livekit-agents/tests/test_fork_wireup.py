@@ -160,6 +160,7 @@ def _preemptive_generation(
             new_transcript=transcript,
             transcript_confidence=0.9,
             started_speaking_at=None,
+            trigger_source="preflight",
         ),
         chat_ctx=chat_ctx.copy(),
         tools=tools or [],
@@ -173,6 +174,7 @@ def test_preemptive_generation_outcome_event_is_public() -> None:
         outcome="reused",
         reason="matched",
         preemptive_lead_time=0.123,
+        trigger_source="preflight",
         speech_id="speech-1",
         transcript_match=True,
         chat_ctx_match=True,
@@ -228,6 +230,7 @@ def test_cancel_preemptive_generation_emits_discarded_outcome() -> None:
     assert emitted[0][0] == "preemptive_generation_outcome"
     assert emitted[0][1].outcome == "discarded"
     assert emitted[0][1].reason == "replaced_by_new_preflight"
+    assert emitted[0][1].trigger_source == "preflight"
     assert emitted[0][1].speech_id == "speech-1"
     assert emitted[0][1].preemptive_lead_time >= 0.0
     assert activity._preemptive_generation is None
@@ -260,5 +263,6 @@ def test_emit_preemptive_generation_reused_outcome() -> None:
     assert emitted[0][0] == "preemptive_generation_outcome"
     assert emitted[0][1].outcome == "reused"
     assert emitted[0][1].reason == "matched"
+    assert emitted[0][1].trigger_source == "preflight"
     assert emitted[0][1].transcript_match is True
     assert emitted[0][1].chat_ctx_match is True

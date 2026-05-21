@@ -175,6 +175,9 @@ class PreemptiveGenerationOutcomeEvent(BaseModel):
     preemptive_lead_time: float
     """Seconds elapsed since the preemptive generation was created."""
 
+    trigger_source: Literal["preflight", "final_transcript", "unknown"] = "unknown"
+    """Transcript source that created the speculative generation."""
+
     speech_id: str | None = None
     transcript_match: bool | None = None
     chat_ctx_match: bool | None = None
