@@ -1087,7 +1087,7 @@ class AgentServer(utils.EventEmitter[EventTypes]):
                 "worker message queue send start",
                 extra={
                     "id": self.id,
-                    "message": which,
+                    "msg_type": which,
                     "msg_qsize": self._msg_chan.qsize(),
                     "msg_full": self._msg_chan.full(),
                     "draining": self._draining,
@@ -1099,7 +1099,7 @@ class AgentServer(utils.EventEmitter[EventTypes]):
                 "worker message queue send done",
                 extra={
                     "id": self.id,
-                    "message": which,
+                    "msg_type": which,
                     "msg_qsize": self._msg_chan.qsize(),
                     "msg_full": self._msg_chan.full(),
                     "draining": self._draining,
