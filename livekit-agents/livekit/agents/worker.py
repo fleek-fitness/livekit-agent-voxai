@@ -879,21 +879,95 @@ class AgentServer(utils.EventEmitter[EventTypes]):
             if self._draining:
                 return
 
+            def _msg_chan_state() -> dict[str, int | bool | None]:
+                msg_chan = getattr(self, "_msg_chan", None)
+                if msg_chan is None:
+                    return {"msg_qsize": None, "msg_full": None}
+
+                return {"msg_qsize": msg_chan.qsize(), "msg_full": msg_chan.full()}
+
+            def _proc_logging_extra(proc: ipc.job_executor.JobExecutor) -> dict[str, Any]:
+                logging_extra = getattr(proc, "logging_extra", None)
+                if callable(logging_extra):
+                    return logging_extra()
+
+                return {}
+
+            def _running_job_id(proc: ipc.job_executor.JobExecutor) -> str | None:
+                running_job = proc.running_job
+                job = getattr(running_job, "job", None)
+                return getattr(job, "id", None)
+
             logger.info("draining worker", extra={"id": self.id, "timeout": timeout})
             self._draining = True
+            logger.info(
+                "drain stage",
+                extra={
+                    "id": self.id,
+                    "stage": "update_worker_status_start",
+                    **_msg_chan_state(),
+                },
+            )
             await self._update_worker_status()
+            logger.info(
+                "drain stage",
+                extra={
+                    "id": self.id,
+                    "stage": "update_worker_status_done",
+                    **_msg_chan_state(),
+                },
+            )
 
             async def _drain() -> None:
                 # wait for in-flight availability tasks to finish launching their jobs
+                pending_tasks = [t for t in self._job_lifecycle_tasks if not t.done()]
+                logger.info(
+                    "drain stage",
+                    extra={
+                        "id": self.id,
+                        "stage": "job_lifecycle_tasks_start",
+                        "pending_count": len(pending_tasks),
+                        "pending_tasks": [t.get_name() for t in pending_tasks],
+                    },
+                )
                 await asyncio.gather(*self._job_lifecycle_tasks, return_exceptions=True)
+                logger.info(
+                    "drain stage",
+                    extra={"id": self.id, "stage": "job_lifecycle_tasks_done"},
+                )
 
                 # then wait for the launched jobs to complete
                 while True:
                     procs = [p for p in self._proc_pool.processes if p.running_job]
+                    logger.info(
+                        "drain stage",
+                        extra={
+                            "id": self.id,
+                            "stage": "proc_scan",
+                            "running_proc_count": len(procs),
+                            "running_job_ids": [_running_job_id(p) for p in procs],
+                        },
+                    )
                     if not procs:
                         break
                     for proc in procs:
+                        logger.info(
+                            "drain stage",
+                            extra={
+                                "id": self.id,
+                                "stage": "proc_join_start",
+                                **_proc_logging_extra(proc),
+                            },
+                        )
                         await proc.join()
+                        logger.info(
+                            "drain stage",
+                            extra={
+                                "id": self.id,
+                                "stage": "proc_join_done",
+                                **_proc_logging_extra(proc),
+                            },
+                        )
 
             if timeout:
                 await asyncio.wait_for(_drain(), timeout)  # raises asyncio.TimeoutError on timeout
@@ -1008,7 +1082,30 @@ class AgentServer(utils.EventEmitter[EventTypes]):
             elif which == "ping":
                 return
 
+        which = msg.WhichOneof("message")
+        if self._draining or self._msg_chan.full():
+            logger.info(
+                "worker message queue send start",
+                extra={
+                    "id": self.id,
+                    "message": which,
+                    "msg_qsize": self._msg_chan.qsize(),
+                    "msg_full": self._msg_chan.full(),
+                    "draining": self._draining,
+                },
+            )
         await self._msg_chan.send(msg)
+        if self._draining or self._msg_chan.full():
+            logger.info(
+                "worker message queue send done",
+                extra={
+                    "id": self.id,
+                    "message": which,
+                    "msg_qsize": self._msg_chan.qsize(),
+                    "msg_full": self._msg_chan.full(),
+                    "draining": self._draining,
+                },
+            )
 
     @utils.log_exceptions(logger=logger)
     async def _connection_task(self) -> None:
