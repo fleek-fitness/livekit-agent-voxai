@@ -887,11 +887,10 @@ class AgentServer(utils.EventEmitter[EventTypes]):
                 return {"msg_qsize": msg_chan.qsize(), "msg_full": msg_chan.full()}
 
             def _proc_logging_extra(proc: ipc.job_executor.JobExecutor) -> dict[str, Any]:
-                logging_extra = getattr(proc, "logging_extra", None)
-                if callable(logging_extra):
-                    return logging_extra()
-
-                return {}
+                try:
+                    return proc.logging_extra()
+                except AttributeError:
+                    return {}
 
             def _running_job_id(proc: ipc.job_executor.JobExecutor) -> str | None:
                 running_job = proc.running_job
