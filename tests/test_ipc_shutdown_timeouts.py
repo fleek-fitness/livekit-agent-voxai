@@ -15,6 +15,7 @@ See:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import multiprocessing as mp
 import socket
 from unittest.mock import AsyncMock, MagicMock
@@ -24,12 +25,16 @@ import pytest
 from livekit.agents.ipc import (
     inference_proc_executor,
     job_proc_executor,
+    job_thread_executor,
     proto,
     supervised_proc,
 )
 from livekit.agents.ipc.inference_proc_executor import InferenceProcExecutor
+from livekit.agents.ipc.job_executor import JobStatus
+from livekit.agents.ipc.job_thread_executor import ThreadJobExecutor
 from livekit.agents.ipc.supervised_proc import SupervisedProc
 from livekit.agents.utils import aio
+from livekit.agents.utils.aio import duplex_unix
 
 
 class _DummySupervisedProc(SupervisedProc):
@@ -292,38 +297,303 @@ async def test_main_task_inference_cancel_timeout_bounds(monkeypatch):
 
 
 async def test_pch_aclose_timeout_force_closes_sock(monkeypatch):
-    """When pch.aclose() hangs, the timeout branch must force-close
-    the underlying transport + socket to release the fd promptly.
+    """When `_supervise_task()` reaches its tail-end `pch.aclose()` and
+    that aclose hangs, the production path must time out within
+    `_PCH_ACLOSE_HARD_TIMEOUT_S` and invoke `_force_close_pch` so the fd
+    is released.
+
+    Drives the real `SupervisedProc._supervise_task()` body — not a
+    reimplementation of the wait_for+force_close pattern — so a future
+    edit that drops the wrap or moves the call site will break this test
+    instead of silently passing.
     """
 
     monkeypatch.setattr(supervised_proc, "_PCH_ACLOSE_HARD_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(supervised_proc, "_HELPERS_CANCEL_HARD_TIMEOUT_S", 0.05)
 
     force_close_called: list[object] = []
+    monkeypatch.setattr(
+        supervised_proc, "_force_close_pch", lambda pch: force_close_called.append(pch)
+    )
 
-    def _capture_force_close(pch):
-        force_close_called.append(pch)
+    proc = _make_dummy_supervised()
 
-    monkeypatch.setattr(supervised_proc, "_force_close_pch", _capture_force_close)
+    # Short-circuit the helper tasks that `_supervise_task` spawns so it
+    # reaches the pch.aclose tail without spinning forever.
+    async def _noop_main(ipc_ch: aio.ChanReceiver[object]) -> None:
+        return None
 
-    # Direct call into the helper path: run the body that wraps pch.aclose
-    # via a minimal harness. Use a hanging coroutine to emulate aclose
-    # never resolving.
-    import contextlib
+    async def _noop_read(ipc_ch: aio.Chan[object], pong_timeout: aio.Sleep) -> None:
+        return None
 
-    async def _hang() -> None:
+    async def _noop_ping(pong_timeout: aio.Sleep) -> None:
+        return None
+
+    monkeypatch.setattr(proc, "_main_task", _noop_main)
+    monkeypatch.setattr(proc, "_read_ipc_task", _noop_read)
+    monkeypatch.setattr(proc, "_ping_pong_task", _noop_ping)
+
+    # Pre-resolve `_initialize_fut` and `_join_fut` so `_supervise_task`
+    # walks past them straight into the cleanup phase.
+    proc._initialize_fut.set_result(None)
+    proc._join_fut = asyncio.Future[None]()
+    proc._join_fut.set_result(None)
+
+    fake_proc = MagicMock()
+    fake_proc.exitcode = 0
+    fake_proc.close = MagicMock()
+    proc._proc = fake_proc
+
+    # `_pch.aclose` hangs — this is the regression site the wrap is
+    # supposed to defend.
+    fake_pch = MagicMock(spec=duplex_unix._AsyncDuplex)
+
+    async def _hang_aclose() -> None:
         await asyncio.sleep(60)
 
-    fake_pch = MagicMock()
-    fake_pch.aclose = _hang
+    fake_pch.aclose = _hang_aclose
+    proc._pch = fake_pch
 
-    with contextlib.suppress(asyncio.TimeoutError):
-        try:
-            await asyncio.wait_for(
-                fake_pch.aclose(),
-                timeout=supervised_proc._PCH_ACLOSE_HARD_TIMEOUT_S,
-            )
-        except asyncio.TimeoutError:
-            supervised_proc._force_close_pch(fake_pch)
-            raise
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    await proc._supervise_task()
+    elapsed = loop.time() - started
 
-    assert force_close_called == [fake_pch]
+    assert force_close_called == [fake_pch], (
+        f"_force_close_pch not invoked via production path: {force_close_called!r}"
+    )
+    # Bounded by HELPERS_CANCEL + PCH_ACLOSE timeouts (both 0.05s); generous
+    # slack for CI scheduling.
+    assert elapsed < 2.0, f"_supervise_task did not bound pch.aclose: {elapsed:.3f}s"
+
+
+async def test_thread_main_task_does_not_false_success_while_thread_runs(monkeypatch):
+    """Regression guard for `_main_task`'s `_join_fut` wait.
+
+    The PR's first attempt bounded the wait with `_JOIN_FUT_HARD_TIMEOUT_S`
+    (30s) and unconditionally set `JobStatus.SUCCESS` on fall-through.
+    That falsely reported normal long-running calls (typical voice agents
+    run for minutes) as SUCCESS while the underlying thread was still
+    alive. The wait must stay unbounded; bounding lives in `aclose()` via
+    the shielded `_main_atask`.
+    """
+
+    loop = asyncio.get_running_loop()
+    executor = ThreadJobExecutor(
+        initialize_process_fnc=lambda _: None,
+        job_entrypoint_fnc=lambda _: asyncio.sleep(0),
+        session_end_fnc=None,
+        inference_executor=None,
+        initialize_timeout=1.0,
+        close_timeout=1.0,
+        session_end_timeout=1.0,
+        ping_interval=10.0,
+        high_ping_threshold=10.0,
+        http_proxy=None,
+        loop=loop,
+    )
+
+    # Short-circuit ping/monitor helpers that `_main_task` spawns —
+    # otherwise they'd try to read from a non-existent `_pch`.
+    async def _noop_ping() -> None:
+        await asyncio.sleep(60)
+
+    async def _noop_monitor() -> None:
+        await asyncio.sleep(60)
+
+    monkeypatch.setattr(executor, "_ping_task", _noop_ping)
+    monkeypatch.setattr(executor, "_monitor_task", _noop_monitor)
+
+    executor._pch = AsyncMock()
+    executor._initialize_fut.set_result(None)
+    executor._join_fut = asyncio.Future[None]()  # unresolved — thread "still running"
+
+    main_task = asyncio.create_task(executor._main_task())
+
+    # Wait longer than the old `_JOIN_FUT_HARD_TIMEOUT_S=30.0`s would have
+    # been monkeypatched to (had it survived). 0.2s is plenty of real wall
+    # clock to expose a still-bounded wait misfiring.
+    await asyncio.sleep(0.2)
+
+    try:
+        assert not main_task.done(), (
+            "regression: _main_task returned while _join_fut still pending"
+            " — bounded wait re-introduced on the normal path"
+        )
+        assert executor._job_status is None, (
+            f"regression: _job_status set to {executor._job_status!r} while"
+            " thread is still running — false SUCCESS emission"
+        )
+
+        # Resolving the join future should now let _main_task complete
+        # cleanly with SUCCESS, proving the wait was the only blocker.
+        executor._join_fut.set_result(None)
+        await asyncio.wait_for(main_task, timeout=2.0)
+        assert executor._job_status == JobStatus.SUCCESS, (
+            f"_main_task did not converge to SUCCESS after join: {executor._job_status!r}"
+        )
+    finally:
+        if not main_task.done():
+            main_task.cancel()
+            with contextlib.suppress(BaseException):
+                await main_task
+
+
+async def test_supervised_aclose_idempotent_under_ack_timeout(monkeypatch):
+    """Repeated `SupervisedProc.aclose()` after a first ack timeout must
+    not raise `CancelledError`.
+
+    Before the shield fix, `wait_for(self._shutdown_ack_fut, ...)` would
+    cancel `_shutdown_ack_fut` on timeout. The next aclose() call (pool
+    double-close, launch-failure cleanup) would then re-await the cancelled
+    future and immediately raise `CancelledError`, breaking idempotency.
+    """
+
+    monkeypatch.setattr(supervised_proc, "_SHUTDOWN_ACK_HARD_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(supervised_proc, "_SHUTTING_DOWN_HARD_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(supervised_proc, "_SUPERVISE_HARD_TIMEOUT_S", 0.05)
+
+    proc = _make_dummy_supervised()
+    proc._pch = AsyncMock()
+    proc._pch.aclose = AsyncMock()
+
+    async def _noop() -> None:
+        return None
+
+    proc._supervise_atask = asyncio.create_task(_noop())
+    monkeypatch.setattr(proc, "_send_dump_signal", _noop)
+    monkeypatch.setattr(proc, "_send_kill_signal", _noop)
+
+    # First aclose: shutdown_ack times out → escalates to dump+kill.
+    await proc.aclose()
+
+    # The shield must keep `_shutdown_ack_fut` pending across the timeout.
+    assert not proc._shutdown_ack_fut.cancelled(), (
+        "shield missing: first aclose() cancelled _shutdown_ack_fut"
+    )
+    assert not proc._shutdown_ack_fut.done(), (
+        "unexpected: _shutdown_ack_fut resolved by something other than producer"
+    )
+
+    # Second aclose: must not raise CancelledError. (Re-arm supervise_atask
+    # so the path is fully re-entered; the supervise wait is already
+    # shielded so it's not the regression target here.)
+    proc._supervise_atask = asyncio.create_task(_noop())
+    try:
+        await proc.aclose()
+    except asyncio.CancelledError as exc:  # pragma: no cover — regression
+        pytest.fail(f"second aclose() raised CancelledError (shield regression): {exc!r}")
+
+
+async def test_thread_aclose_idempotent_under_ack_timeout(monkeypatch):
+    """ThreadJobExecutor mirror of `test_supervised_aclose_idempotent_under_ack_timeout`.
+
+    The same shield-on-`_shutdown_ack_fut` invariant must hold for the
+    threaded executor; both call sites had identical unshielded `wait_for`.
+    """
+
+    monkeypatch.setattr(supervised_proc, "_SHUTDOWN_ACK_HARD_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(supervised_proc, "_SHUTTING_DOWN_HARD_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(supervised_proc, "_SUPERVISE_HARD_TIMEOUT_S", 0.05)
+
+    loop = asyncio.get_running_loop()
+    executor = ThreadJobExecutor(
+        initialize_process_fnc=lambda _: None,
+        job_entrypoint_fnc=lambda _: asyncio.sleep(0),
+        session_end_fnc=None,
+        inference_executor=None,
+        initialize_timeout=1.0,
+        close_timeout=1.0,
+        session_end_timeout=1.0,
+        ping_interval=10.0,
+        high_ping_threshold=10.0,
+        http_proxy=None,
+        loop=loop,
+    )
+
+    executor._pch = AsyncMock()
+    executor._pch.aclose = AsyncMock()
+
+    async def _noop() -> None:
+        return None
+
+    executor._main_atask = asyncio.create_task(_noop())  # marks `started`
+
+    # First aclose: ack times out (future unresolved).
+    await executor.aclose()
+
+    assert not executor._shutdown_ack_fut.cancelled(), (
+        "shield missing: first aclose() cancelled _shutdown_ack_fut (thread)"
+    )
+    assert not executor._shutdown_ack_fut.done()
+
+    executor._main_atask = asyncio.create_task(_noop())
+    try:
+        await executor.aclose()
+    except asyncio.CancelledError as exc:  # pragma: no cover — regression
+        pytest.fail(f"second thread aclose() raised CancelledError (shield regression): {exc!r}")
+
+
+async def test_thread_start_exception_bounds_pch_aclose(monkeypatch):
+    """When `ThreadJobExecutor._start()` raises after `pch` is created,
+    the exception-cleanup `pch.aclose()` must be bounded by
+    `_START_CLEANUP_PCH_ACLOSE_HARD_TIMEOUT_S` and fall back to
+    `_force_close_pch` on timeout — matching the process-side behavior.
+
+    Before this fix, the thread `_start` exception path had a bare
+    `await pch.aclose()` that would hang indefinitely if the duplex
+    flush stalled (the symptom this PR is supposed to defend against).
+    """
+
+    monkeypatch.setattr(job_thread_executor, "_START_CLEANUP_PCH_ACLOSE_HARD_TIMEOUT_S", 0.05)
+
+    fake_pch = MagicMock(spec=duplex_unix._AsyncDuplex)
+
+    async def _hang_aclose() -> None:
+        await asyncio.sleep(60)
+
+    fake_pch.aclose = _hang_aclose
+
+    async def _fake_open(sock):
+        return fake_pch
+
+    monkeypatch.setattr(duplex_unix._AsyncDuplex, "open", staticmethod(_fake_open))
+
+    class _BoomThread:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("simulated thread construction failure")
+
+    monkeypatch.setattr(job_thread_executor.threading, "Thread", _BoomThread)
+
+    force_close_called: list[object] = []
+    monkeypatch.setattr(
+        job_thread_executor,
+        "_force_close_pch",
+        lambda pch: force_close_called.append(pch),
+    )
+
+    loop = asyncio.get_running_loop()
+    executor = ThreadJobExecutor(
+        initialize_process_fnc=lambda _: None,
+        job_entrypoint_fnc=lambda _: asyncio.sleep(0),
+        session_end_fnc=None,
+        inference_executor=None,
+        initialize_timeout=1.0,
+        close_timeout=1.0,
+        session_end_timeout=1.0,
+        ping_interval=10.0,
+        high_ping_threshold=10.0,
+        http_proxy=None,
+        loop=loop,
+    )
+
+    started = loop.time()
+    with pytest.raises(RuntimeError, match="simulated thread construction failure"):
+        await executor.start()
+    elapsed = loop.time() - started
+
+    assert force_close_called == [fake_pch], (
+        "_force_close_pch was not invoked from _start() exception cleanup"
+    )
+    # _start cleanup is bounded by 0.05s pch.aclose timeout; generous slack.
+    assert elapsed < 1.0, f"_start exception cleanup did not bound: {elapsed:.3f}s"

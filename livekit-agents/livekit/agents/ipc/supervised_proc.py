@@ -340,7 +340,13 @@ class SupervisedProc(ABC):
         # worst-case aclose() chain into the 10h range.
         shutdown_ack_timeout = min(self._opts.close_timeout, _SHUTDOWN_ACK_HARD_TIMEOUT_S)
         try:
-            await asyncio.wait_for(self._shutdown_ack_fut, timeout=shutdown_ack_timeout)
+            # Shield so a timeout cancels only this wait, not the underlying
+            # future itself. A subsequent aclose() (pool double-close,
+            # launch-failure cleanup) must observe the same future state
+            # instead of getting an immediate CancelledError.
+            await asyncio.wait_for(
+                asyncio.shield(self._shutdown_ack_fut), timeout=shutdown_ack_timeout
+            )
         except asyncio.TimeoutError:
             logger.error(
                 "[ipc.shutdown_ack_timeout] process did not ack shutdown in time, killing process",
