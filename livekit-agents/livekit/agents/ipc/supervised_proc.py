@@ -26,6 +26,21 @@ from ..utils.aio import duplex_unix
 from . import channel, proto
 from .log_queue import LogQueueListener
 
+# Defense-in-depth hard timeouts for the parent-side shutdown chain.
+# These bound four awaits that are otherwise unbounded (or effectively
+# unbounded because they pivot on `close_timeout`, which can be set to
+# very large values for K8s graceful shutdown). Without these bounds a
+# stuck IPC channel or a stuck `_supervise_task` cleanup step can keep
+# a pod Terminating until the K8s grace period expires.
+# See https://github.com/livekit/agents/issues/5497,
+# https://github.com/livekit/agents/issues/3174,
+# https://github.com/livekit/agents/pull/4580 (regression source),
+# https://github.com/livekit/agents/pull/5602 (child-side complement).
+_SHUTTING_DOWN_HARD_TIMEOUT_S = 10.0
+_SUPERVISE_HARD_TIMEOUT_S = 10.0
+_HELPERS_CANCEL_HARD_TIMEOUT_S = 10.0
+_PCH_ACLOSE_HARD_TIMEOUT_S = 5.0
+
 _mask_ctrl_c_refcount = 0
 _mask_ctrl_c_original: Callable[[int, FrameType | None], Any] | int | None = signal.SIG_DFL
 
@@ -286,7 +301,22 @@ class SupervisedProc(ABC):
             await self._send_kill_signal()
 
         if not self._shutting_down_fut.done():
-            await self._shutting_down_fut
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(self._shutting_down_fut),
+                    timeout=_SHUTTING_DOWN_HARD_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    "[ipc.shutting_down_timeout] waiting for ShuttingDown timed out,"
+                    " killing process",
+                    extra={
+                        "timeout_s": _SHUTTING_DOWN_HARD_TIMEOUT_S,
+                        **self.logging_extra(),
+                    },
+                )
+                await self._send_dump_signal()
+                await self._send_kill_signal()
 
         if self._supervise_atask and not self._supervise_atask.done():
             try:
@@ -302,8 +332,21 @@ class SupervisedProc(ABC):
                 await self._send_kill_signal()
 
         async with self._lock:
-            if self._supervise_atask:
-                await asyncio.shield(self._supervise_atask)
+            if self._supervise_atask and not self._supervise_atask.done():
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(self._supervise_atask),
+                        timeout=_SUPERVISE_HARD_TIMEOUT_S,
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(
+                        "[ipc.supervise_atask_timeout] supervise task did not"
+                        " complete after kill, dropping",
+                        extra={
+                            "timeout_s": _SUPERVISE_HARD_TIMEOUT_S,
+                            **self.logging_extra(),
+                        },
+                    )
 
     async def kill(self) -> None:
         """forcefully kill the supervised process"""
@@ -393,13 +436,48 @@ class SupervisedProc(ABC):
         await self._join_fut
         self._exitcode = self._proc.exitcode
         self._proc.close()
-        await aio.cancel_and_wait(ping_task, read_ipc_task, main_task)
+        try:
+            await asyncio.wait_for(
+                aio.cancel_and_wait(ping_task, read_ipc_task, main_task),
+                timeout=_HELPERS_CANCEL_HARD_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "[ipc.helpers_cancel_timeout] supervised helper tasks did not"
+                " cancel in time, dropping",
+                extra={
+                    "timeout_s": _HELPERS_CANCEL_HARD_TIMEOUT_S,
+                    **self.logging_extra(),
+                },
+            )
 
         if memory_monitor_task is not None:
-            await aio.cancel_and_wait(memory_monitor_task)
+            try:
+                await asyncio.wait_for(
+                    aio.cancel_and_wait(memory_monitor_task),
+                    timeout=_HELPERS_CANCEL_HARD_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    "[ipc.helpers_cancel_timeout] memory monitor task did not"
+                    " cancel in time, dropping",
+                    extra={
+                        "timeout_s": _HELPERS_CANCEL_HARD_TIMEOUT_S,
+                        **self.logging_extra(),
+                    },
+                )
 
         with contextlib.suppress(duplex_unix.DuplexClosed):
-            await self._pch.aclose()
+            try:
+                await asyncio.wait_for(self._pch.aclose(), timeout=_PCH_ACLOSE_HARD_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[ipc.pch_aclose_timeout] supervised pch.aclose timed out, dropping",
+                    extra={
+                        "timeout_s": _PCH_ACLOSE_HARD_TIMEOUT_S,
+                        **self.logging_extra(),
+                    },
+                )
 
         if self._exitcode != 0 and not self._kill_sent:
             logger.error(

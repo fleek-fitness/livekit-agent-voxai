@@ -18,6 +18,13 @@ from .job_executor import JobStatus
 from .job_proc_lazy_main import ProcStartArgs, proc_main
 from .supervised_proc import SupervisedProc
 
+# Defense-in-depth hard timeout for the parent-side `_main_task` finally,
+# bounding `cancel_and_wait` over pending `_do_inference_task`s. Without
+# this, a single in-flight inference whose cancel does not propagate can
+# block `_supervise_task` cleanup and keep a K8s pod Terminating.
+# See https://github.com/livekit/agents/issues/5497 and #3174.
+_INFERENCE_TASKS_CANCEL_HARD_TIMEOUT_S = 10.0
+
 
 class ProcJobExecutor(SupervisedProc):
     def __init__(
@@ -119,7 +126,23 @@ class ProcJobExecutor(SupervisedProc):
                     self._inference_tasks.add(task)
                     task.add_done_callback(self._inference_tasks.discard)
         finally:
-            await aio.cancel_and_wait(*self._inference_tasks)
+            pending_tasks = tuple(self._inference_tasks)
+            if pending_tasks:
+                try:
+                    await asyncio.wait_for(
+                        aio.cancel_and_wait(*pending_tasks),
+                        timeout=_INFERENCE_TASKS_CANCEL_HARD_TIMEOUT_S,
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(
+                        "[ipc.main_task_inference_cancel_timeout] inference tasks"
+                        " did not cancel in time, dropping",
+                        extra={
+                            "timeout_s": _INFERENCE_TASKS_CANCEL_HARD_TIMEOUT_S,
+                            "pending_count": len(pending_tasks),
+                            **self.logging_extra(),
+                        },
+                    )
 
     @log_exceptions(logger=logger)
     async def _supervise_task(self) -> None:
