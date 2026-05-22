@@ -255,6 +255,14 @@ class ProcPool(utils.EventEmitter[EventTypes]):
                 await asyncio.sleep(0.1)
         except asyncio.CancelledError:
             await aio.cancel_and_wait(*self._spawn_tasks)
+            # `proc.aclose()` has a bounded shutdown chain in SupervisedProc,
+            # but its internal `_supervise_atask` may legitimately outlive
+            # `aclose()` if a hard timeout fires. The monitor tasks below
+            # `await proc.join()`, which awaits that same `_supervise_atask`
+            # — so without an explicit cancel here, the pool would re-hang
+            # via the monitor even though aclose() returned. Cancel them
+            # so the pool can finish closing.
             await asyncio.gather(*[proc.aclose() for proc in self._executors])
             await asyncio.gather(*self._close_tasks)
-            await asyncio.gather(*self._monitor_tasks)
+            if self._monitor_tasks:
+                await aio.cancel_and_wait(*self._monitor_tasks)
