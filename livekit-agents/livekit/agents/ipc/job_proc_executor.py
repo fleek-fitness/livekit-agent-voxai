@@ -126,6 +126,8 @@ class ProcJobExecutor(SupervisedProc):
                     self._inference_tasks.add(task)
                     task.add_done_callback(self._inference_tasks.discard)
         finally:
+            # Snapshot the set so done-callbacks discarding entries during
+            # cancellation don't mutate what we're awaiting.
             pending_tasks = tuple(self._inference_tasks)
             if pending_tasks:
                 try:
@@ -134,12 +136,17 @@ class ProcJobExecutor(SupervisedProc):
                         timeout=_INFERENCE_TASKS_CANCEL_HARD_TIMEOUT_S,
                     )
                 except asyncio.TimeoutError:
+                    # cancel_and_wait may return before tasks finish if the
+                    # outer wait_for cancels mid-await; count what actually
+                    # leaked rather than the snapshot size.
+                    still_pending = sum(1 for t in pending_tasks if not t.done())
                     logger.error(
                         "[ipc.main_task_inference_cancel_timeout] inference tasks"
                         " did not cancel in time, dropping",
                         extra={
                             "timeout_s": _INFERENCE_TASKS_CANCEL_HARD_TIMEOUT_S,
-                            "pending_count": len(pending_tasks),
+                            "still_pending": still_pending,
+                            "snapshot_size": len(pending_tasks),
                             **self.logging_extra(),
                         },
                     )
