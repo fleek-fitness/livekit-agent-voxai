@@ -14,13 +14,6 @@ from . import channel, proto
 from .inference_proc_lazy_main import ProcStartArgs, proc_main
 from .supervised_proc import SupervisedProc
 
-# Defense-in-depth hard timeout for an in-flight inference response.
-# Bounds `await fut` so a stuck inference proc cannot keep a parent-side
-# `_do_inference_task` alive forever, which would otherwise block
-# `_main_task`'s `cancel_and_wait` during shutdown.
-# See https://github.com/livekit/agents/issues/5497 and #3174.
-_INFERENCE_RESPONSE_TIMEOUT_S = 10.0
-
 
 class InferenceProcExecutor(SupervisedProc):
     def __init__(
@@ -101,25 +94,7 @@ class InferenceProcExecutor(SupervisedProc):
             self._active_requests.pop(request_id, None)
             raise
 
-        try:
-            inf_resp = await asyncio.wait_for(fut, timeout=_INFERENCE_RESPONSE_TIMEOUT_S)
-        except asyncio.TimeoutError as e:
-            logger.error(
-                "[ipc.inference_response_timeout] inference response timed out",
-                extra={
-                    "method": method,
-                    "request_id": request_id,
-                    "timeout_s": _INFERENCE_RESPONSE_TIMEOUT_S,
-                    **self.logging_extra(),
-                },
-            )
-            self._active_requests.pop(request_id, None)
-            if not fut.done():
-                fut.cancel()
-            raise RuntimeError(
-                f"inference of {method} timed out after {_INFERENCE_RESPONSE_TIMEOUT_S}s"
-            ) from e
-
+        inf_resp = await fut
         if inf_resp.error:
             raise RuntimeError(f"inference of {method} failed: {inf_resp.error}")
 
