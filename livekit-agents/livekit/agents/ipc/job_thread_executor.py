@@ -16,28 +16,6 @@ from ..utils.aio import duplex_unix
 from . import channel, job_proc_lazy_main, proto
 from .inference_executor import InferenceExecutor
 from .job_executor import JobStatus
-from .supervised_proc import (
-    _HELPERS_CANCEL_HARD_TIMEOUT_S,
-    _PCH_ACLOSE_HARD_TIMEOUT_S,
-    _SHUTDOWN_ACK_HARD_TIMEOUT_S,
-    _SHUTTING_DOWN_HARD_TIMEOUT_S,
-    _START_CLEANUP_PCH_ACLOSE_HARD_TIMEOUT_S,
-    _SUPERVISE_HARD_TIMEOUT_S,
-    _force_close_pch,
-)
-
-# Defense-in-depth hard timeout for the thread-side `_main_task` finally,
-# bounding `cancel_and_wait` over pending `_do_inference_task`s in the
-# thread executor. Mirrors the logic in `job_proc_executor.py`.
-_INFERENCE_TASKS_CANCEL_HARD_TIMEOUT_S = 10.0
-# NOTE: the `_join_fut` wait inside `_main_task` is intentionally unbounded.
-# Threads cannot be killed, and `_join_fut` resolves on **normal job
-# termination** as well as shutdown. Bounding it here would cause the
-# normal long-running job path (typical voice agent calls run for minutes)
-# to fall through and mark `JobStatus.SUCCESS` while the worker thread is
-# still alive. The async surface is kept bounded in `aclose()` via the
-# `_main_atask` shielded wait (`_SUPERVISE_HARD_TIMEOUT_S`); a hung thread
-# is a documented worst-case leak that callers should log/escalate.
 
 
 @dataclass
@@ -174,22 +152,7 @@ class ThreadJobExecutor:
 
                 if pch is not None:
                     with contextlib.suppress(duplex_unix.DuplexClosed):
-                        try:
-                            await asyncio.wait_for(
-                                pch.aclose(),
-                                timeout=_START_CLEANUP_PCH_ACLOSE_HARD_TIMEOUT_S,
-                            )
-                        except asyncio.TimeoutError:
-                            logger.warning(
-                                "[thread.start_cleanup_pch_aclose_timeout]"
-                                " pch.aclose timed out during _start exception"
-                                " cleanup, aborting transport and closing socket",
-                                extra={
-                                    "timeout_s": _START_CLEANUP_PCH_ACLOSE_HARD_TIMEOUT_S,
-                                    **self.logging_extra(),
-                                },
-                            )
-                            _force_close_pch(pch)
+                        await pch.aclose()
                 else:
                     with contextlib.suppress(OSError):
                         mp_pch.close()
@@ -250,66 +213,25 @@ class ThreadJobExecutor:
         with contextlib.suppress(utils.aio.duplex_unix.DuplexClosed):
             await channel.asend_message(self._pch, proto.ShutdownRequest())
 
-        shutdown_ack_timeout = min(self._opts.close_timeout, _SHUTDOWN_ACK_HARD_TIMEOUT_S)
         try:
-            # Shield so a timeout cancels only this wait, not the underlying
-            # future itself. A subsequent aclose() (pool double-close,
-            # launch-failure cleanup) must observe the same future state
-            # instead of getting an immediate CancelledError.
-            await asyncio.wait_for(
-                asyncio.shield(self._shutdown_ack_fut), timeout=shutdown_ack_timeout
-            )
+            await asyncio.wait_for(self._shutdown_ack_fut, timeout=self._opts.close_timeout)
         except asyncio.TimeoutError:
-            logger.error(
-                "[thread.shutdown_ack_timeout] job did not ack shutdown in time",
-                extra={"timeout_s": shutdown_ack_timeout, **self.logging_extra()},
-            )
+            logger.error("job did not ack shutdown in time", extra=self.logging_extra())
 
         if not self._shutting_down_fut.done():
-            try:
-                await asyncio.wait_for(
-                    asyncio.shield(self._shutting_down_fut),
-                    timeout=_SHUTTING_DOWN_HARD_TIMEOUT_S,
-                )
-            except asyncio.TimeoutError:
-                logger.error(
-                    "[thread.shutting_down_timeout] waiting for ShuttingDown timed"
-                    " out (thread cannot be killed)",
-                    extra={
-                        "timeout_s": _SHUTTING_DOWN_HARD_TIMEOUT_S,
-                        **self.logging_extra(),
-                    },
-                )
+            await self._shutting_down_fut
 
-        if self._main_atask is not None and not self._main_atask.done():
-            main_first_timeout = min(self._opts.close_timeout, _SUPERVISE_HARD_TIMEOUT_S)
-            try:
-                await asyncio.wait_for(asyncio.shield(self._main_atask), timeout=main_first_timeout)
-            except asyncio.TimeoutError:
-                logger.error(
-                    "[thread.main_first_timeout] job shutdown is taking too much time..",
-                    extra={
-                        "timeout_s": main_first_timeout,
-                        **self.logging_extra(),
-                    },
+        try:
+            if self._main_atask:
+                await asyncio.wait_for(
+                    asyncio.shield(self._main_atask), timeout=self._opts.close_timeout
                 )
+        except asyncio.TimeoutError:
+            logger.error("job shutdown is taking too much time..", extra=self.logging_extra())
 
         async with self._lock:
-            if self._main_atask is not None and not self._main_atask.done():
-                try:
-                    await asyncio.wait_for(
-                        asyncio.shield(self._main_atask),
-                        timeout=_SUPERVISE_HARD_TIMEOUT_S,
-                    )
-                except asyncio.TimeoutError:
-                    logger.error(
-                        "[thread.main_lock_timeout] main task did not complete"
-                        " after kill attempt, dropping",
-                        extra={
-                            "timeout_s": _SUPERVISE_HARD_TIMEOUT_S,
-                            **self.logging_extra(),
-                        },
-                    )
+            if self._main_atask:
+                await asyncio.shield(self._main_atask)
 
     async def _do_inference_task(self, inf_req: proto.InferenceRequest) -> None:
         if self._inference_executor is None:
@@ -361,65 +283,12 @@ class ThreadJobExecutor:
         ping_task = asyncio.create_task(self._ping_task())
         monitor_task = asyncio.create_task(self._monitor_task())
 
-        # Wait for the thread to terminate. This is intentionally unbounded:
-        # `_join_fut` fires on normal job end as well as on shutdown, so a
-        # bound here would also clip happy-path long-running jobs (see the
-        # module-level comment on `_JOIN_FUT_HARD_TIMEOUT_S` removal). The
-        # async surface stays bounded in `aclose()` via the shielded
-        # `_main_atask` wait — a thread that ignores shutdown leaks until
-        # process exit but does not block the worker loop.
         await self._join_fut
-
-        helper_tasks = (ping_task, monitor_task)
-        try:
-            await asyncio.wait_for(
-                utils.aio.cancel_and_wait(*helper_tasks),
-                timeout=_HELPERS_CANCEL_HARD_TIMEOUT_S,
-            )
-        except asyncio.TimeoutError:
-            still_pending = sum(1 for t in helper_tasks if not t.done())
-            logger.error(
-                "[thread.helpers_cancel_timeout] helper tasks did not cancel in time, dropping",
-                extra={
-                    "timeout_s": _HELPERS_CANCEL_HARD_TIMEOUT_S,
-                    "still_pending": still_pending,
-                    **self.logging_extra(),
-                },
-            )
-
-        pending_inference = tuple(self._inference_tasks)
-        if pending_inference:
-            try:
-                await asyncio.wait_for(
-                    utils.aio.cancel_and_wait(*pending_inference),
-                    timeout=_INFERENCE_TASKS_CANCEL_HARD_TIMEOUT_S,
-                )
-            except asyncio.TimeoutError:
-                still_pending = sum(1 for t in pending_inference if not t.done())
-                logger.error(
-                    "[thread.inference_cancel_timeout] inference tasks did not"
-                    " cancel in time, dropping",
-                    extra={
-                        "timeout_s": _INFERENCE_TASKS_CANCEL_HARD_TIMEOUT_S,
-                        "still_pending": still_pending,
-                        "snapshot_size": len(pending_inference),
-                        **self.logging_extra(),
-                    },
-                )
+        await utils.aio.cancel_and_wait(ping_task, monitor_task)
+        await utils.aio.cancel_and_wait(*self._inference_tasks)
 
         with contextlib.suppress(duplex_unix.DuplexClosed):
-            try:
-                await asyncio.wait_for(self._pch.aclose(), timeout=_PCH_ACLOSE_HARD_TIMEOUT_S)
-            except asyncio.TimeoutError:
-                logger.error(
-                    "[thread.pch_aclose_timeout] pch.aclose timed out,"
-                    " force-closing transport and socket",
-                    extra={
-                        "timeout_s": _PCH_ACLOSE_HARD_TIMEOUT_S,
-                        **self.logging_extra(),
-                    },
-                )
-                _force_close_pch(self._pch)
+            await self._pch.aclose()
 
         self._job_status = JobStatus.SUCCESS
 

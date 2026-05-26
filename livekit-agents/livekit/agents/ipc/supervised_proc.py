@@ -26,53 +26,8 @@ from ..utils.aio import duplex_unix
 from . import channel, proto
 from .log_queue import LogQueueListener
 
-# Defense-in-depth hard timeouts for the parent-side shutdown chain.
-# These bound six awaits in this module that are otherwise unbounded
-# (or effectively unbounded because they pivot on `close_timeout`,
-# which K8s operators set to large values for graceful shutdown).
-# Without these bounds a stuck IPC channel or a stuck `_supervise_task`
-# cleanup step can keep a pod Terminating until the K8s grace period
-# expires.
-#
-# Rationale for values: K8s typically uses terminationGracePeriodSeconds
-# in the 30s..18000s range. The longest hard floor here (10s) is well
-# below all common grace periods, so it never gates the happy path, but
-# it ensures every site escapes within 10s of the trigger.
-#
-# See https://github.com/livekit/agents/issues/5497,
-# https://github.com/livekit/agents/issues/3174,
-# https://github.com/livekit/agents/pull/4580 (regression source),
-# https://github.com/livekit/agents/pull/5602 (child-side complement).
-_SHUTDOWN_ACK_HARD_TIMEOUT_S = 10.0
-_SHUTTING_DOWN_HARD_TIMEOUT_S = 10.0
-_SUPERVISE_HARD_TIMEOUT_S = 10.0
-_HELPERS_CANCEL_HARD_TIMEOUT_S = 10.0
-_PCH_ACLOSE_HARD_TIMEOUT_S = 5.0
-_KILL_SUPERVISE_HARD_TIMEOUT_S = 10.0
-_START_CLEANUP_PCH_ACLOSE_HARD_TIMEOUT_S = 5.0
-
 _mask_ctrl_c_refcount = 0
 _mask_ctrl_c_original: Callable[[int, FrameType | None], Any] | int | None = signal.SIG_DFL
-
-
-def _force_close_pch(pch: duplex_unix._AsyncDuplex) -> None:
-    """Best-effort socket/transport cleanup after `pch.aclose()` times out.
-
-    `duplex_unix._AsyncDuplex.aclose()` does `writer.close() -> wait_closed()
-    -> sock.close()`. When `asyncio.wait_for` cancels at `wait_closed()`,
-    the final `_sock.close()` is skipped, leaking the fd until process
-    exit. Mirror what `aclose()` would have done so the fd is released
-    promptly even on a stuck shutdown.
-    """
-    try:
-        transport = pch._writer.transport
-    except AttributeError:
-        transport = None
-    if transport is not None:
-        with contextlib.suppress(Exception):
-            transport.abort()
-    with contextlib.suppress(Exception):
-        pch._sock.close()
 
 
 @contextlib.contextmanager
@@ -229,22 +184,7 @@ class SupervisedProc(ABC):
 
                 if pch is not None:
                     with contextlib.suppress(duplex_unix.DuplexClosed):
-                        try:
-                            await asyncio.wait_for(
-                                pch.aclose(),
-                                timeout=_START_CLEANUP_PCH_ACLOSE_HARD_TIMEOUT_S,
-                            )
-                        except asyncio.TimeoutError:
-                            logger.warning(
-                                "[ipc.start_cleanup_pch_aclose_timeout] pch.aclose"
-                                " timed out during _start exception cleanup,"
-                                " aborting transport and closing sockets",
-                                extra={
-                                    "timeout_s": _START_CLEANUP_PCH_ACLOSE_HARD_TIMEOUT_S,
-                                    **self.logging_extra(),
-                                },
-                            )
-                            _force_close_pch(pch)
+                        await pch.aclose()
 
                 if log_listener is not None:
                     with contextlib.suppress(duplex_unix.DuplexClosed):
@@ -335,83 +275,35 @@ class SupervisedProc(ABC):
         with contextlib.suppress(duplex_unix.DuplexClosed):
             await channel.asend_message(self._pch, proto.ShutdownRequest())
 
-        # Use min(close_timeout, hard_floor) so a large operator-configured
-        # close_timeout (e.g. K8s grace period of hours) cannot stretch the
-        # worst-case aclose() chain into the 10h range.
-        shutdown_ack_timeout = min(self._opts.close_timeout, _SHUTDOWN_ACK_HARD_TIMEOUT_S)
         try:
-            # Shield so a timeout cancels only this wait, not the underlying
-            # future itself. A subsequent aclose() (pool double-close,
-            # launch-failure cleanup) must observe the same future state
-            # instead of getting an immediate CancelledError.
-            await asyncio.wait_for(
-                asyncio.shield(self._shutdown_ack_fut), timeout=shutdown_ack_timeout
-            )
+            await asyncio.wait_for(self._shutdown_ack_fut, timeout=self._opts.close_timeout)
         except asyncio.TimeoutError:
             logger.error(
-                "[ipc.shutdown_ack_timeout] process did not ack shutdown in time, killing process",
-                extra={
-                    "timeout_s": shutdown_ack_timeout,
-                    **self.logging_extra(),
-                },
+                "process did not ack shutdown in time, killing process",
+                extra=self.logging_extra(),
             )
             await self._send_dump_signal()
             await self._send_kill_signal()
 
         if not self._shutting_down_fut.done():
-            try:
-                await asyncio.wait_for(
-                    asyncio.shield(self._shutting_down_fut),
-                    timeout=_SHUTTING_DOWN_HARD_TIMEOUT_S,
-                )
-            except asyncio.TimeoutError:
-                logger.error(
-                    "[ipc.shutting_down_timeout] waiting for ShuttingDown timed out,"
-                    " killing process",
-                    extra={
-                        "timeout_s": _SHUTTING_DOWN_HARD_TIMEOUT_S,
-                        **self.logging_extra(),
-                    },
-                )
-                await self._send_dump_signal()
-                await self._send_kill_signal()
+            await self._shutting_down_fut
 
         if self._supervise_atask and not self._supervise_atask.done():
-            # Same min(close_timeout, hard_floor) rationale as
-            # shutdown_ack above; bound the chain regardless of operator
-            # config.
-            supervise_first_timeout = min(self._opts.close_timeout, _SUPERVISE_HARD_TIMEOUT_S)
             try:
                 await asyncio.wait_for(
-                    asyncio.shield(self._supervise_atask), timeout=supervise_first_timeout
+                    asyncio.shield(self._supervise_atask), timeout=self._opts.close_timeout
                 )
             except asyncio.TimeoutError:
                 logger.error(
-                    "[ipc.supervise_first_timeout] process did not exit in time, killing process",
-                    extra={
-                        "timeout_s": supervise_first_timeout,
-                        **self.logging_extra(),
-                    },
+                    "process did not exit in time, killing process",
+                    extra=self.logging_extra(),
                 )
                 await self._send_dump_signal()
                 await self._send_kill_signal()
 
         async with self._lock:
-            if self._supervise_atask and not self._supervise_atask.done():
-                try:
-                    await asyncio.wait_for(
-                        asyncio.shield(self._supervise_atask),
-                        timeout=_SUPERVISE_HARD_TIMEOUT_S,
-                    )
-                except asyncio.TimeoutError:
-                    logger.error(
-                        "[ipc.supervise_atask_timeout] supervise task did not"
-                        " complete after kill, dropping",
-                        extra={
-                            "timeout_s": _SUPERVISE_HARD_TIMEOUT_S,
-                            **self.logging_extra(),
-                        },
-                    )
+            if self._supervise_atask:
+                await asyncio.shield(self._supervise_atask)
 
     async def kill(self) -> None:
         """forcefully kill the supervised process"""
@@ -423,21 +315,8 @@ class SupervisedProc(ABC):
         await self._send_kill_signal()
 
         async with self._lock:
-            if self._supervise_atask and not self._supervise_atask.done():
-                try:
-                    await asyncio.wait_for(
-                        asyncio.shield(self._supervise_atask),
-                        timeout=_KILL_SUPERVISE_HARD_TIMEOUT_S,
-                    )
-                except asyncio.TimeoutError:
-                    logger.error(
-                        "[ipc.kill_supervise_timeout] supervise task did not"
-                        " complete after kill, dropping",
-                        extra={
-                            "timeout_s": _KILL_SUPERVISE_HARD_TIMEOUT_S,
-                            **self.logging_extra(),
-                        },
-                    )
+            if self._supervise_atask:
+                await asyncio.shield(self._supervise_atask)
 
     async def _send_dump_signal(self) -> None:
         if not self.enabled_stack_trace_dump:
@@ -514,64 +393,13 @@ class SupervisedProc(ABC):
         await self._join_fut
         self._exitcode = self._proc.exitcode
         self._proc.close()
-        helper_tasks = (ping_task, read_ipc_task, main_task)
-        try:
-            await asyncio.wait_for(
-                aio.cancel_and_wait(*helper_tasks),
-                timeout=_HELPERS_CANCEL_HARD_TIMEOUT_S,
-            )
-        except asyncio.TimeoutError:
-            # cancel_and_wait issues `.cancel()` first and then awaits the
-            # waiters; when wait_for cancels the outer awaitable the inner
-            # tasks have been *requested* to cancel but may not have
-            # finished. Count and log the leftover, then continue —
-            # downstream cleanup (process exited, sockets closed) limits
-            # the blast radius.
-            still_pending = sum(1 for t in helper_tasks if not t.done())
-            logger.error(
-                "[ipc.helpers_cancel_timeout] supervised helper tasks did not"
-                " cancel in time, dropping",
-                extra={
-                    "timeout_s": _HELPERS_CANCEL_HARD_TIMEOUT_S,
-                    "still_pending": still_pending,
-                    **self.logging_extra(),
-                },
-            )
+        await aio.cancel_and_wait(ping_task, read_ipc_task, main_task)
 
         if memory_monitor_task is not None:
-            try:
-                await asyncio.wait_for(
-                    aio.cancel_and_wait(memory_monitor_task),
-                    timeout=_HELPERS_CANCEL_HARD_TIMEOUT_S,
-                )
-            except asyncio.TimeoutError:
-                logger.error(
-                    "[ipc.memory_monitor_cancel_timeout] memory monitor task did"
-                    " not cancel in time, dropping",
-                    extra={
-                        "timeout_s": _HELPERS_CANCEL_HARD_TIMEOUT_S,
-                        "still_pending": int(not memory_monitor_task.done()),
-                        **self.logging_extra(),
-                    },
-                )
+            await aio.cancel_and_wait(memory_monitor_task)
 
         with contextlib.suppress(duplex_unix.DuplexClosed):
-            try:
-                await asyncio.wait_for(self._pch.aclose(), timeout=_PCH_ACLOSE_HARD_TIMEOUT_S)
-            except asyncio.TimeoutError:
-                # `_AsyncDuplex.aclose()` is `writer.close() -> wait_closed()
-                # -> sock.close()`. Outer cancel at `wait_closed()` skips
-                # `sock.close()`, leaking the fd. Force-close so the fd
-                # is released even on a stuck shutdown.
-                logger.error(
-                    "[ipc.pch_aclose_timeout] supervised pch.aclose timed out,"
-                    " force-closing transport and socket",
-                    extra={
-                        "timeout_s": _PCH_ACLOSE_HARD_TIMEOUT_S,
-                        **self.logging_extra(),
-                    },
-                )
-                _force_close_pch(self._pch)
+            await self._pch.aclose()
 
         if self._exitcode != 0 and not self._kill_sent:
             logger.error(
