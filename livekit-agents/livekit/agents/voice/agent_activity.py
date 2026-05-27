@@ -2524,6 +2524,7 @@ class AgentActivity(RecognitionHooks):
                 transcription_delay=info.transcription_delay or 0.0,
                 on_user_turn_completed_delay=on_user_turn_completed_delay,
                 speech_id=speech_handle.id,
+                speech_anchor_source=info.speech_anchor_source,
                 metadata=metadata,
             )
             self._session.emit("metrics_collected", MetricsCollectedEvent(metrics=eou_metrics))

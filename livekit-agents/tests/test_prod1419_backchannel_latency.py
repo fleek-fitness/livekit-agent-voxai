@@ -13,6 +13,7 @@ from livekit.agents.metrics import (
     TTSMetrics,
 )
 from livekit.agents.metrics.utils import log_metrics
+from livekit.agents.stt import SpeechData, SpeechEvent, SpeechEventType
 from livekit.agents.voice.agent_activity import AgentActivity
 from livekit.agents.voice.audio_recognition import AudioRecognition, _EndOfTurnInfo
 from livekit.agents.voice.endpointing import BaseEndpointing
@@ -116,6 +117,7 @@ def _info(
     text: str,
     suppressed: bool = False,
     skip_reply: bool = False,
+    speech_anchor_source: str = "vad",
 ) -> _EndOfTurnInfo:
     return _EndOfTurnInfo(
         skip_reply=skip_reply,
@@ -126,7 +128,69 @@ def _info(
         stopped_speaking_at=None if suppressed else 456.0,
         transcription_delay=None if suppressed else 0.1,
         end_of_turn_delay=None if suppressed else 0.2,
+        speech_anchor_source="missing" if suppressed else speech_anchor_source,
     )
+
+
+def _final_transcript_event(
+    *,
+    start_time: float = 0.2,
+    end_time: float = 0.8,
+    speech_start_time: float | None = None,
+) -> SpeechEvent:
+    return SpeechEvent(
+        type=SpeechEventType.FINAL_TRANSCRIPT,
+        alternatives=[
+            SpeechData(
+                language="ko",
+                text="안녕하세요",
+                start_time=start_time,
+                end_time=end_time,
+            )
+        ],
+        speech_start_time=speech_start_time,
+    )
+
+
+def test_stt_timestamp_anchor_uses_speech_data_offsets() -> None:
+    recognition = _recognition()
+    recognition._input_started_at = 100.0
+
+    applied = recognition._apply_stt_timestamp_anchor(_final_transcript_event())
+
+    assert applied is True
+    assert recognition._speech_start_time == 100.2
+    assert recognition._last_speaking_time == 100.8
+    assert recognition._speech_anchor_source == "stt_timestamp"
+
+
+def test_stt_timestamp_anchor_keeps_existing_vad_anchor() -> None:
+    recognition = _recognition()
+    recognition._input_started_at = 100.0
+    recognition._speech_start_time = 120.0
+    recognition._last_speaking_time = 123.0
+    recognition._speech_anchor_source = "vad"
+
+    applied = recognition._apply_stt_timestamp_anchor(_final_transcript_event())
+
+    assert applied is False
+    assert recognition._speech_start_time == 120.0
+    assert recognition._last_speaking_time == 123.0
+    assert recognition._speech_anchor_source == "vad"
+
+
+def test_stt_timestamp_anchor_stays_missing_without_offsets() -> None:
+    recognition = _recognition()
+    recognition._input_started_at = 100.0
+
+    applied = recognition._apply_stt_timestamp_anchor(
+        _final_transcript_event(start_time=0.0, end_time=0.0)
+    )
+
+    assert applied is False
+    assert recognition._speech_start_time is None
+    assert recognition._last_speaking_time is None
+    assert recognition._speech_anchor_source == "missing"
 
 
 def test_vad_end_does_not_create_response_latency_anchor() -> None:

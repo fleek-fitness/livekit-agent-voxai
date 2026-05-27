@@ -7,7 +7,7 @@ import time
 from collections import deque
 from collections.abc import AsyncIterable, Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from opentelemetry import trace
 from opentelemetry.sdk.trace import ReadableSpan
@@ -53,6 +53,7 @@ class _EndOfTurnInfo:
     stopped_speaking_at: float | None
     transcription_delay: float | None
     end_of_turn_delay: float | None
+    speech_anchor_source: Literal["vad", "stt_timestamp", "missing"]
 
 
 @dataclass
@@ -161,6 +162,7 @@ class AudioRecognition:
         self._final_transcript_clock_suppressed = False
         self._last_speaking_time: float | None = None
         self._speech_start_time: float | None = None
+        self._speech_anchor_source: Literal["vad", "stt_timestamp", "missing"] = "missing"
 
         # used for manual commit_user_turn
         self._final_transcript_received = asyncio.Event()
@@ -868,6 +870,7 @@ class AudioRecognition:
                 # no return here to allow the new event to be processed normally
 
         if ev.type == stt.SpeechEventType.FINAL_TRANSCRIPT:
+            alt = ev.alternatives[0]
             transcript = ev.alternatives[0].text
             language = ev.alternatives[0].language
             confidence = ev.alternatives[0].confidence
@@ -903,13 +906,10 @@ class AudioRecognition:
             self._audio_interim_transcript = ""
             self._audio_preflight_transcript = ""
 
-            if not self._vad or self._last_speaking_time is None:
-                # vad disabled, use stt timestamp
-                # TODO: this would screw up transcription latency metrics
-                # but we'll live with it for now.
-                # the correct way is to ensure STT fires SpeechEventType.END_OF_SPEECH
-                # and using that timestamp for _last_speaking_time
-                self._last_speaking_time = time.time()
+            if self._last_speaking_time is None:
+                if not self._apply_stt_timestamp_anchor(ev) and not self._vad:
+                    self._last_speaking_time = time.time()
+                    self._speech_anchor_source = "missing"
 
             if self._vad_base_turn_detection or self._user_turn_committed:
                 if transcript_changed:
@@ -1002,6 +1002,7 @@ class AudioRecognition:
             self._user_turn_committed = True
             if not self._vad or self._last_speaking_time is None:
                 self._last_speaking_time = time.time()
+                self._speech_anchor_source = "missing"
 
             chat_ctx = self._hooks.retrieve_chat_ctx().copy()
             self._run_eou_detection(chat_ctx)
@@ -1027,6 +1028,7 @@ class AudioRecognition:
             speech_start_time = time.time() - ev.speech_duration - ev.inference_duration
             if not self._vad_speech_started:
                 self._speech_start_time = speech_start_time
+                self._speech_anchor_source = "vad"
                 self._vad_speech_started = True
 
             with trace.use_span(self._ensure_user_turn_span(start_time=speech_start_time)):
@@ -1046,6 +1048,7 @@ class AudioRecognition:
             # for metrics, get the "earliest" signal of speech as possible
             if ev.raw_accumulated_speech > 0.0:
                 self._last_speaking_time = time.time()
+                self._speech_anchor_source = "vad"
 
                 if self._speech_start_time is None:
                     self._speech_start_time = time.time() - ev.raw_accumulated_speech
@@ -1169,6 +1172,7 @@ class AudioRecognition:
             stopped_speaking_at = None
             transcription_delay = None
             end_of_turn_delay = None
+            speech_anchor_source: Literal["vad", "stt_timestamp", "missing"] = "missing"
 
             # sometimes, we can't calculate the metrics because VAD was unreliable.
             # in this case, we just ignore the calculation, it's better than providing likely wrong values
@@ -1182,6 +1186,7 @@ class AudioRecognition:
                 stopped_speaking_at = last_speaking_time
                 transcription_delay = max(last_final_transcript_time - last_speaking_time, 0)
                 end_of_turn_delay = time.time() - last_speaking_time
+                speech_anchor_source = self._speech_anchor_source
 
             committed = self._hooks.on_end_of_turn(
                 _EndOfTurnInfo(
@@ -1197,6 +1202,7 @@ class AudioRecognition:
                     end_of_turn_delay=end_of_turn_delay,
                     started_speaking_at=started_speaking_at,
                     stopped_speaking_at=stopped_speaking_at,
+                    speech_anchor_source=speech_anchor_source,
                 )
             )
             if committed:
@@ -1227,6 +1233,7 @@ class AudioRecognition:
                     self._speech_start_time = None
                     self._vad_speech_started = False
                     self._last_speaking_time = None
+                    self._speech_anchor_source = "missing"
 
             self._final_transcript_clock_suppressed = False
             self._user_turn_committed = False
@@ -1251,6 +1258,25 @@ class AudioRecognition:
         if self._speaking:
             return True
         return time.time() - self._last_speaking_time <= self._endpointing.max_delay
+
+    def _apply_stt_timestamp_anchor(self, ev: stt.SpeechEvent) -> bool:
+        if self._last_speaking_time is not None or not ev.alternatives:
+            return False
+
+        alt = ev.alternatives[0]
+        if self._input_started_at is None or alt.end_time <= 0:
+            return False
+
+        stt_start_time = ev.speech_start_time
+        stt_end_time = self._input_started_at + alt.end_time
+        if stt_start_time is None and alt.start_time > 0:
+            stt_start_time = self._input_started_at + alt.start_time
+
+        if self._speech_start_time is None:
+            self._speech_start_time = stt_start_time or stt_end_time
+        self._last_speaking_time = stt_end_time
+        self._speech_anchor_source = "stt_timestamp"
+        return True
 
     def _record_final_transcript_time(self) -> None:
         if not self._should_advance_final_transcript_clock():
