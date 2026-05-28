@@ -899,7 +899,7 @@ class AgentServer(utils.EventEmitter[EventTypes]):
 
             logger.info("draining worker", extra={"id": self.id, "timeout": timeout})
             self._draining = True
-            logger.info(
+            logger.debug(
                 "drain stage",
                 extra={
                     "id": self.id,
@@ -908,7 +908,7 @@ class AgentServer(utils.EventEmitter[EventTypes]):
                 },
             )
             await self._update_worker_status()
-            logger.info(
+            logger.debug(
                 "drain stage",
                 extra={
                     "id": self.id,
@@ -920,7 +920,7 @@ class AgentServer(utils.EventEmitter[EventTypes]):
             async def _drain() -> None:
                 # wait for in-flight availability tasks to finish launching their jobs
                 pending_tasks = [t for t in self._job_lifecycle_tasks if not t.done()]
-                logger.info(
+                logger.debug(
                     "drain stage",
                     extra={
                         "id": self.id,
@@ -930,7 +930,7 @@ class AgentServer(utils.EventEmitter[EventTypes]):
                     },
                 )
                 await asyncio.gather(*self._job_lifecycle_tasks, return_exceptions=True)
-                logger.info(
+                logger.debug(
                     "drain stage",
                     extra={"id": self.id, "stage": "job_lifecycle_tasks_done"},
                 )
@@ -938,7 +938,7 @@ class AgentServer(utils.EventEmitter[EventTypes]):
                 # then wait for the launched jobs to complete
                 while True:
                     procs = [p for p in self._proc_pool.processes if p.running_job]
-                    logger.info(
+                    logger.debug(
                         "drain stage",
                         extra={
                             "id": self.id,
@@ -950,7 +950,7 @@ class AgentServer(utils.EventEmitter[EventTypes]):
                     if not procs:
                         break
                     for proc in procs:
-                        logger.info(
+                        logger.debug(
                             "drain stage",
                             extra={
                                 "id": self.id,
@@ -959,7 +959,7 @@ class AgentServer(utils.EventEmitter[EventTypes]):
                             },
                         )
                         await proc.join()
-                        logger.info(
+                        logger.debug(
                             "drain stage",
                             extra={
                                 "id": self.id,
@@ -1083,7 +1083,7 @@ class AgentServer(utils.EventEmitter[EventTypes]):
 
         which = msg.WhichOneof("message")
         if self._draining or self._msg_chan.full():
-            logger.info(
+            logger.debug(
                 "worker message queue send start",
                 extra={
                     "id": self.id,
@@ -1095,7 +1095,7 @@ class AgentServer(utils.EventEmitter[EventTypes]):
             )
         await self._msg_chan.send(msg)
         if self._draining or self._msg_chan.full():
-            logger.info(
+            logger.debug(
                 "worker message queue send done",
                 extra={
                     "id": self.id,
