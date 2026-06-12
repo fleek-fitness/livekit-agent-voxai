@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import socket
 import sys
+import time
 from collections.abc import Coroutine
 from types import FrameType
 from typing import Callable
@@ -34,6 +35,7 @@ class _ProcClient:
         self._initialized = False
 
     def initialize(self) -> None:
+        start_time = time.perf_counter()
         try:
             cch = aio.duplex_unix._Duplex.open(self._mp_cch)
             first_req = recv_message(cch, IPC_MESSAGES)
@@ -43,16 +45,47 @@ class _ProcClient:
             )
 
             self._init_req = first_req
+            logger.info("process_init_step", extra={"step": "initialize_request_received"})
             try:
+                setup_start_time = time.perf_counter()
+                logger.info("process_init_step", extra={"step": "initialize_fnc_start"})
                 self._initialize_fnc(self._init_req, self)
+                logger.info(
+                    "process_init_step",
+                    extra={
+                        "step": "initialize_fnc_complete",
+                        "elapsed_time": round(time.perf_counter() - setup_start_time, 2),
+                    },
+                )
                 send_message(cch, InitializeResponse())
+                logger.info(
+                    "process_init_step",
+                    extra={
+                        "step": "initialize_response_sent",
+                        "elapsed_time": round(time.perf_counter() - start_time, 2),
+                    },
+                )
             except Exception as e:
+                logger.exception(
+                    "process_init_step_failed",
+                    extra={
+                        "step": "initialize_fnc_failed",
+                        "elapsed_time": round(time.perf_counter() - start_time, 2),
+                    },
+                )
                 send_message(cch, InitializeResponse(error=str(e)))
                 raise
 
             self._initialized = True
             cch.detach()
         except aio.duplex_unix.DuplexClosed as e:
+            logger.exception(
+                "process_init_step_failed",
+                extra={
+                    "step": "initialize_ipc_closed",
+                    "elapsed_time": round(time.perf_counter() - start_time, 2),
+                },
+            )
             raise RuntimeError("failed to initialize proc_client") from e
 
     def run(self) -> None:
@@ -165,6 +198,7 @@ def _dump_stack_traces_impl() -> None:
     dir: str = os.getenv("LK_DUMP_DIR", tempfile.gettempdir())
     Path(dir).mkdir(parents=True, exist_ok=True)
 
+    dump_path = None
     with tempfile.NamedTemporaryFile(
         mode="w",
         dir=dir,
@@ -172,6 +206,7 @@ def _dump_stack_traces_impl() -> None:
         prefix=f"livekit-agents-pid-{current_process().pid}-{time.time_ns()}-",
         suffix=".stacktrace",
     ) as f:
+        dump_path = f.name
         print(f"\n{'=' * 60}", file=f)
         print(
             f"Process {current_process().name} (pid {current_process().pid}) stack trace dump",
@@ -250,6 +285,9 @@ def _dump_stack_traces_impl() -> None:
             print(f"VMS: {memory_info.vms / (1024 * 1024):.2f} MB", file=f)
         except Exception:
             pass
+
+    if dump_path is not None:
+        print(f"livekit agents stack trace dumped to {dump_path}", file=sys.stderr, flush=True)
 
 
 def _dump_stack_traces(signum: int, _: FrameType | None) -> None:

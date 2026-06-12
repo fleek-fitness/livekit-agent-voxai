@@ -230,6 +230,14 @@ class SupervisedProc(ABC):
             self._initialize_fut.set_exception(
                 asyncio.TimeoutError("process initialization timed out")
             )
+            logger.error(
+                "process initialization timed out",
+                extra={
+                    **self.logging_extra(),
+                    "initialize_timeout": self._opts.initialize_timeout,
+                    "stack_trace_dump_enabled": self.enabled_stack_trace_dump,
+                },
+            )
             await self._send_dump_signal()
             await self._send_kill_signal()
             raise
