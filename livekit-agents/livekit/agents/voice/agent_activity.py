@@ -161,6 +161,20 @@ def _truncate_interruption_text(text: str | None, limit: int = 80) -> str | None
     return normalized[:limit] + "..."
 
 
+_BARGE_IN_SOURCE_ALIASES = {
+    "vad": "livekit_vad",
+    "vad_start": "livekit_vad_start",
+    "overlap": "livekit_overlap",
+    "interim": "main_stt_interim",
+    "preflight": "main_stt_preflight",
+    "final": "main_stt_final",
+}
+
+
+def _barge_in_source(source: str) -> str:
+    return _BARGE_IN_SOURCE_ALIASES.get(source, source or "unknown")
+
+
 @dataclass
 class _OnEnterData:
     session: AgentSession
@@ -207,6 +221,7 @@ class _PausedSpeechInfo:
     handle: SpeechHandle
     agent_state: AgentState
     timeout: float
+    source: str | None = None
 
 
 # NOTE: AgentActivity isn't exposed to the public API
@@ -262,6 +277,7 @@ class AgentActivity(RecognitionHooks):
         self._agent_ttft_by_speech: dict[str, float] = {}
         self._user_speech_started_during_interruptible_agent_speech = False
         self._dynamic_interruption = DynamicInterruptionManager(self._opts)
+        self._barge_in_source_event_keys: set[tuple[str, str, str | None]] = set()
 
         if (
             isinstance(self.llm, llm.RealtimeModel)
@@ -1913,23 +1929,70 @@ class AgentActivity(RecognitionHooks):
                 if text_hint is not None and opts.interruption_ignore_words
                 else None
             )
-            if dyn_min_words > 0:
-                # TODO(long): better word splitting for multi-language
-                if word_count < dyn_min_words:
-                    return
-
-            # voxai: interruption ignore words
+            short_transcript = dyn_min_words > 0 and word_count < dyn_min_words
+            is_empty = text.strip() == ""
             if opts.interruption_ignore_words:
-                is_empty = text.strip() == ""
-                if is_empty and dyn_min_words > 0:
-                    return
                 ignore_match = (
                     _matches_ignore_words(text, opts.interruption_ignore_words)
                     if not is_empty
                     else None
                 )
+            candidate_result = "candidate"
+            if short_transcript:
+                candidate_result = "min_words"
+            elif is_empty and dyn_min_words > 0 and opts.interruption_ignore_words:
+                candidate_result = "empty_interruption"
+            elif ignore_match:
+                candidate_result = "interruption_ignore_words"
+            self._log_barge_in_source_event(
+                "barge_in_source_candidate",
+                source=source,
+                text_hint=text_hint,
+                current_transcript=text,
+                dyn_min_words=dyn_min_words,
+                word_count=word_count,
+                ignore_match=ignore_match,
+                event_ignore_match=event_ignore_match,
+                once=True,
+                extra={
+                    "candidate_result": candidate_result,
+                    "has_current_speech": self._current_speech is not None,
+                    "agent_state": self._session.agent_state,
+                    "will_evaluate_current_speech": (
+                        self._current_speech is not None
+                        and not self._current_speech.interrupted
+                        and self._current_speech.allow_interruptions
+                    ),
+                },
+            )
+            if dyn_min_words > 0:
+                # TODO(long): better word splitting for multi-language
+                if short_transcript:
+                    return
+
+            # voxai: interruption ignore words
+            if opts.interruption_ignore_words:
+                if is_empty and dyn_min_words > 0:
+                    return
                 if ignore_match:
                     return
+        else:
+            self._log_barge_in_source_event(
+                "barge_in_source_candidate",
+                source=source,
+                text_hint=text_hint,
+                once=True,
+                extra={
+                    "candidate_result": "candidate",
+                    "has_current_speech": self._current_speech is not None,
+                    "agent_state": self._session.agent_state,
+                    "will_evaluate_current_speech": (
+                        self._current_speech is not None
+                        and not self._current_speech.interrupted
+                        and self._current_speech.allow_interruptions
+                    ),
+                },
+            )
 
         if self._rt_session is not None:
             self._rt_session.start_user_activity()
@@ -1963,11 +2026,29 @@ class AgentActivity(RecognitionHooks):
             # that reaches the speech-interrupt branch, regardless of pause vs
             # interrupt path; `reason` discriminates the two.
             will_pause = self._pause_enabled()
+            reason = "pause_current_speech" if will_pause else "interrupt_current_speech"
+            self._log_barge_in_source_event(
+                "barge_in_source_commit",
+                source=source,
+                text_hint=text_hint,
+                current_transcript=text,
+                dyn_min_words=dyn_min_words,
+                word_count=word_count,
+                ignore_match=ignore_match,
+                event_ignore_match=event_ignore_match,
+                once=True,
+                extra={
+                    "reason": reason,
+                    "will_pause": will_pause,
+                    "will_interrupt": True,
+                    "agent_state": self._session.agent_state,
+                },
+            )
             logger.info(
                 "interruption_candidate",
                 extra={
                     "source": source,
-                    "reason": "pause_current_speech" if will_pause else "interrupt_current_speech",
+                    "reason": reason,
                     "event_text": _truncate_interruption_text(text_hint),
                     "current_transcript": _truncate_interruption_text(text),
                     "dyn_min_words": dyn_min_words,
@@ -1985,7 +2066,7 @@ class AgentActivity(RecognitionHooks):
                 assert (timeout := interruption_options["false_interruption_timeout"]) is not None
                 assert (audio_output := self._session.output.audio) is not None
 
-                self._update_paused_speech(self._current_speech, timeout)
+                self._update_paused_speech(self._current_speech, timeout, source=source)
                 audio_output.pause()
                 self._session._update_agent_state("listening")
                 if self._audio_recognition:
@@ -2040,7 +2121,7 @@ class AgentActivity(RecognitionHooks):
             # resume immediately when user stops speaking, the timeout will be updated by _interrupt_by_audio_activity
             assert (audio_output := self._session.output.audio) is not None
 
-            self._update_paused_speech(current_speech, timeout=0)
+            self._update_paused_speech(current_speech, timeout=0, source="vad_start")
             audio_output.pause()
 
     def on_end_of_speech(self, ev: vad.VADEvent | None) -> None:
@@ -2297,10 +2378,42 @@ class AgentActivity(RecognitionHooks):
         ):
             opts = self._session.options
             min_words = self._get_dynamic_min_interruption_words()
-            if (
-                min_words > 0
-                and len(split_words(info.new_transcript, split_character=True)) < min_words
+            word_count = len(split_words(info.new_transcript, split_character=True))
+            final_ignore_match = (
+                _matches_ignore_words(info.new_transcript, opts.interruption_ignore_words)
+                if info.new_transcript.strip() and opts.interruption_ignore_words
+                else None
+            )
+            final_candidate_result = "candidate"
+            if min_words > 0 and word_count < min_words:
+                final_candidate_result = "min_words"
+            elif (
+                info.new_transcript.strip() == ""
+                and min_words > 0
+                and opts.interruption_ignore_words
             ):
+                final_candidate_result = "empty_interruption"
+            elif final_ignore_match:
+                final_candidate_result = "interruption_ignore_words"
+            self._log_barge_in_source_event(
+                "barge_in_source_candidate",
+                source="final",
+                text_hint=info.new_transcript,
+                current_transcript=info.new_transcript,
+                dyn_min_words=min_words,
+                word_count=word_count,
+                ignore_match=final_ignore_match,
+                event_ignore_match=final_ignore_match,
+                once=True,
+                extra={
+                    "candidate_result": final_candidate_result,
+                    "delayed_interruption_context": delayed_interruption_context,
+                    "has_current_speech": self._current_speech is not None,
+                    "agent_state": self._session.agent_state,
+                    "will_evaluate_current_speech": current_speech_interruptible,
+                },
+            )
+            if min_words > 0 and word_count < min_words:
                 self._cancel_preemptive_generation(reason="min_interruption_words")
                 # avoid interruption if the new_transcript is too short
                 if delayed_interruption_context:
@@ -2321,9 +2434,7 @@ class AgentActivity(RecognitionHooks):
                             reason="empty_interruption",
                         )
                     return False
-                if (not is_empty) and _matches_ignore_words(
-                    info.new_transcript, opts.interruption_ignore_words
-                ):
+                if (not is_empty) and final_ignore_match:
                     self._cancel_preemptive_generation(reason="interruption_ignore_words")
                     if delayed_interruption_context:
                         return self._consume_delayed_interruption_turn(
@@ -2331,6 +2442,23 @@ class AgentActivity(RecognitionHooks):
                             reason="interruption_ignore_words",
                         )
                     return False
+            self._log_barge_in_source_event(
+                "barge_in_source_commit",
+                source="final",
+                text_hint=info.new_transcript,
+                current_transcript=info.new_transcript,
+                dyn_min_words=min_words,
+                word_count=word_count,
+                ignore_match=final_ignore_match,
+                event_ignore_match=final_ignore_match,
+                once=True,
+                extra={
+                    "reason": "commit_user_turn",
+                    "delayed_interruption_context": delayed_interruption_context,
+                    "will_interrupt": current_speech_interruptible,
+                    "agent_state": self._session.agent_state,
+                },
+            )
 
         old_task = self._user_turn_completed_atask
         self._user_turn_completed_atask = self._create_speech_task(
@@ -3898,11 +4026,13 @@ class AgentActivity(RecognitionHooks):
                     f"Tool reply cannot be prevented when using {self.llm._label}, it generates reply automatically."
                 )
 
-    def _update_paused_speech(self, speech_handle: SpeechHandle, timeout: float) -> None:
+    def _update_paused_speech(
+        self, speech_handle: SpeechHandle, timeout: float, *, source: str | None = None
+    ) -> None:
         """Record that ``speech_handle`` is paused.
 
         If already paused for this handle, only ``timeout`` is updated — the
-        ``agent_state`` captured at first pause is preserved, so the resume
+        ``agent_state`` and source captured at first pause are preserved, so the resume
         path restores the correct state even across multiple calls.
         """
         if self._paused_speech and self._paused_speech.handle is speech_handle:
@@ -3912,6 +4042,7 @@ class AgentActivity(RecognitionHooks):
                 handle=speech_handle,
                 agent_state=self._session.agent_state,
                 timeout=timeout,
+                source=source,
             )
 
     def _pause_enabled(self) -> bool:
@@ -3954,6 +4085,12 @@ class AgentActivity(RecognitionHooks):
                 resumed = True
                 logger.debug("resumed false interrupted speech", extra={"timeout": timeout})
 
+            self._log_barge_in_source_event(
+                "barge_in_source_false_interrupt",
+                source=self._paused_speech.source or "unknown",
+                once=False,
+                extra={"resumed": resumed, "timeout": timeout},
+            )
             self._session.emit(
                 "agent_false_interruption", AgentFalseInterruptionEvent(resumed=resumed)
             )
@@ -4027,6 +4164,74 @@ class AgentActivity(RecognitionHooks):
         self._interruption_by_audio_activity_enabled = (
             self._default_interruption_by_audio_activity_enabled
         )
+
+    def _log_barge_in_source_event(
+        self,
+        event: str,
+        *,
+        source: str,
+        text_hint: str | None = None,
+        current_transcript: str | None = None,
+        dyn_min_words: int = 0,
+        word_count: int = 0,
+        ignore_match: bool | None = None,
+        event_ignore_match: bool | None = None,
+        once: bool = False,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        try:
+            speech = self._current_speech or (
+                self._paused_speech.handle if self._paused_speech else None
+            )
+            speech_id = getattr(speech, "id", None)
+            source_name = _barge_in_source(source)
+            if once:
+                seen = getattr(self, "_barge_in_source_event_keys", None)
+                if seen is None:
+                    seen = set()
+                    self._barge_in_source_event_keys = seen
+                key = (event, source_name, speech_id)
+                if key in seen:
+                    return
+                seen.add(key)
+
+            metadata: dict[str, Any] = {
+                "source": source_name,
+                "raw_source": source,
+                "perf_ts": time.perf_counter(),
+                "wall_ts": time.time(),
+                "agent_activity_id": hex(id(self)),
+                "speech_id": speech_id,
+                "generation_id": getattr(speech, "_generation_id", None),
+                "event_text": _truncate_interruption_text(text_hint),
+                "current_transcript": _truncate_interruption_text(current_transcript),
+                "dyn_min_words": dyn_min_words,
+                "word_count": word_count,
+                "ignore_match": ignore_match,
+                "event_ignore_match": event_ignore_match,
+                **self._barge_in_context_fields(),
+            }
+            if extra:
+                metadata.update(extra)
+            logger.info(event, extra=metadata)
+        except Exception:
+            logger.debug("failed to emit barge-in source diagnostic", exc_info=True)
+
+    def _barge_in_context_fields(self) -> dict[str, Any]:
+        try:
+            context = self._session.userdata
+        except Exception:
+            context = None
+
+        call = getattr(context, "call", None)
+        current_agent_config = getattr(context, "current_agent_config", None)
+        agent_config = getattr(context, "agent_config", None)
+        return {
+            "call_id": getattr(call, "call_id", None),
+            "organization_id": getattr(call, "organization_id", None),
+            "agent_id": getattr(current_agent_config, "uid", None)
+            or getattr(agent_config, "uid", None),
+        }
 
     def _fallback_to_vad_interruption(self) -> None:
         """Degrade gracefully from adaptive interruption to VAD-based interruption.

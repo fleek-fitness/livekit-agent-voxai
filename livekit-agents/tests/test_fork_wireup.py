@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import logging
 import time
 from types import SimpleNamespace
 
@@ -34,6 +35,64 @@ def _activity(opts: SimpleNamespace) -> AgentActivity:
     activity._opts = opts
     activity._dynamic_interruption = DynamicInterruptionManager(opts)
     return activity
+
+
+class _DiagnosticSpeech:
+    id = "speech-test"
+    _generation_id = "speech-test_1"
+    allow_interruptions = True
+
+    def __init__(self) -> None:
+        self.interrupted = False
+
+    def interrupt(self) -> _DiagnosticSpeech:
+        self.interrupted = True
+        return self
+
+
+def _diagnostic_activity(
+    *,
+    transcript: str,
+    ignore_words: list[str] | None = None,
+    min_words: int = 0,
+) -> tuple[AgentActivity, _DiagnosticSpeech]:
+    opts = SimpleNamespace(
+        interruption={"min_words": min_words},
+        interruption_ignore_words=ignore_words or [],
+        enable_dynamic_interruption=False,
+        enable_adaptive_endpointing=False,
+    )
+    speech = _DiagnosticSpeech()
+    activity = AgentActivity.__new__(AgentActivity)
+    activity._opts = opts
+    activity._agent = SimpleNamespace(stt=object(), llm=None)
+    activity._session = SimpleNamespace(
+        options=opts,
+        stt=None,
+        llm=None,
+        agent_state="speaking",
+        _aec_warmup_remaining=0,
+        _aec_warmup_timer=None,
+        userdata=SimpleNamespace(
+            call=SimpleNamespace(call_id="call-1", organization_id="org-1"),
+            current_agent_config=SimpleNamespace(uid="agent-1"),
+        ),
+    )
+    activity._audio_recognition = SimpleNamespace(
+        current_transcript=transcript,
+        _endpointing=SimpleNamespace(overlapping=False),
+        on_start_of_speech=lambda **kwargs: None,
+        on_end_of_agent_speech=lambda **kwargs: None,
+    )
+    activity._interruption_by_audio_activity_enabled = True
+    activity._current_speech = speech
+    activity._paused_speech = None
+    activity._false_interruption_timer = None
+    activity._rt_session = None
+    activity._barge_in_source_event_keys = set()
+    activity._pause_enabled = lambda: False
+    activity._record_dynamic_continuation_collision = lambda: None
+    return activity, speech
 
 
 def _audio_recognition(opts: SimpleNamespace, multiplier: float) -> AudioRecognition:
@@ -125,6 +184,53 @@ def test_dynamic_interruption_enabled_consults_continuity_threshold() -> None:
     activity._dynamic_interruption.conversation_state.last_user_speech_end_time = time.time() - 3.0
     activity._capture_dynamic_continuity_at_speech_start()
     assert activity._get_dynamic_min_interruption_words() == 2
+
+
+def test_barge_in_source_candidate_logs_before_ignore_gate(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    activity, speech = _diagnostic_activity(transcript="네", ignore_words=["네"])
+    caplog.set_level(logging.INFO, logger="livekit.agents")
+
+    activity._interrupt_by_audio_activity(source="interim", text_hint="네")
+
+    assert speech.interrupted is False
+    candidate_records = [
+        record for record in caplog.records if record.message == "barge_in_source_candidate"
+    ]
+    commit_records = [
+        record for record in caplog.records if record.message == "barge_in_source_commit"
+    ]
+    assert len(candidate_records) == 1
+    assert candidate_records[0].source == "main_stt_interim"
+    assert candidate_records[0].candidate_result == "interruption_ignore_words"
+    assert candidate_records[0].ignore_match is True
+    assert candidate_records[0].call_id == "call-1"
+    assert commit_records == []
+
+
+def test_barge_in_source_commit_logs_once_for_eligible_candidate(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    activity, speech = _diagnostic_activity(transcript="예약 변경", ignore_words=["네"])
+    caplog.set_level(logging.INFO, logger="livekit.agents")
+
+    activity._interrupt_by_audio_activity(source="interim", text_hint="예약 변경")
+    activity._interrupt_by_audio_activity(source="interim", text_hint="예약 변경 다시")
+
+    assert speech.interrupted is True
+    candidate_records = [
+        record for record in caplog.records if record.message == "barge_in_source_candidate"
+    ]
+    commit_records = [
+        record for record in caplog.records if record.message == "barge_in_source_commit"
+    ]
+    assert len(candidate_records) == 1
+    assert len(commit_records) == 1
+    assert candidate_records[0].source == "main_stt_interim"
+    assert candidate_records[0].candidate_result == "candidate"
+    assert commit_records[0].source == "main_stt_interim"
+    assert commit_records[0].reason == "interrupt_current_speech"
 
 
 def test_adaptive_endpointing_disabled_no_multiplier() -> None:
