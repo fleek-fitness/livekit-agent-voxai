@@ -22,7 +22,9 @@ from livekit.agents.llm import (
 )
 from livekit.agents.llm.chat_context import ChatContext, ChatMessage
 from livekit.agents.stt import SpeechData, SpeechEvent, SpeechEventType
+from livekit.agents.tokenize.basic import split_words
 from livekit.agents.utils import aio
+from livekit.agents.voice.agent_activity import _matches_ignore_words
 from livekit.agents.voice.audio_recognition import AudioRecognition, _EndOfTurnInfo
 from livekit.agents.voice.endpointing import BaseEndpointing
 from livekit.agents.voice.events import FunctionToolsExecutedEvent
@@ -542,6 +544,66 @@ async def test_false_interruption_before_speaking_resumes() -> None:
     assert len(playback_finished_events) == 1
     assert playback_finished_events[0].interrupted is False
     check_timestamp(playback_finished_events[0].playback_position, 5.0, speed_factor=speed)
+
+
+async def test_ignore_word_resumes_paused_speech_before_false_timeout() -> None:
+    speed = 5.0
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.5, "Tell me a story.")
+    actions.add_llm("Here is a short reply.", ttft=0.05, duration=0.05)
+    actions.add_tts(5.0, ttfb=0.05, duration=0.05)
+    actions.add_user_speech(4.0, 4.6, "네", stt_delay=0.2)
+
+    session = create_session(
+        actions,
+        speed_factor=speed,
+        can_pause_audio=True,
+        extra_kwargs={"interruption_ignore_words": ["네", "예"]},
+        turn_handling={
+            "interruption": {
+                "min_words": 0,
+                "false_interruption_timeout": 5.0 / speed,
+            }
+        },
+    )
+    agent = MyAgent()
+
+    agent_state_events: list[AgentStateChangedEvent] = []
+    playback_finished_events: list[PlaybackFinishedEvent] = []
+    false_interruption_events: list[AgentFalseInterruptionEvent] = []
+    session.on("agent_state_changed", agent_state_events.append)
+    session.on("agent_false_interruption", false_interruption_events.append)
+    session.output.audio.on("playback_finished", playback_finished_events.append)
+
+    t_origin = await asyncio.wait_for(run_session(session, agent), timeout=SESSION_TIMEOUT)
+
+    resumed_events = [ev for ev in false_interruption_events if ev.resumed]
+    assert resumed_events
+    # VAD pauses at ~4.5s, the interim "네" arrives at ~4.7s. If this waited
+    # for the false-interruption timer, it would resume around 9.6s instead.
+    check_timestamp(resumed_events[0].created_at - t_origin, 4.7, speed_factor=speed)
+
+    transitions = [(ev.old_state, ev.new_state) for ev in agent_state_events]
+    assert ("speaking", "listening") in transitions
+    assert ("listening", "speaking") in transitions
+    assert len(playback_finished_events) == 1
+    assert playback_finished_events[0].interrupted is False
+    check_timestamp(playback_finished_events[0].playback_position, 5.0, speed_factor=speed)
+
+
+def test_ignore_words_do_not_match_arbitrary_single_character() -> None:
+    assert _matches_ignore_words("네", ["네", "예"]) is True
+    assert _matches_ignore_words("왜", ["네", "예"]) is False
+
+
+def test_hangul_split_character_counts_syllables() -> None:
+    assert [word for word, _, _ in split_words("안녕하세요", split_character=True)] == [
+        "안",
+        "녕",
+        "하",
+        "세",
+        "요",
+    ]
 
 
 async def test_generate_reply() -> None:
