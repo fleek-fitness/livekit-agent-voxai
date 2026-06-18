@@ -233,6 +233,43 @@ def test_barge_in_source_commit_logs_once_for_eligible_candidate(
     assert commit_records[0].reason == "interrupt_current_speech"
 
 
+def test_barge_in_source_sink_receives_candidate_and_commit() -> None:
+    activity, _speech = _diagnostic_activity(transcript="예약 변경", ignore_words=["네"])
+    seen: list[tuple[object, str, dict[str, object]]] = []
+    activity._session.userdata.barge_in_source_event_sink = (
+        lambda session, *, event, metadata: seen.append((session, event, metadata))
+    )
+
+    activity._interrupt_by_audio_activity(source="interim", text_hint="예약 변경")
+
+    assert [(event, metadata["source"]) for _, event, metadata in seen] == [
+        ("barge_in_source_candidate", "main_stt_interim"),
+        ("barge_in_source_commit", "main_stt_interim"),
+    ]
+    assert all(session is activity._session for session, _, _ in seen)
+    assert seen[0][2]["call_id"] == "call-1"
+    assert seen[1][2]["reason"] == "interrupt_current_speech"
+
+
+def test_barge_in_source_sink_failure_does_not_block_logging(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    activity, speech = _diagnostic_activity(transcript="예약 변경", ignore_words=["네"])
+    activity._session.userdata.barge_in_source_event_sink = (
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom"))
+    )
+    caplog.set_level(logging.INFO, logger="livekit.agents")
+
+    activity._interrupt_by_audio_activity(source="interim", text_hint="예약 변경")
+
+    assert speech.interrupted is True
+    assert [
+        record.message
+        for record in caplog.records
+        if record.message.startswith("barge_in_source_")
+    ] == ["barge_in_source_candidate", "barge_in_source_commit"]
+
+
 def test_adaptive_endpointing_disabled_no_multiplier() -> None:
     audio_recognition = _audio_recognition(
         _opts(enable_adaptive_endpointing=False),

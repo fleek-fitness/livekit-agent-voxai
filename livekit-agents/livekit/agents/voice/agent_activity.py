@@ -4213,6 +4213,13 @@ class AgentActivity(RecognitionHooks):
             }
             if extra:
                 metadata.update(extra)
+            try:
+                context = self._session.userdata
+                sink = getattr(context, "barge_in_source_event_sink", None)
+                if callable(sink):
+                    sink(self._session, event=event, metadata=dict(metadata))
+            except Exception:
+                logger.debug("failed to publish barge-in source diagnostic", exc_info=True)
             logger.info(event, extra=metadata)
         except Exception:
             logger.debug("failed to emit barge-in source diagnostic", exc_info=True)
