@@ -22,10 +22,12 @@ def split_words(
     words: list[tuple[str, int, int]] = []
 
     # CJK: \u4e00-\u9fff, \u3040-\u30ff, \u3400-\u4dbf
+    # Hangul: \uac00-\ud7a3
     # Thai: \u0E00-\u0E7F
     char_based_codes = (
         re.compile(
             r"[\u4e00-\u9fff\u3040-\u30ff\u3400-\u4dbf"  # CJK scripts
+            r"\uac00-\ud7a3"  # Hangul syllables
             r"\u0E00-\u0E7F]"  # Thai
         )
         if split_character
