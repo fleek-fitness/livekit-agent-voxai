@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import math
 import time
 from collections import deque
 from collections.abc import AsyncIterable, Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from opentelemetry import trace
 from opentelemetry.sdk.trace import ReadableSpan
@@ -49,6 +50,7 @@ class _EndOfTurnInfo:
     """If True, a reply was already triggered and should be skipped after end of turn detection."""
     new_transcript: str
     transcript_confidence: float
+    transcript_clock_suppressed: bool
 
     # metrics report
     started_speaking_at: float | None
@@ -62,6 +64,7 @@ class _PreemptiveGenerationInfo:
     new_transcript: str
     transcript_confidence: float
     started_speaking_at: float | None
+    trigger_source: Literal["preflight", "final_transcript"]
 
 
 @dataclass
@@ -172,6 +175,7 @@ class AudioRecognition:
         self._user_silence_ev.set()
 
         self._last_final_transcript_time: float | None = None
+        self._final_transcript_clock_suppressed = False
         self._last_speaking_time: float | None = None
         self._speech_start_time: float | None = None
 
@@ -254,6 +258,33 @@ class AudioRecognition:
                             self._end_of_turn_task.cancel()
                     self._end_of_turn_task = None
                     self._user_turn_committed = False
+
+    def _adaptive_endpointing_enabled(self) -> bool:
+        return bool(getattr(self._session.options, "enable_adaptive_endpointing", False))
+
+    def _apply_adaptive_endpointing_multiplier(self, endpointing_delay: float) -> float:
+        if not self._adaptive_endpointing_enabled():
+            return endpointing_delay
+
+        dyn_mgr = getattr(self._hooks, "_dynamic_interruption", None)
+        if dyn_mgr is None:
+            return endpointing_delay
+
+        try:
+            multiplier = float(dyn_mgr.get_endpointing_multiplier())
+        except Exception:
+            multiplier = 1.0
+
+        if multiplier <= 1.0:
+            return endpointing_delay
+
+        adjusted_delay = min(max(endpointing_delay, 1.0) * multiplier, self._endpointing.max_delay)
+        logger.debug(
+            "adaptive endpointing: multiplier=%s, delay=%s",
+            round(multiplier, 2),
+            round(adjusted_delay, 2),
+        )
+        return adjusted_delay
 
     def start(self, *, stt_pipeline: _STTPipeline | None = None) -> None:
         self.update_stt(self._stt, pipeline=stt_pipeline)
@@ -608,10 +639,35 @@ class AudioRecognition:
             await aio.cancel_and_wait(self._interruption_atask)
 
         if self._end_of_turn_task is not None:
-            try:
-                await self._end_of_turn_task
-            except asyncio.CancelledError:
-                pass
+            # voxai: log and handle cancelled EOU task gracefully during shutdown
+            end_of_turn_task = self._end_of_turn_task
+            logger.debug(
+                "AudioRecognition.aclose end_of_turn_task await start",
+                extra={
+                    "end_of_turn_task_done": end_of_turn_task.done(),
+                    "end_of_turn_task_cancelled": end_of_turn_task.cancelled(),
+                },
+            )
+            if end_of_turn_task.cancelled():
+                logger.debug("AudioRecognition.aclose end_of_turn_task already cancelled")
+            else:
+                try:
+                    # normal close completes in ms; bound the shield so a hung eou
+                    # task is cancelled+reaped here rather than orphaned at the outer
+                    # 60s aclose deadline.
+                    await asyncio.wait_for(asyncio.shield(end_of_turn_task), timeout=5.0)
+                except asyncio.TimeoutError:
+                    end_of_turn_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await end_of_turn_task
+                except asyncio.CancelledError:
+                    if end_of_turn_task.cancelled():
+                        logger.debug(
+                            "AudioRecognition.aclose end_of_turn_task cancelled during close"
+                        )
+                    else:
+                        raise
+            logger.debug("AudioRecognition.aclose end_of_turn_task await done")
 
         if self._backchannel_boundary_timer is not None:
             self._backchannel_boundary_timer.cancel()
@@ -721,6 +777,7 @@ class AudioRecognition:
         self._audio_preflight_transcript = ""
         self._final_transcript_confidence = []
         self._last_final_transcript_time = None
+        self._final_transcript_clock_suppressed = False
         self._speech_start_time = None
         self._last_speaking_time = None
         self._vad_speech_started = False
@@ -918,7 +975,7 @@ class AudioRecognition:
                 extra["transcript_delay"] = time.time() - self._last_speaking_time
             logger.debug("received user transcript", extra=extra)
 
-            self._last_final_transcript_time = time.time()
+            self._record_final_transcript_time()
             self._audio_transcript += f" {transcript}"
             self._audio_transcript = self._audio_transcript.lstrip()
             self._final_transcript_confidence.append(confidence)
@@ -945,6 +1002,7 @@ class AudioRecognition:
                                 else 0
                             ),
                             started_speaking_at=self._speech_start_time,
+                            trigger_source="final_transcript",
                         )
                     )
 
@@ -976,8 +1034,7 @@ class AudioRecognition:
                 extra={"user_transcript": transcript, "language": self._last_language},
             )
 
-            # still need to increment it as it's used for turn detection,
-            self._last_final_transcript_time = time.time()
+            self._record_final_transcript_time()
             # preflight transcript includes all pre-committed transcripts (including final transcript from the previous STT run)
             self._audio_preflight_transcript = (self._audio_transcript + " " + transcript).lstrip()
             self._audio_interim_transcript = transcript
@@ -993,6 +1050,7 @@ class AudioRecognition:
                         new_transcript=self._audio_preflight_transcript,
                         transcript_confidence=sum(confidence_vals) / len(confidence_vals),
                         started_speaking_at=self._speech_start_time,
+                        trigger_source="preflight",
                     )
                 )
 
@@ -1127,6 +1185,7 @@ class AudioRecognition:
             last_speaking_time: float | None = None,
             last_final_transcript_time: float | None = None,
             speech_start_time: float | None = None,
+            transcript_clock_suppressed: bool = False,
         ) -> None:
             endpointing_delay = self._endpointing.min_delay
             user_turn_span = self._ensure_user_turn_span()
@@ -1181,6 +1240,8 @@ class AudioRecognition:
                             }
                         )
 
+            endpointing_delay = self._apply_adaptive_endpointing_multiplier(endpointing_delay)
+
             extra_sleep = endpointing_delay
             if last_speaking_time:
                 extra_sleep += last_speaking_time - time.time()
@@ -1205,7 +1266,8 @@ class AudioRecognition:
             # sometimes, we can't calculate the metrics because VAD was unreliable.
             # in this case, we just ignore the calculation, it's better than providing likely wrong values
             if (
-                last_final_transcript_time is not None
+                not transcript_clock_suppressed
+                and last_final_transcript_time is not None
                 and last_speaking_time is not None
                 and speech_start_time is not None
             ):
@@ -1219,7 +1281,12 @@ class AudioRecognition:
                     skip_reply=skip_reply,
                     new_transcript=self._audio_transcript,
                     transcript_confidence=confidence_avg,
-                    transcription_delay=transcription_delay or 0,
+                    transcript_clock_suppressed=transcript_clock_suppressed,
+                    transcription_delay=(
+                        transcription_delay
+                        if transcription_delay is not None or transcript_clock_suppressed
+                        else 0
+                    ),
                     end_of_turn_delay=end_of_turn_delay,
                     started_speaking_at=started_speaking_at,
                     stopped_speaking_at=stopped_speaking_at,
@@ -1254,6 +1321,7 @@ class AudioRecognition:
                     self._vad_speech_started = False
                     self._last_speaking_time = None
 
+            self._final_transcript_clock_suppressed = False
             self._user_turn_committed = False
 
         if self._end_of_turn_task is not None:
@@ -1266,8 +1334,21 @@ class AudioRecognition:
                 self._last_speaking_time,
                 self._last_final_transcript_time,
                 self._user_turn_start,
+                self._final_transcript_clock_suppressed,
             )
         )
+
+    def _should_advance_final_transcript_clock(self) -> bool:
+        if self._last_speaking_time is None:
+            return True
+        if self._speaking:
+            return True
+        return time.time() - self._last_speaking_time <= self._endpointing.max_delay
+
+    def _record_final_transcript_time(self) -> None:
+        if not self._should_advance_final_transcript_clock():
+            self._final_transcript_clock_suppressed = True
+        self._last_final_transcript_time = time.time()
 
     def _check_user_turn_limit(self, transcript: str) -> None:
         """Check if the user turn exceeds configured limits.

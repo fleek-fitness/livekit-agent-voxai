@@ -23,11 +23,13 @@ from ..llm import (
 )
 from ..llm.chat_context import Instructions
 from ..log import logger
+from ..metrics import AgentLLMMetrics, ToolExecutionMetrics
 from ..telemetry import trace_types, tracer
 from ..types import USERDATA_TIMED_TRANSCRIPT, FlushSentinel, NotGivenOr
 from ..utils import aio
 from ..utils.aio import itertools
 from . import io
+from .events import MetricsCollectedEvent
 from .speech_handle import SpeechHandle
 from .tool_executor import _build_executor_map
 from .transcription.text_transforms import _apply_text_transforms
@@ -63,12 +65,15 @@ def perform_llm_inference(
     model_settings: ModelSettings,
     model: str | None = None,
     provider: str | None = None,
+    session: AgentSession | None = None,
 ) -> tuple[asyncio.Task[bool], _LLMGenerationData]:
     text_ch = aio.Chan[str | FlushSentinel]()
     function_ch = aio.Chan[llm.FunctionCall]()
     data = _LLMGenerationData(text_ch=text_ch, function_ch=function_ch)
     llm_task = asyncio.create_task(
-        _llm_inference_task(node, chat_ctx, tool_ctx, model_settings, data, model, provider)
+        _llm_inference_task(
+            node, chat_ctx, tool_ctx, model_settings, data, model, provider, session
+        )
     )
     llm_task.add_done_callback(lambda _: text_ch.close())
     llm_task.add_done_callback(lambda _: function_ch.close())
@@ -92,8 +97,11 @@ async def _llm_inference_task(
     data: _LLMGenerationData,
     model: str | None = None,
     provider: str | None = None,
+    session: AgentSession | None = None,
 ) -> bool:
     start_time = time.perf_counter()
+    agent_llm_start_time = time.time()
+    ttft_captured = False
     current_span = trace.get_current_span()
     data.started_fut.set_result(None)
 
@@ -128,10 +136,31 @@ async def _llm_inference_task(
     # tool_ctx here is ephemeral for this turn, and we allow manipulations
     tool_ctx.update_tools(tools)
     tools_snapshot = tools.copy()
+    node_exec_time = time.time() - agent_llm_start_time
+
+    def _emit_agent_ttft(agent_ttft: float) -> None:
+        if session is None:
+            return
+        metrics = AgentLLMMetrics(
+            timestamp=time.time(),
+            speech_id=None,
+            agent_ttft=agent_ttft,
+            llm_node_await=node_exec_time,
+        )
+        try:
+            if (activity := session._activity) is not None:
+                activity._on_metrics_collected(metrics)
+            else:
+                session.emit("metrics_collected", MetricsCollectedEvent(metrics=metrics))
+        except Exception:
+            pass
 
     if isinstance(llm_node, str):
         data.generated_text = llm_node
         text_ch.send_nowait(llm_node)
+        if llm_node.strip():
+            ttft_captured = True
+            _emit_agent_ttft(time.time() - agent_llm_start_time)
         current_span.set_attribute(trace_types.ATTR_RESPONSE_TEXT, data.generated_text)
         return True
 
@@ -148,6 +177,9 @@ async def _llm_inference_task(
             if isinstance(chunk, str):
                 data.generated_text += chunk
                 text_ch.send_nowait(chunk)
+                if not ttft_captured and chunk.strip():
+                    ttft_captured = True
+                    _emit_agent_ttft(time.time() - agent_llm_start_time)
 
             elif isinstance(chunk, ChatChunk):
                 if not chunk.delta:
@@ -182,6 +214,9 @@ async def _llm_inference_task(
                 if chunk.delta.content:
                     data.generated_text += chunk.delta.content
                     text_ch.send_nowait(chunk.delta.content)
+                    if not ttft_captured and chunk.delta.content.strip():
+                        ttft_captured = True
+                        _emit_agent_ttft(time.time() - agent_llm_start_time)
 
             elif isinstance(chunk, FlushSentinel):
                 text_ch.send_nowait(chunk)
@@ -590,8 +625,12 @@ async def _execute_tools_task(
     )
 
     tasks: list[asyncio.Task[Any]] = []
+    tool_exec_start = time.time()
+    executed_any_tool = False
+    tool_durations: dict[str, float] = {}
     try:
         async for fnc_call in function_stream:
+            executed_any_tool = True
             if tool_choice == "none":
                 logger.error(
                     "received a tool call with tool_choice set to 'none', ignoring",
@@ -747,9 +786,24 @@ async def _execute_tools_task(
                     # TODO(theomonnom): Add the agent handoff inside the current_span
                     _tool_completed(output)
 
+                started_at = time.time()
                 task = asyncio.create_task(
                     _traceable_fnc_tool(function_callable, fnc_call),
                     name=f"func_exec_{fnc_call.name}",  # task name is used for logging when the task is cancelled
+                )
+
+                def _record_tool_duration(
+                    _: asyncio.Future[Any], *, name: str, started_at: float
+                ) -> None:
+                    try:
+                        tool_durations[name] = time.time() - started_at
+                    except Exception:
+                        pass
+
+                task.add_done_callback(
+                    functools.partial(
+                        _record_tool_duration, name=fnc_call.name, started_at=started_at
+                    )
                 )
                 _set_activity_task_info(
                     task, speech_handle=speech_handle, function_call=fnc_call, inline_task=True
@@ -791,6 +845,20 @@ async def _execute_tools_task(
                 "tools execution completed",
                 extra={"speech_id": speech_handle.id},
             )
+        if executed_any_tool:
+            metrics = ToolExecutionMetrics(
+                timestamp=time.time(),
+                speech_id=None,
+                total_execution_time=time.time() - tool_exec_start,
+                tool_durations=tool_durations,
+            )
+            try:
+                if (activity := session._activity) is not None:
+                    activity._on_metrics_collected(metrics)
+                else:
+                    session.emit("metrics_collected", MetricsCollectedEvent(metrics=metrics))
+            except Exception:
+                pass
 
 
 @dataclass
