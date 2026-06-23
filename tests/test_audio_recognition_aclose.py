@@ -145,3 +145,16 @@ class TestAudioRecognitionAclose:
         # Both tasks are now done (not orphaned)
         assert commit_task.done()
         assert end_of_turn_task.done()
+
+    @pytest.mark.asyncio
+    async def test_aclose_clears_backchannel_boundary_timer(self):
+        audio_recognition = self._create_audio_recognition()
+        timer = MagicMock()
+        audio_recognition._backchannel_boundary_timer = timer
+        audio_recognition.backchannel_boundary_callback = MagicMock()
+
+        await audio_recognition.aclose()
+
+        timer.cancel.assert_called_once()
+        assert audio_recognition._backchannel_boundary_timer is None
+        assert audio_recognition.backchannel_boundary_callback is None

@@ -150,7 +150,14 @@ async def test_events_and_metrics() -> None:
     check_timestamp(agent_state_events[3].created_at - t_origin, 5.5, speed_factor=speed)
 
     # metrics
-    metrics_events = [ev for ev in metrics_events if ev.metrics.type != "vad_metrics"]
+    fork_metric_types = {
+        "agent_llm_metrics",
+        "response_latency_metrics",
+        "tool_execution_metrics",
+    }
+    metrics_events = [
+        ev for ev in metrics_events if ev.metrics.type not in ("vad_metrics", *fork_metric_types)
+    ]
     assert len(metrics_events) == 3
     assert metrics_events[0].metrics.type == "eou_metrics"
     check_timestamp(metrics_events[0].metrics.end_of_utterance_delay, 0.5, speed_factor=speed)
