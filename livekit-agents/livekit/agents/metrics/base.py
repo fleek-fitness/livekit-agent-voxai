@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class Metadata(BaseModel):
@@ -193,6 +193,38 @@ class AvatarMetrics(_BaseMetrics):
     metadata: Metadata | None = None
 
 
+# --- voxai custom: Extended metrics for adaptive endpointing & tooling visibility ---
+
+
+class ResponseLatencyMetrics(_BaseMetrics):
+    type: Literal["response_latency_metrics"] = "response_latency_metrics"
+    timestamp: float
+    speech_id: str | None = None
+    e2e_latency: float
+    eou_timestamp: float
+    first_audio_timestamp: float
+    metadata: Metadata | None = None
+
+
+class AgentLLMMetrics(_BaseMetrics):
+    type: Literal["agent_llm_metrics"] = "agent_llm_metrics"
+    timestamp: float
+    speech_id: str | None = None
+    agent_ttft: float | None = None
+    llm_node_await: float | None = None
+    request_id: str | None = None
+    metadata: Metadata | None = None
+
+
+class ToolExecutionMetrics(_BaseMetrics):
+    type: Literal["tool_execution_metrics"] = "tool_execution_metrics"
+    timestamp: float
+    speech_id: str | None = None
+    total_execution_time: float
+    tool_durations: dict[str, float] = Field(default_factory=dict)
+    metadata: Metadata | None = None
+
+
 AgentMetrics = (
     STTMetrics
     | LLMMetrics
@@ -202,4 +234,7 @@ AgentMetrics = (
     | RealtimeModelMetrics
     | InterruptionMetrics
     | AvatarMetrics
+    | ResponseLatencyMetrics
+    | AgentLLMMetrics
+    | ToolExecutionMetrics
 )
