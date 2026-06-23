@@ -793,7 +793,7 @@ async def _execute_tools_task(
                 )
 
                 def _record_tool_duration(
-                    _: asyncio.Task[Any], *, name: str, started_at: float
+                    _: asyncio.Future[Any], *, name: str, started_at: float
                 ) -> None:
                     try:
                         tool_durations[name] = time.time() - started_at
@@ -801,8 +801,8 @@ async def _execute_tools_task(
                         pass
 
                 task.add_done_callback(
-                    lambda task, name=fnc_call.name, started_at=started_at: _record_tool_duration(
-                        task, name=name, started_at=started_at
+                    functools.partial(
+                        _record_tool_duration, name=fnc_call.name, started_at=started_at
                     )
                 )
                 _set_activity_task_info(
