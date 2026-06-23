@@ -284,6 +284,7 @@ EventTypes = Literal[
     "conversation_item_added",
     "agent_false_interruption",
     "overlapping_speech",
+    "preemptive_generation_outcome",
     "function_tools_executed",
     "metrics_collected",
     "session_usage_updated",
@@ -350,6 +351,28 @@ class MetricsCollectedEvent(BaseModel):
 class SessionUsageUpdatedEvent(BaseModel):
     type: Literal["session_usage_updated"] = "session_usage_updated"
     usage: AgentSessionUsage
+    created_at: float = Field(default_factory=time.time)
+
+
+class PreemptiveGenerationOutcomeEvent(BaseModel):
+    type: Literal["preemptive_generation_outcome"] = "preemptive_generation_outcome"
+    outcome: Literal["reused", "discarded"]
+    """Whether a speculative generation was scheduled or thrown away."""
+
+    reason: str
+    """Stable machine-readable reason for the outcome."""
+
+    preemptive_lead_time: float
+    """Seconds elapsed since the preemptive generation was created."""
+
+    trigger_source: Literal["preflight", "final_transcript", "unknown"] = "unknown"
+    """Transcript source that created the speculative generation."""
+
+    speech_id: str | None = None
+    transcript_match: bool | None = None
+    chat_ctx_match: bool | None = None
+    tools_match: bool | None = None
+    tool_choice_match: bool | None = None
     created_at: float = Field(default_factory=time.time)
 
 
@@ -481,6 +504,7 @@ AgentEvent = Annotated[
     | AgentFalseInterruptionEvent
     | MetricsCollectedEvent
     | SessionUsageUpdatedEvent
+    | PreemptiveGenerationOutcomeEvent
     | ConversationItemAddedEvent
     | FunctionToolsExecutedEvent
     | SpeechCreatedEvent
