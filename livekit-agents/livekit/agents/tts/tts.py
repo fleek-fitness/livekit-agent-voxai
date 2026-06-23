@@ -759,7 +759,7 @@ class AudioEmitter:
         sample_rate: int,
         num_channels: int,
         mime_type: str,
-        frame_size_ms: int = 200,
+        frame_size_ms: int = 50,  # voxai: reduced from 200 to 50 for lower TTFB
         stream: bool = False,
     ) -> None:
         if self._started:
