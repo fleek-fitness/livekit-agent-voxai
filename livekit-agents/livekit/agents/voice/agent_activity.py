@@ -1445,6 +1445,13 @@ class AgentActivity(RecognitionHooks):
                 tool_choice_match=tool_choice_match,
             ),
         )
+        if outcome == "discarded":
+            # discarded preempts never reach the success-path ttft pop (which fires
+            # only when the reply's TTS metrics arrive); clear here to avoid leaking
+            # one _agent_ttft_by_speech entry per discarded preemptive generation.
+            discarded_speech_id = getattr(preemptive.speech_handle, "id", None)
+            if discarded_speech_id:
+                self._agent_ttft_by_speech.pop(discarded_speech_id, None)
 
     def _preemptive_generation_mismatch_reason(
         self,

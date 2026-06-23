@@ -200,6 +200,7 @@ def test_cancel_preemptive_generation_emits_discarded_outcome() -> None:
         emit=lambda event, payload: emitted.append((event, payload)),
     )
     activity._agent = SimpleNamespace(_reply_messages=["stale"], _reply_chat_ctx=object())
+    activity._agent_ttft_by_speech = {"speech-1": 0.5}
     activity._preemptive_generation = _preemptive_generation(
         transcript="예약 가능해요?",
         chat_ctx=llm.ChatContext.empty(),
@@ -217,6 +218,8 @@ def test_cancel_preemptive_generation_emits_discarded_outcome() -> None:
     assert activity._preemptive_generation is None
     assert activity._agent._reply_messages == []
     assert activity._agent._reply_chat_ctx is None
+    # discarding a preempt clears its agent-TTFT entry (no leak; finding-2 regression)
+    assert activity._agent_ttft_by_speech == {}
 
 
 def test_emit_preemptive_generation_reused_outcome() -> None:

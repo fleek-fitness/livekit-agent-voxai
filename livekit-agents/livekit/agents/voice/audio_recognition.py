@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import math
 import time
@@ -651,7 +652,14 @@ class AudioRecognition:
                 logger.debug("AudioRecognition.aclose end_of_turn_task already cancelled")
             else:
                 try:
-                    await asyncio.shield(end_of_turn_task)
+                    # normal close completes in ms; bound the shield so a hung eou
+                    # task is cancelled+reaped here rather than orphaned at the outer
+                    # 60s aclose deadline.
+                    await asyncio.wait_for(asyncio.shield(end_of_turn_task), timeout=5.0)
+                except asyncio.TimeoutError:
+                    end_of_turn_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await end_of_turn_task
                 except asyncio.CancelledError:
                     if end_of_turn_task.cancelled():
                         logger.debug(
