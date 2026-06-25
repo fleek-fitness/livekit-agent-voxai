@@ -234,6 +234,11 @@ class _JobProc:
 
                     self._start_job(msg)
                 if isinstance(msg, ShutdownRequest):
+                    self._emit_shutdown_trace(
+                        "shutdown_request_received",
+                        reason=getattr(msg, "reason", None),
+                        has_running_job=self.has_running_job,
+                    )
                     await self._client.send(ShutdownRequestAck())
 
                     if not self.has_running_job:
@@ -256,13 +261,44 @@ class _JobProc:
             self._inf_client.close()
 
         read_task = asyncio.create_task(_read_ipc_task(), name="job_ipc_read")
+        teardown_via_cancel = False
         try:
             await self._exit_proc_flag.wait()
+        except asyncio.CancelledError:
+            teardown_via_cancel = True
+            raise
         finally:
             # ensure cleanup on cancellation (e.g. parent channel closes)
+            job_task = self._job_task
+            self._emit_shutdown_trace(
+                "main_task_teardown",
+                via_cancel=teardown_via_cancel,
+                exit_flag_set=self._exit_proc_flag.is_set(),
+                job_task_running=job_task is not None and not job_task.done(),
+            )
             if self._job_task is not None:
                 await aio.cancel_and_wait(self._job_task)
             await aio.cancel_and_wait(read_task)
+
+    def _emit_shutdown_trace(self, event: str, **extra: object) -> None:
+        # voxai: why-cancel observability for job teardown. Emitted from the IPC
+        # message loop and the main-task teardown (which force-cancels an
+        # in-flight job_task). Pairs with `_log_shutdown_stage` so a cancelled
+        # `session.aclose()` can be traced to its trigger: a parent
+        # ShutdownRequest vs a dropped IPC channel cancelling the main task
+        # mid-shutdown (via_cancel=True, job_task_running=True).
+        job_id = None
+        job_ctx = getattr(self, "_job_ctx", None)
+        if job_ctx is not None:
+            try:
+                job_id = job_ctx.job.id
+            except Exception:
+                job_id = None
+        fields = {"event": event, "job_id": job_id, **extra}
+        field_text = " ".join(
+            f"{key}={value!r}" for key, value in fields.items() if value is not None
+        )
+        logger.info("job_proc_shutdown_trace %s", field_text)
 
     def _start_job(self, msg: StartJobRequest) -> None:
         if msg.running_job.fake_job:

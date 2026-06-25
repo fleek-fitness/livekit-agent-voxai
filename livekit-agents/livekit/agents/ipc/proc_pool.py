@@ -174,6 +174,10 @@ class ProcPool(utils.EventEmitter[EventTypes]):
                 self.emit("process_job_launched", proc)
                 return
             except Exception:
+                logger.warning(
+                    "closing job process: launch failed",
+                    extra=proc.logging_extra(),
+                )
                 close_task = asyncio.create_task(proc.aclose())
                 self._close_tasks.add(close_task)
                 close_task.add_done_callback(self._close_tasks.discard)
@@ -291,6 +295,10 @@ class ProcPool(utils.EventEmitter[EventTypes]):
                 await asyncio.sleep(0.1)
         except asyncio.CancelledError:
             await aio.cancel_and_wait(*self._spawn_tasks)
+            logger.info(
+                "draining job process pool: closing %d process(es)",
+                len(self._executors),
+            )
             await asyncio.gather(*[proc.aclose() for proc in self._executors])
             await asyncio.gather(*self._close_tasks)
             await asyncio.gather(*self._monitor_tasks)
