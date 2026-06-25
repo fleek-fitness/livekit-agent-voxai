@@ -308,6 +308,12 @@ class SupervisedProc(ABC):
             return
 
         self._closing = True
+        # voxai: who/why-cancel observability. Marks a parent-initiated graceful
+        # close of this job process (sends ShutdownRequest to the child). Pairs
+        # with the child's `shutdown_request_received` / `main_task_teardown`
+        # traces: absence of this line + child `via_cancel=True` means the close
+        # was NOT a graceful parent ShutdownRequest (IPC drop / kill instead).
+        logger.info("closing supervised job process", extra=self.logging_extra())
         with contextlib.suppress(duplex_unix.DuplexClosed):
             await channel.asend_message(self._pch, proto.ShutdownRequest())
 
