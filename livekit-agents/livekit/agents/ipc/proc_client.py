@@ -124,7 +124,34 @@ class _ProcClient:
                 self._main_task_fnc(ipc_ch), name="main_task_entrypoint"
             )
 
-            def _done_cb(_: asyncio.Task[None]) -> None:
+            exit_trigger: str | None = None
+
+            def _done_cb(task: asyncio.Task[None]) -> None:
+                nonlocal exit_trigger
+                if exit_trigger is None:
+                    # voxai: name the *immediate* trigger of a job teardown. The
+                    # first of read_task / health_check_task / main_task to finish
+                    # ends this monitor loop; the subsequent cancel_and_wait then
+                    # force-cancels a still-running main_task (and thus an in-flight
+                    # session.aclose()). Which task fired first is the sender:
+                    #   ipc_read     -> parent IPC channel closed (EOF / dropped)
+                    #   health_check -> parent ping timed out (parent unresponsive)
+                    #   main_task_entrypoint -> job finished on its own (graceful)
+                    # Pairs with `main_task_teardown` in job_proc_lazy_main:
+                    # via_cancel=True there + ipc_read here = parent dropped the
+                    # channel mid-shutdown.
+                    _trigger_names = {
+                        "ipc_read": "ipc_channel_closed",
+                        "health_check": "ping_timeout",
+                        "main_task_entrypoint": "main_task_done",
+                    }
+                    exit_trigger = _trigger_names.get(task.get_name(), task.get_name())
+                    logger.info(
+                        "proc_client_monitor_exit trigger=%r main_task_running=%r",
+                        exit_trigger,
+                        not main_task.done(),
+                    )
+
                 with contextlib.suppress(asyncio.InvalidStateError):
                     exit_flag.set()
 
