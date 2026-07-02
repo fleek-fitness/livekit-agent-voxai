@@ -1407,6 +1407,58 @@ async def test_silent_tool_call_pause_state_does_not_leak_into_tool_reply() -> N
     assert false_interruption_events[-1].resumed is True
 
 
+async def test_ignore_word_final_keeps_paused_speech() -> None:
+    """A backchannel final ("네") must resume the paused speech, not kill it.
+
+    Before the fix, on_final_transcript unconditionally cancelled the speech
+    pause: the paused speech was interrupted while the ignore-word gate in
+    on_end_of_turn dropped the transcript without a reply — dead air.
+    """
+    speed = 5.0
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.5, "Tell me a story.")
+    actions.add_llm("Here is a long story for you ... the end.")
+    actions.add_tts(10.0)  # playout starts at 3.5s
+
+    # Backchannel while the agent is speaking. The VAD pause fires before the
+    # transcript is known; the final arrives after end-of-speech.
+    actions.add_user_speech(5.0, 5.8, "네", stt_delay=0.3)
+
+    session = create_session(
+        actions,
+        speed_factor=speed,
+        can_pause_audio=True,
+        turn_handling={"interruption": {"false_interruption_timeout": 0.3 / speed}},
+        extra_kwargs={"interruption_ignore_words": ["네"]},
+    )
+    agent = MyAgent()
+
+    agent_state_events: list[AgentStateChangedEvent] = []
+    false_interruption_events: list[AgentFalseInterruptionEvent] = []
+    playback_finished_events: list[PlaybackFinishedEvent] = []
+    session.on("agent_state_changed", agent_state_events.append)
+    session.on("agent_false_interruption", false_interruption_events.append)
+    session.output.audio.on("playback_finished", playback_finished_events.append)
+
+    await asyncio.wait_for(run_session(session, agent), timeout=SESSION_TIMEOUT)
+
+    # the pause was recognized as a false interruption and playback resumed
+    assert false_interruption_events
+    assert false_interruption_events[-1].resumed is True
+    transitions = [(ev.old_state, ev.new_state) for ev in agent_state_events]
+    assert ("listening", "speaking") in transitions[transitions.index(("speaking", "listening")) :]
+
+    # the story played to completion and the backchannel produced no reply
+    # (the "네" transcript itself may still be flushed into the chat context
+    # during session drain — only a generated reply would be a regression)
+    assert playback_finished_events[-1].interrupted is False
+    assistant_messages = [
+        item for item in agent.chat_ctx.items if item.type == "message" and item.role == "assistant"
+    ]
+    assert len(assistant_messages) == 1
+    assert assistant_messages[-1].interrupted is False
+
+
 class FlushMultiSegmentAgent(Agent):
     """Agent whose llm_node flushes the reply into two segments via FlushSentinel."""
 

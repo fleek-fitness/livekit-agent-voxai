@@ -2267,6 +2267,20 @@ class AgentActivity(RecognitionHooks):
                 # schedule a resume timer if interrupted after end_of_speech
                 self._start_false_interruption_timer(timeout)
 
+        # voxai: an ignore-word final (backchannel like "네") never commits a turn,
+        # so interrupting the paused speech here would leave dead air — no resume
+        # and no reply. Keep the pause and its false-interruption timer alive so
+        # playback resumes instead.
+        if (
+            self._paused_speech is not None
+            and self._session.options.interruption_ignore_words
+            and _matches_ignore_words(
+                ev.alternatives[0].text,
+                self._session.options.interruption_ignore_words,
+            )
+        ):
+            return
+
         self._cancel_speech_pause_task = asyncio.create_task(
             self._cancel_speech_pause(old_task=self._cancel_speech_pause_task)
         )
