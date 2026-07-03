@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import time
+from collections import deque
 
 from google.protobuf.json_format import MessageToDict
 
@@ -32,6 +34,7 @@ class _ParticipantAudioOutput(io.AudioOutput):
         num_channels: int,
         track_publish_options: rtc.TrackPublishOptions,
         track_name: str = "roomio_audio",
+        fade_out_ms: int = 0,
     ) -> None:
         super().__init__(
             label="RoomIO",
@@ -55,6 +58,19 @@ class _ParticipantAudioOutput(io.AudioOutput):
         self._flush_task: asyncio.Task[None] | None = None
         self._interrupted_event = asyncio.Event()
         self._forwarding_task: asyncio.Task[None] | None = None
+
+        # voxai: fade-stop support. 0 keeps the stock instant clear_queue
+        # behavior bit-for-bit. When >0, a rolling copy of the last captured
+        # audio lets us replay the *dropped* queue content as a short gain
+        # ramp instead of cutting mid-phoneme.
+        self._fade_out_ms = max(0, int(fade_out_ms))
+        self._fade_in_ms = 80
+        self._sample_rate_hz = sample_rate
+        self._num_channels = num_channels
+        self._fade_ring: deque[rtc.AudioFrame] = deque()
+        self._fade_ring_duration = 0.0
+        self._fade_in_remaining = 0  # samples left to ramp in after resume
+        self._fade_tail_active = False
 
         self._pushed_duration: float = 0.0
 
@@ -162,7 +178,10 @@ class _ParticipantAudioOutput(io.AudioOutput):
                 queued_duration += self._audio_buf.recv_nowait().duration
 
             pushed_duration = max(pushed_duration - queued_duration, 0)
-            self._audio_source.clear_queue()
+            if self._fade_out_ms > 0:
+                pushed_duration += await self._play_fade_tail()
+            else:
+                self._audio_source.clear_queue()
             wait_for_playout.cancel()
         else:
             wait_for_interruption.cancel()
@@ -172,11 +191,109 @@ class _ParticipantAudioOutput(io.AudioOutput):
         self._first_frame_event.clear()
         self.on_playback_finished(playback_position=pushed_duration, interrupted=interrupted)
 
+    def _fade_ring_push(self, frame: rtc.AudioFrame) -> None:
+        """Keep a rolling copy of recently captured audio (~2x fade window)."""
+        self._fade_ring.append(frame)
+        self._fade_ring_duration += frame.duration
+        max_duration = self._fade_out_ms / 1000 * 2 + 0.25
+        while self._fade_ring and self._fade_ring_duration > max_duration:
+            self._fade_ring_duration -= self._fade_ring.popleft().duration
+
+    def _apply_fade_in(self, frame: rtc.AudioFrame) -> rtc.AudioFrame:
+        data = bytearray(frame.data)
+        samples = memoryview(data).cast("h")
+        total = int(self._fade_in_ms / 1000 * self._sample_rate_hz)
+        done = total - self._fade_in_remaining
+        n = min(len(samples) // self._num_channels, self._fade_in_remaining)
+        for i in range(n):
+            gain = 0.5 * (1 - math.cos(math.pi * (done + i) / total))
+            for ch in range(self._num_channels):
+                idx = i * self._num_channels + ch
+                samples[idx] = int(samples[idx] * gain)
+        self._fade_in_remaining -= n
+        return rtc.AudioFrame(
+            data=bytes(data),
+            sample_rate=frame.sample_rate,
+            num_channels=frame.num_channels,
+            samples_per_channel=frame.samples_per_channel,
+        )
+
+    async def _play_fade_tail(self) -> float:
+        """Replace the instant clear_queue with a short gain-ramped tail.
+
+        Clears the source queue immediately (same reactivity as stock), then
+        replays the first ``fade_out_ms`` of the *dropped* content from the
+        rolling ring copy with a cosine ramp to zero. Returns the tail
+        duration in seconds (audio actually heard).
+        """
+        if self._fade_tail_active:
+            # concurrent fade (e.g. hard interrupt landing mid pause-fade):
+            # drop whatever is left instead of fading the fade
+            self._audio_source.clear_queue()
+            return 0.0
+
+        queued = self._audio_source.queued_duration
+        self._audio_source.clear_queue()
+        if queued <= 0 or not self._fade_ring:
+            return 0.0
+        self._fade_tail_active = True
+
+        # the dropped content = last `queued` seconds of what we captured
+        dropped: list[rtc.AudioFrame] = []
+        acc = 0.0
+        for f in reversed(self._fade_ring):
+            dropped.append(f)
+            acc += f.duration
+            if acc >= queued:
+                break
+        dropped.reverse()
+
+        samples = bytearray()
+        skip = max(0.0, acc - queued)  # partial leading frame alignment
+        skip_samples = int(skip * self._sample_rate_hz) * self._num_channels * 2
+        for f in dropped:
+            samples.extend(f.data)
+        samples = samples[skip_samples:]
+
+        fade_samples = int(self._fade_out_ms / 1000 * self._sample_rate_hz)
+        view = memoryview(samples).cast("h")
+        n = min(len(view) // self._num_channels, fade_samples)
+        if n <= 0:
+            return 0.0
+        for i in range(n):
+            gain = 0.5 * (1 + math.cos(math.pi * i / n))
+            for ch in range(self._num_channels):
+                idx = i * self._num_channels + ch
+                view[idx] = int(view[idx] * gain)
+
+        tail = rtc.AudioFrame(
+            data=bytes(samples[: n * self._num_channels * 2]),
+            sample_rate=self._sample_rate_hz,
+            num_channels=self._num_channels,
+            samples_per_channel=n,
+        )
+        try:
+            await self._audio_source.capture_frame(tail)
+        except Exception:
+            logger.debug("fade tail capture failed", exc_info=True)
+            return 0.0
+        finally:
+            self._fade_tail_active = False
+        return n / self._sample_rate_hz
+
     async def _forward_audio(self) -> None:
         async for frame in self._audio_buf:
             if not self._playback_enabled.is_set():
-                self._audio_source.clear_queue()
+                if self._fade_out_ms > 0:
+                    await self._play_fade_tail()
+                else:
+                    self._audio_source.clear_queue()
                 await self._playback_enabled.wait()
+                if self._fade_out_ms > 0:
+                    # ramp the first frames back in so resume doesn't pop
+                    self._fade_in_remaining = int(
+                        self._fade_in_ms / 1000 * self._sample_rate_hz
+                    )
                 # TODO(long): save the frames in the queue and play them later
                 # TODO(long): ignore frames from previous syllable
 
@@ -190,6 +307,10 @@ class _ParticipantAudioOutput(io.AudioOutput):
             if not self._first_frame_event.is_set():
                 self._first_frame_event.set()
                 self.on_playback_started(created_at=time.time())
+            if self._fade_out_ms > 0:
+                if self._fade_in_remaining > 0:
+                    frame = self._apply_fade_in(frame)
+                self._fade_ring_push(frame)
             await self._audio_source.capture_frame(frame)
 
 
