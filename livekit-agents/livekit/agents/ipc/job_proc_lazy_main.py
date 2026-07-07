@@ -78,6 +78,11 @@ def proc_main(args: ProcStartArgs) -> None:
     log_handler = LogQueueHandler(log_cch)
     root_logger.addHandler(log_handler)
 
+    # voxai: parent's "initializing process" timestamp minus this one = child
+    # bootstrap (module import) time; the "process initialized" elapsed_time on
+    # the parent bundles bootstrap + prewarm, so this log lets us split them.
+    logger.debug("proc_main started")
+
     job_proc = _JobProc(
         args.initialize_process_fnc,
         args.job_entrypoint_fnc,
@@ -210,6 +215,8 @@ class _JobProc:
         return self._job_task is not None
 
     def initialize(self, init_req: InitializeRequest, client: _ProcClient) -> None:
+        import time
+
         self._client = client
         self._inf_client = _InfClient(client)
         self._job_proc = JobProcess(
@@ -217,7 +224,12 @@ class _JobProc:
             user_arguments=self._user_arguments,
             http_proxy=init_req.http_proxy or None,
         )
+        prewarm_start = time.perf_counter()
         self._initialize_process_fnc(self._job_proc)
+        logger.debug(
+            "user prewarm completed",
+            extra={"elapsed_time": round(time.perf_counter() - prewarm_start, 2)},
+        )
 
     @log_exceptions(logger=logger)
     async def entrypoint(self, cch: aio.ChanReceiver[Message]) -> None:

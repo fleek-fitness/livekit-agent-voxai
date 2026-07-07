@@ -713,7 +713,15 @@ class AgentServer(utils.EventEmitter[EventTypes]):
                 )
 
             if self._mp_ctx_str == "forkserver":
-                plugin_packages = [p.package for p in Plugin.registered_plugins] + ["av"]
+                # voxai: set_forkserver_preload() REPLACES CPython's default preload
+                # list ['__main__'], so keep "__main__" here — the forkserver then
+                # imports the user's main module once and forked job processes
+                # inherit the whole import closure via COW instead of re-importing
+                # it on every spawn.
+                plugin_packages = [p.package for p in Plugin.registered_plugins] + [
+                    "av",
+                    "__main__",
+                ]
                 logger.info("preloading plugins", extra={"packages": plugin_packages})
                 self._mp_ctx.set_forkserver_preload(plugin_packages)
 
