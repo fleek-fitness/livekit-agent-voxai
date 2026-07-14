@@ -41,6 +41,8 @@ class SpeechHandle:
         self._done_fut = asyncio.Future[None]()
         self._scheduled_fut = asyncio.Future[None]()
         self._authorize_event = asyncio.Event()
+        self._playout_allowed = asyncio.Event()
+        self._playout_allowed.set()
 
         self._generations: list[asyncio.Future[None]] = []
 
@@ -214,6 +216,7 @@ class SpeechHandle:
 
         if not self._interrupt_fut.done():
             self._interrupt_fut.set_result(None)
+            self._playout_allowed.set()
 
             def _on_timeout() -> None:
                 logger.error(

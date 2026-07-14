@@ -217,6 +217,7 @@ class _PausedSpeechInfo:
     handle: SpeechHandle
     agent_state: AgentState
     timeout: float
+    confirmed: bool = False
 
 
 # NOTE: AgentActivity isn't exposed to the public API
@@ -1621,11 +1622,21 @@ class AgentActivity(RecognitionHooks):
 
                 if self._paused_speech and self._paused_speech.handle is self._current_speech:
                     # clear paused speech after generation done
+                    resume_playout = (
+                        not self._paused_speech.confirmed
+                        and not self._paused_speech.handle.interrupted
+                    )
+                    if resume_playout:
+                        self._paused_speech.handle._playout_allowed.set()
                     self._paused_speech = None
                     if self._false_interruption_timer is not None:
                         self._false_interruption_timer.cancel()
                         self._false_interruption_timer = None
-                    if (audio_output := self._session.output.audio) and audio_output.can_pause:
+                    if (
+                        resume_playout
+                        and (audio_output := self._session.output.audio)
+                        and audio_output.can_pause
+                    ):
                         audio_output.resume()
                 self._current_speech = None
                 last_playout_ts = time.time()
@@ -2857,12 +2868,16 @@ class AgentActivity(RecognitionHooks):
                     text_source = timed_texts
 
                 forward_audio_task, audio_out = perform_audio_forwarding(
-                    audio_output=audio_output, tts_output=tts_gen_data.audio_ch
+                    speech_handle=speech_handle,
+                    audio_output=audio_output,
+                    tts_output=tts_gen_data.audio_ch,
                 )
             else:
                 # use the provided audio
                 forward_audio_task, audio_out = perform_audio_forwarding(
-                    audio_output=audio_output, tts_output=audio
+                    speech_handle=speech_handle,
+                    audio_output=audio_output,
+                    tts_output=audio,
                 )
 
             audio_out.first_frame_fut.add_done_callback(_on_first_frame)
@@ -4135,6 +4150,7 @@ class AgentActivity(RecognitionHooks):
         ``agent_state`` captured at first pause is preserved, so the resume
         path restores the correct state even across multiple calls.
         """
+        speech_handle._playout_allowed.clear()
         if self._paused_speech and self._paused_speech.handle is speech_handle:
             self._paused_speech.timeout = timeout
         else:
@@ -4143,6 +4159,17 @@ class AgentActivity(RecognitionHooks):
                 agent_state=self._session.agent_state,
                 timeout=timeout,
             )
+
+    def confirm_paused_speech(self, speech_handle: SpeechHandle) -> bool:
+        """Prevent false-resume for the currently paused speech handle."""
+        if self._paused_speech is None or self._paused_speech.handle is not speech_handle:
+            return False
+
+        self._paused_speech.confirmed = True
+        if self._false_interruption_timer is not None:
+            self._false_interruption_timer.cancel()
+            self._false_interruption_timer = None
+        return True
 
     def _pause_enabled(self) -> bool:
         interruption_options = self._session.options.interruption
@@ -4154,6 +4181,8 @@ class AgentActivity(RecognitionHooks):
         )
 
     def _start_false_interruption_timer(self, timeout: float) -> None:
+        if self._paused_speech is not None and self._paused_speech.confirmed:
+            return
         if self._false_interruption_timer is not None:
             self._false_interruption_timer.cancel()
 
@@ -4180,6 +4209,7 @@ class AgentActivity(RecognitionHooks):
                     self._audio_recognition.on_start_of_agent_speech(started_at=time.time())
                 if self.interruption_enabled:
                     self._disable_vad_interruption_soon()
+                self._paused_speech.handle._playout_allowed.set()
                 audio_output.resume()
                 resumed = True
                 logger.debug("resumed false interrupted speech", extra={"timeout": timeout})
@@ -4214,17 +4244,16 @@ class AgentActivity(RecognitionHooks):
         if not self._paused_speech:
             return
 
-        if (
-            interrupt
-            and not self._paused_speech.handle.interrupted
-            and self._paused_speech.handle.allow_interruptions
-        ):
-            self._paused_speech.handle.interrupt()
+        paused_handle = self._paused_speech.handle
+
+        if interrupt and not paused_handle.interrupted and paused_handle.allow_interruptions:
+            paused_handle.interrupt()
             # ensure the generation is done — but only if a generation
             # was actually started; a paused speech that was never
             # authorized won't have an active generation future.
-            if self._paused_speech.handle._generations:
-                await self._paused_speech.handle._wait_for_generation()
+            if paused_handle._generations:
+                await paused_handle._wait_for_generation()
+        paused_handle._playout_allowed.set()
         self._paused_speech = None
 
         if (
