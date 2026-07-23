@@ -1856,7 +1856,7 @@ class AgentActivity(RecognitionHooks):
     ) -> None:
         if event.state == "active":
             if self._audio_recognition:
-                self._audio_recognition.set_interruption_detection_available(True)
+                self._audio_recognition._sync_interruption_detection()
             logger.info(
                 "adaptive interruption detector active",
                 extra={"previous_state": event.previous_state, "retry_count": event.retry_count},
@@ -1866,7 +1866,7 @@ class AgentActivity(RecognitionHooks):
         if event.state in ("connecting", "reconnecting"):
             self._restore_interruption_by_audio_activity()
             if self._audio_recognition:
-                self._audio_recognition.set_interruption_detection_available(False)
+                self._audio_recognition._sync_interruption_detection()
             logger.info(
                 "adaptive interruption detector unavailable; VAD owns interruption",
                 extra={

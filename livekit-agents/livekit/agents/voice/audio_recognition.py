@@ -42,6 +42,35 @@ if TYPE_CHECKING:
 MIN_LANGUAGE_DETECTION_LENGTH = 5
 # Mirrors turn_detector.base.MAX_HISTORY_TURNS for tracing
 _EOU_MAX_HISTORY_TURNS = 6
+_INTERRUPTION_STREAM_CLOSE_TIMEOUT = 1.0
+
+
+def _consume_interruption_stream_close(task: asyncio.Task[None]) -> None:
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logger.exception("adaptive interruption stream close failed")
+
+
+async def _close_interruption_stream(stream: Any) -> None:
+    close_task = asyncio.create_task(stream.aclose())
+    try:
+        done, _ = await asyncio.wait({close_task}, timeout=_INTERRUPTION_STREAM_CLOSE_TIMEOUT)
+    except asyncio.CancelledError:
+        close_task.cancel()
+        close_task.add_done_callback(_consume_interruption_stream_close)
+        raise
+    if not done:
+        close_task.cancel()
+        close_task.add_done_callback(_consume_interruption_stream_close)
+        logger.warning(
+            "adaptive interruption stream close timed out",
+            extra={"timeout_seconds": _INTERRUPTION_STREAM_CLOSE_TIMEOUT},
+        )
+        return
+    _consume_interruption_stream_close(close_task)
 
 
 @dataclass
@@ -201,10 +230,7 @@ class AudioRecognition:
         self._input_started_at: float | None = None
         self._ignore_user_transcript_until: NotGivenOr[float] = NOT_GIVEN
         self._transcript_buffer: deque[SpeechEvent] = deque()
-        self._interruption_ready: bool = (
-            interruption_detection is not None and interruption_detection.state == "active"
-        )
-        self._interruption_enabled: bool = self._interruption_ready and vad is not None
+        self._interruption_enabled: bool = self._adaptive_interruption_ready and vad is not None
         self._agent_speaking: bool = False
 
         _backchannel_boundary: float | tuple[float, float] | None = (
@@ -307,6 +333,13 @@ class AudioRecognition:
             and not self._interruption_ch.closed
         )
 
+    @property
+    def _adaptive_interruption_ready(self) -> bool:
+        return (
+            self._interruption_detection is not None
+            and self._interruption_detection.state == "active"
+        )
+
     # region: boundary for adaptive interruption detection
 
     @property
@@ -331,7 +364,7 @@ class AudioRecognition:
     # endregion
 
     def on_start_of_agent_speech(self, started_at: float) -> None:
-        if self._interruption_ready and not self._agent_speaking:
+        if self._adaptive_interruption_ready and not self._agent_speaking:
             self._interruption_enabled = self._vad is not None
         self._agent_speaking = True
         self._endpointing.on_start_of_agent_speech(started_at=started_at)
@@ -356,7 +389,7 @@ class AudioRecognition:
 
         if not self.adaptive_interruption_active:
             self._agent_speaking = False
-            if self._interruption_ready:
+            if self._adaptive_interruption_ready:
                 # A reconnect can complete while the agent is speaking. Start using
                 # the detector only after that speech finishes, at a clean boundary.
                 self._interruption_enabled = self._vad is not None
@@ -730,7 +763,7 @@ class AudioRecognition:
             self._vad_ch = None
             self._vad_stream = None
 
-        self._interruption_enabled = self._interruption_ready and self._vad is not None
+        self._interruption_enabled = self._adaptive_interruption_ready and self._vad is not None
 
     async def detach_stt(self) -> _STTPipeline | None:
         """Detach the STT pipeline for handoff to another AudioRecognition.
@@ -753,9 +786,6 @@ class AudioRecognition:
         self, interruption_detection: inference.AdaptiveInterruptionDetector | None
     ) -> None:
         self._interruption_detection = interruption_detection
-        self._interruption_ready = (
-            interruption_detection is not None and interruption_detection.state == "active"
-        )
         if interruption_detection is not None:
             self._interruption_ch = aio.Chan[inference.InterruptionDataFrameType]()
             self._interruption_atask = asyncio.create_task(
@@ -777,22 +807,18 @@ class AudioRecognition:
             flush_task.add_done_callback(lambda _: self._tasks.discard(flush_task))
             self._tasks.add(flush_task)
 
-        self._interruption_enabled = self._interruption_ready and self._vad is not None
+        self._interruption_enabled = self._adaptive_interruption_ready and self._vad is not None
 
-    def set_interruption_detection_available(self, available: bool) -> None:
+    def _sync_interruption_detection(self) -> None:
         """Switch interruption ownership without tearing down the detector stream."""
 
-        ready = (
-            available
-            and self._interruption_detection is not None
-            and self._interruption_detection.state == "active"
-        )
         was_enabled = self._interruption_enabled
-        self._interruption_ready = ready
         # Do not activate a freshly reconnected detector in the middle of agent
         # speech: it did not receive that speech's start sentinel.
         self._interruption_enabled = (
-            ready and self._vad is not None and not (self._agent_speaking and not was_enabled)
+            self._adaptive_interruption_ready
+            and self._vad is not None
+            and not (self._agent_speaking and not was_enabled)
         )
 
         if was_enabled and not self._interruption_enabled:
@@ -1494,7 +1520,7 @@ class AudioRecognition:
             return
         finally:
             await aio.cancel_and_wait(forward_task)
-            await stream.aclose()
+            await _close_interruption_stream(stream)
 
     def _ensure_user_turn_span(self, start_time: float | None = None) -> trace.Span:
         if self._user_turn_span and self._user_turn_span.is_recording():

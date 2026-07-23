@@ -29,6 +29,7 @@ from livekit.agents.llm import (
 from livekit.agents.llm.chat_context import ChatContext, ChatMessage
 from livekit.agents.stt import SpeechData, SpeechEvent, SpeechEventType
 from livekit.agents.utils import aio
+from livekit.agents.voice import audio_recognition as audio_recognition_module
 from livekit.agents.voice.agent_activity import AgentActivity
 from livekit.agents.voice.audio_recognition import AudioRecognition, _EndOfTurnInfo
 from livekit.agents.voice.endpointing import BaseEndpointing
@@ -912,7 +913,7 @@ async def test_reconnected_detector_waits_for_agent_speech_boundary() -> None:
 
     try:
         detector._set_state("active")
-        recognition.set_interruption_detection_available(True)
+        recognition._sync_interruption_detection()
         assert recognition.adaptive_interruption_active is False
 
         recognition.on_end_of_agent_speech(ignore_user_transcript_until=time.time())
@@ -939,7 +940,7 @@ async def test_detector_state_switches_interruption_owner() -> None:
                 retry_count=1,
             )
         )
-        audio_recognition.set_interruption_detection_available.assert_called_once_with(False)
+        audio_recognition._sync_interruption_detection.assert_called_once_with()
         assert activity._interruption_by_audio_activity_enabled is True
 
         audio_recognition.reset_mock()
@@ -950,7 +951,7 @@ async def test_detector_state_switches_interruption_owner() -> None:
                 retry_count=1,
             )
         )
-        audio_recognition.set_interruption_detection_available.assert_called_once_with(True)
+        audio_recognition._sync_interruption_detection.assert_called_once_with()
 
         fallback = Mock()
         activity._fallback_to_vad_interruption = fallback
@@ -965,6 +966,44 @@ async def test_detector_state_switches_interruption_owner() -> None:
         fallback.assert_called_once_with()
     finally:
         await _close_test_session(session)
+
+
+async def test_interruption_stream_close_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        audio_recognition_module,
+        "_INTERRUPTION_STREAM_CLOSE_TIMEOUT",
+        0.01,
+    )
+
+    class _CancellationResistantStream:
+        def __init__(self) -> None:
+            self.close_task: asyncio.Task[None] | None = None
+            self.cancelled = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def aclose(self) -> None:
+            self.close_task = asyncio.current_task()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                await self.release.wait()
+
+    stream = _CancellationResistantStream()
+    await asyncio.wait_for(
+        audio_recognition_module._close_interruption_stream(stream),
+        timeout=0.1,
+    )
+
+    try:
+        await asyncio.wait_for(stream.cancelled.wait(), timeout=0.1)
+        assert stream.close_task is not None and not stream.close_task.done()
+    finally:
+        stream.release.set()
+        if stream.close_task is not None:
+            await asyncio.wait_for(stream.close_task, timeout=0.1)
 
 
 async def test_vad_fallback_uses_next_vad_inference_event(
