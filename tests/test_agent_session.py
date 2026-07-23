@@ -789,6 +789,7 @@ def _active_adaptive_recognition() -> tuple[AgentSession, AudioRecognition]:
 
 async def test_agent_start_connects_vad_speech_that_started_before_playout() -> None:
     session, recognition = _active_adaptive_recognition()
+    recognition._speaking = True
     recognition._vad_speech_started = True
     recognition._speech_start_time = 100.0
 
@@ -811,6 +812,26 @@ async def test_agent_start_connects_vad_speech_that_started_before_playout() -> 
 async def test_agent_start_does_not_connect_vad_speech_that_already_ended() -> None:
     session, recognition = _active_adaptive_recognition()
     recognition._vad_speech_started = False
+    recognition._speech_start_time = 100.0
+
+    try:
+        recognition.on_start_of_agent_speech(started_at=100.7)
+
+        assert isinstance(
+            recognition._interruption_ch.recv_nowait(),
+            _AgentSpeechStartedSentinel,
+        )
+        assert recognition._interruption_ch.empty()
+    finally:
+        recognition._interruption_ch.close()
+        await _close_test_session(session)
+
+
+async def test_agent_start_does_not_connect_stale_vad_segment_after_stt_eos() -> None:
+    session, recognition = _active_adaptive_recognition()
+    recognition._turn_detection_mode = "stt"
+    recognition._speaking = False
+    recognition._vad_speech_started = True
     recognition._speech_start_time = 100.0
 
     try:

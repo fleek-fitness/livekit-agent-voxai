@@ -343,7 +343,7 @@ class AudioRecognition:
         if self.adaptive_interruption_active:
             self._interruption_ch.send_nowait(_AgentSpeechStartedSentinel())  # type: ignore[union-attr]
             # VAD may already be inside a user speech segment when playout starts.
-            if self._vad_speech_started and self._speech_start_time is not None:
+            if self._speaking and self._vad_speech_started and self._speech_start_time is not None:
                 speech_duration = max(0.0, started_at - self._speech_start_time)
                 logger.debug(
                     "agent speech started during active user VAD; continuing overlap inference",
