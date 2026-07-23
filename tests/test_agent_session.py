@@ -11,6 +11,7 @@ import pytest
 from livekit.agents import (
     Agent,
     AgentFalseInterruptionEvent,
+    AgentSession,
     AgentStateChangedEvent,
     ConversationItemAddedEvent,
     FlushSentinel,
@@ -22,6 +23,10 @@ from livekit.agents import (
     function_tool,
     inference,
     vad,
+)
+from livekit.agents.inference.interruption import (
+    _AgentSpeechStartedSentinel,
+    _OverlapSpeechStartedSentinel,
 )
 from livekit.agents.llm import (
     FunctionToolCall,
@@ -762,6 +767,86 @@ async def test_backchannel_boundary_suppresses_start_boundary_backchannel() -> N
         await recognition._on_overlap_speech_event(_interruption_event())
         assert len(hooks.interruptions) == 2
     finally:
+        await _close_test_session(session)
+
+
+def _active_adaptive_recognition() -> tuple[AgentSession, AudioRecognition]:
+    session = create_session(FakeActions())
+    detector = MagicMock()
+    detector.state = "active"
+    recognition = AudioRecognition(
+        session,
+        hooks=_TestRecognitionHooks(),
+        endpointing=BaseEndpointing(min_delay=0.1, max_delay=1.0),
+        stt=None,
+        vad=MagicMock(),
+        interruption_detection=detector,
+        turn_detection="vad",
+    )
+    recognition._interruption_ch = aio.Chan[inference.InterruptionDataFrameType]()
+    return session, recognition
+
+
+async def test_agent_start_connects_vad_speech_that_started_before_playout() -> None:
+    session, recognition = _active_adaptive_recognition()
+    recognition._vad_speech_started = True
+    recognition._speech_start_time = 100.0
+
+    try:
+        recognition.on_start_of_agent_speech(started_at=100.7)
+
+        agent_started = recognition._interruption_ch.recv_nowait()
+        overlap_started = recognition._interruption_ch.recv_nowait()
+        assert isinstance(agent_started, _AgentSpeechStartedSentinel)
+        assert isinstance(overlap_started, _OverlapSpeechStartedSentinel)
+        assert overlap_started._speech_duration == pytest.approx(0.7)
+        assert overlap_started._started_at == 100.7
+        assert overlap_started._user_speaking_span is session._user_speaking_span
+        assert recognition._interruption_ch.empty()
+    finally:
+        recognition._interruption_ch.close()
+        await _close_test_session(session)
+
+
+async def test_agent_start_does_not_connect_vad_speech_that_already_ended() -> None:
+    session, recognition = _active_adaptive_recognition()
+    recognition._vad_speech_started = False
+    recognition._speech_start_time = 100.0
+
+    try:
+        recognition.on_start_of_agent_speech(started_at=100.7)
+
+        assert isinstance(
+            recognition._interruption_ch.recv_nowait(),
+            _AgentSpeechStartedSentinel,
+        )
+        assert recognition._interruption_ch.empty()
+    finally:
+        recognition._interruption_ch.close()
+        await _close_test_session(session)
+
+
+async def test_vad_start_after_agent_uses_normal_overlap_path_once() -> None:
+    session, recognition = _active_adaptive_recognition()
+
+    try:
+        recognition.on_start_of_agent_speech(started_at=100.0)
+        assert isinstance(
+            recognition._interruption_ch.recv_nowait(),
+            _AgentSpeechStartedSentinel,
+        )
+
+        recognition.on_start_of_speech(
+            started_at=100.2,
+            speech_duration=0.05,
+        )
+        overlap_started = recognition._interruption_ch.recv_nowait()
+        assert isinstance(overlap_started, _OverlapSpeechStartedSentinel)
+        assert overlap_started._speech_duration == 0.05
+        assert overlap_started._started_at == 100.2
+        assert recognition._interruption_ch.empty()
+    finally:
+        recognition._interruption_ch.close()
         await _close_test_session(session)
 
 
