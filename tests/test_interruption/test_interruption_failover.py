@@ -241,12 +241,17 @@ class TestHttpLifecycle:
     async def test_stream_close_preserves_terminal_fallback(self) -> None:
         mock_session = AsyncMock(spec=aiohttp.ClientSession)
         detector = _create_detector(mock_session, use_proxy=False)
+        states = _collect_states(detector)
         stream = detector.stream(conn_options=CONN_OPTIONS)
         detector.fail(RuntimeError("terminal"))
+        detector._set_state("active")
 
         await stream.aclose()
 
         assert detector.state == "fallback"
+        assert [event.state for event in states] == ["fallback"]
+        with pytest.raises(RuntimeError, match="terminally failed"):
+            detector.stream(conn_options=CONN_OPTIONS)
 
 
 # ---------------------------------------------------------------------------

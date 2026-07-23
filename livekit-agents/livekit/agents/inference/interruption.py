@@ -414,6 +414,12 @@ class AdaptiveInterruptionDetector(
         retry_count: int = 0,
     ) -> None:
         previous_state = self._state
+        if previous_state == "fallback" and state != "fallback":
+            logger.debug(
+                "ignoring interruption detector state transition from terminal fallback",
+                extra={"requested_state": state, "reason": reason},
+            )
+            return
         if previous_state == state and state != "reconnecting":
             return
         self._state = state
@@ -451,6 +457,8 @@ class AdaptiveInterruptionDetector(
     def stream(
         self, *, conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS
     ) -> InterruptionHttpStream | InterruptionWebSocketStream:
+        if self._state == "fallback":
+            raise RuntimeError("adaptive interruption detector has terminally failed")
         if self._state == "closed":
             self._set_state("connecting" if self._opts.use_proxy else "active")
         try:
