@@ -732,7 +732,7 @@ class InterruptionStreamBase(ABC):
                     self._overlap_started = False
                     self._accumulated_samples = 0
                     self._overlap_started_at = None
-                    # we don't clear the cache here since responses might be in flight
+                    self._cache.clear()
                 case rtc.AudioFrame() if self._agent_speech_started:
                     samples_written = self._audio_buffer.push_frame(input_frame)
                     self._accumulated_samples += samples_written
@@ -1024,11 +1024,11 @@ class InterruptionWebSocketStream(InterruptionStreamBase):
                 await self._num_requests.increment()
                 created_at = perf_counter_ns()
                 header = struct.pack("<Q", created_at)  # 8 bytes
-                await ws.send_bytes(header + audio_data.tobytes())
                 self._cache[created_at] = InterruptionCacheEntry(
                     created_at=created_at,
                     speech_input=audio_data,
                 )
+                await ws.send_bytes(header + audio_data.tobytes())
 
             closing_ws = True
             msg = InterruptionWSSessionCloseMessage(
@@ -1090,61 +1090,63 @@ class InterruptionWebSocketStream(InterruptionStreamBase):
                         pass
                     case InterruptionWSDetectedMessage():
                         created_at = msg.created_at
-                        if (
-                            overlap_started_at := self._overlap_started_at
-                        ) is not None and self._overlap_started:
-                            entry = self._cache.set_or_update(
-                                created_at,
-                                lambda c=created_at: InterruptionCacheEntry(created_at=c),  # type: ignore[misc]
-                                total_duration=(perf_counter_ns() - created_at) / 1e9,
-                                probabilities=np.array(msg.probabilities, dtype=np.float32),
-                                is_interruption=True,
-                                prediction_duration=msg.prediction_duration,
-                                detection_delay=time.time() - overlap_started_at,
-                            )
-                            if self._user_speech_span:
-                                self._update_user_speech_span(self._user_speech_span, entry)
-                                self._user_speech_span = None
-                            logger.debug(
-                                "interruption detected",
-                                extra={
-                                    "total_duration": entry.get_total_duration(),
-                                    "prediction_duration": entry.get_prediction_duration(),
-                                    "detection_delay": entry.get_detection_delay(),
-                                    "probability": entry.get_probability(),
-                                },
-                            )
-                            ev = OverlappingSpeechEvent.from_cache_entry(
-                                entry=entry,
-                                is_interruption=True,
-                                started_at=overlap_started_at,
-                                ended_at=time.time(),
-                            )
-                            ev.num_requests = await self._num_requests.get_and_reset()
-                            self.send(ev)
-                            self._overlap_started = False
+                        overlap_started_at = self._overlap_started_at
+                        if overlap_started_at is None or not self._overlap_started:
+                            continue
+                        entry = self._cache.update_value(
+                            created_at,
+                            total_duration=(perf_counter_ns() - created_at) / 1e9,
+                            probabilities=np.array(msg.probabilities, dtype=np.float32),
+                            is_interruption=True,
+                            prediction_duration=msg.prediction_duration,
+                            detection_delay=time.time() - overlap_started_at,
+                        )
+                        if entry is None:
+                            continue
+                        if self._user_speech_span:
+                            self._update_user_speech_span(self._user_speech_span, entry)
+                            self._user_speech_span = None
+                        logger.debug(
+                            "interruption detected",
+                            extra={
+                                "total_duration": entry.get_total_duration(),
+                                "prediction_duration": entry.get_prediction_duration(),
+                                "detection_delay": entry.get_detection_delay(),
+                                "probability": entry.get_probability(),
+                            },
+                        )
+                        ev = OverlappingSpeechEvent.from_cache_entry(
+                            entry=entry,
+                            is_interruption=True,
+                            started_at=overlap_started_at,
+                            ended_at=time.time(),
+                        )
+                        ev.num_requests = await self._num_requests.get_and_reset()
+                        self.send(ev)
+                        self._overlap_started = False
                     case InterruptionWSInferenceDoneMessage():
                         created_at = msg.created_at
-                        if (
-                            overlap_started_at := self._overlap_started_at
-                        ) is not None and self._overlap_started:
-                            entry = self._cache.set_or_update(
-                                created_at,
-                                lambda c=created_at: InterruptionCacheEntry(created_at=c),  # type: ignore[misc]
-                                total_duration=(perf_counter_ns() - created_at) / 1e9,
-                                prediction_duration=msg.prediction_duration,
-                                probabilities=np.array(msg.probabilities, dtype=np.float32),
-                                is_interruption=False,
-                                detection_delay=time.time() - overlap_started_at,
-                            )
-                            logger.trace(
-                                "interruption inference done",
-                                extra={
-                                    "total_duration": entry.get_total_duration(),
-                                    "prediction_duration": entry.get_prediction_duration(),
-                                    "probability": entry.get_probability(),
-                                },
-                            )
+                        overlap_started_at = self._overlap_started_at
+                        if overlap_started_at is None or not self._overlap_started:
+                            continue
+                        entry = self._cache.update_value(
+                            created_at,
+                            total_duration=(perf_counter_ns() - created_at) / 1e9,
+                            prediction_duration=msg.prediction_duration,
+                            probabilities=np.array(msg.probabilities, dtype=np.float32),
+                            is_interruption=False,
+                            detection_delay=time.time() - overlap_started_at,
+                        )
+                        if entry is None:
+                            continue
+                        logger.trace(
+                            "interruption inference done",
+                            extra={
+                                "total_duration": entry.get_total_duration(),
+                                "prediction_duration": entry.get_prediction_duration(),
+                                "probability": entry.get_probability(),
+                            },
+                        )
                     case InterruptionWSErrorMessage():
                         raise APIStatusError(
                             f"LiveKit Adaptive Interruption returned error: {msg.code}",

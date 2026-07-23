@@ -26,6 +26,7 @@ from livekit.agents.inference.interruption import (
     InterruptionHttpStream,
     InterruptionWebSocketStream,
     _AgentSpeechStartedSentinel,
+    _OverlapSpeechEndedSentinel,
     _OverlapSpeechStartedSentinel,
 )
 from livekit.agents.types import APIConnectOptions
@@ -439,6 +440,58 @@ class TestWsLifecycle:
 
 
 class TestWsCacheTimeout:
+    @pytest.mark.asyncio
+    async def test_ignores_inflight_request_after_overlap_ends(self) -> None:
+        mock_session = AsyncMock(spec=aiohttp.ClientSession)
+        mock_ws = MagicMock(spec=aiohttp.ClientWebSocketResponse)
+        mock_ws.send_str = AsyncMock()
+        release_send = asyncio.Event()
+
+        async def _send_bytes(*_: object) -> None:
+            await release_send.wait()
+
+        mock_ws.send_bytes = AsyncMock(side_effect=_send_bytes)
+        mock_ws.closed = False
+        mock_ws.close_code = None
+        mock_ws.close = AsyncMock(return_value=True)
+
+        received_handshake = False
+
+        async def _receive_hang() -> aiohttp.WSMessage:
+            nonlocal received_handshake
+            if not received_handshake:
+                received_handshake = True
+                return aiohttp.WSMessage(
+                    type=aiohttp.WSMsgType.TEXT,
+                    data='{"type":"session.created"}',
+                    extra=None,
+                )
+            await asyncio.sleep(3600)
+            return aiohttp.WSMessage(type=aiohttp.WSMsgType.CLOSED, data=None, extra=None)
+
+        mock_ws.receive = _receive_hang
+        mock_session.ws_connect = AsyncMock(return_value=mock_ws)
+        detector = _create_detector(mock_session, use_proxy=True, inference_timeout=0.05)
+        stream = detector.stream(conn_options=CONN_OPTIONS)
+
+        stream.push_frame(_AgentSpeechStartedSentinel())
+        stream.push_frame(
+            _OverlapSpeechStartedSentinel(speech_duration=0.5, started_at=time.time())
+        )
+        stream.push_frame(_make_audio_frame())
+        try:
+            await asyncio.wait_for(_wait_until(lambda: bool(stream._cache)), timeout=1.0)
+            stream.push_frame(_OverlapSpeechEndedSentinel(ended_at=time.time()))
+            await asyncio.wait_for(_wait_until(lambda: not stream._cache), timeout=1.0)
+            release_send.set()
+            await asyncio.sleep(0.1)
+            assert not stream._cache
+            assert not stream._task.done()
+            assert detector.state == "active"
+        finally:
+            release_send.set()
+            await stream.aclose()
+
     @pytest.mark.asyncio
     async def test_times_out_without_another_audio_frame(self) -> None:
         mock_session = AsyncMock(spec=aiohttp.ClientSession)
