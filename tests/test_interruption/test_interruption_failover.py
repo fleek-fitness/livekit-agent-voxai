@@ -48,7 +48,11 @@ def _make_audio_frame(*, num_samples: int = 1600, sample_rate: int = 16000) -> r
 
 
 def _create_detector(
-    mock_session: AsyncMock, *, use_proxy: bool, inference_timeout: float = 0.1
+    mock_session: AsyncMock,
+    *,
+    use_proxy: bool,
+    inference_timeout: float = 0.1,
+    detection_interval: float = 0.1,
 ) -> AdaptiveInterruptionDetector:
     detector = AdaptiveInterruptionDetector(
         base_url="http://localhost:9999",
@@ -56,6 +60,7 @@ def _create_detector(
         api_secret="test-secret",
         http_session=mock_session,
         inference_timeout=inference_timeout,
+        detection_interval=detection_interval,
         transport="websocket" if use_proxy else "http",
     )
     return detector
@@ -440,6 +445,22 @@ class TestWsLifecycle:
 
 
 class TestWsCacheTimeout:
+    @pytest.mark.asyncio
+    async def test_request_cache_covers_timeout_window(self) -> None:
+        mock_session = AsyncMock(spec=aiohttp.ClientSession)
+        detector = _create_detector(
+            mock_session,
+            use_proxy=True,
+            inference_timeout=0.25,
+            detection_interval=0.01,
+        )
+        stream = detector.stream(conn_options=CONN_OPTIONS)
+
+        try:
+            assert stream._cache.maxsize == 27
+        finally:
+            await stream.aclose()
+
     @pytest.mark.asyncio
     async def test_preserves_current_overlap_detection_after_cache_eviction(self) -> None:
         mock_session = AsyncMock(spec=aiohttp.ClientSession)

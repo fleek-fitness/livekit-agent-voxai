@@ -510,7 +510,11 @@ class InterruptionStreamBase(ABC):
             dtype=np.int16,
             sample_rate=self._opts.sample_rate,
         )
-        self._cache = BoundedDict[int, InterruptionCacheEntry](maxsize=10)
+        request_cache_size = max(
+            10,
+            math.ceil(self._opts.inference_timeout / self._opts.detection_interval) + 2,
+        )
+        self._cache = BoundedDict[int, InterruptionCacheEntry](maxsize=request_cache_size)
         self._tee_aiter = aio.itertools.tee(self._event_ch, 2)
         self._event_aiter, monitor_aiter = self._tee_aiter
         self._metrics_task = asyncio.create_task(
