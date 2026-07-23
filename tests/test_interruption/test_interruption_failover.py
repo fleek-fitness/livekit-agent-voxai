@@ -223,6 +223,38 @@ class TestHttpNonRetryable:
 
 class TestHttpLifecycle:
     @pytest.mark.asyncio
+    async def test_retry_reactivates_stateless_transport(self) -> None:
+        mock_session = AsyncMock(spec=aiohttp.ClientSession)
+        mock_ctx = AsyncMock()
+        mock_ctx.__aenter__ = AsyncMock(
+            side_effect=aiohttp.ClientConnectionError("temporary outage")
+        )
+        mock_session.post.return_value = mock_ctx
+
+        detector = _create_detector(mock_session, use_proxy=False)
+        recovered = asyncio.Event()
+        states: list[InterruptionDetectionStateChangedEvent] = []
+
+        def _on_state(event: InterruptionDetectionStateChangedEvent) -> None:
+            states.append(event)
+            if event.previous_state == "reconnecting" and event.state == "active":
+                recovered.set()
+
+        detector.on("state_changed", _on_state)
+        stream = detector.stream(conn_options=CONN_OPTIONS)
+
+        stream.push_frame(_AgentSpeechStartedSentinel())
+        stream.push_frame(
+            _OverlapSpeechStartedSentinel(speech_duration=0.5, started_at=time.time())
+        )
+        stream.push_frame(_make_audio_frame())
+        try:
+            await asyncio.wait_for(recovered.wait(), timeout=1.0)
+            assert [event.state for event in states] == ["reconnecting", "active"]
+        finally:
+            await stream.aclose()
+
+    @pytest.mark.asyncio
     async def test_reopens_active_after_stream_close(self) -> None:
         mock_session = AsyncMock(spec=aiohttp.ClientSession)
         detector = _create_detector(mock_session, use_proxy=False)

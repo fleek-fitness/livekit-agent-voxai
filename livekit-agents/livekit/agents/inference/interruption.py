@@ -795,6 +795,10 @@ class InterruptionHttpStream(InterruptionStreamBase):
             self._opts.min_frames = math.ceil(min_interruption_duration * _FRAMES_PER_SECOND)
 
     async def _run(self) -> None:
+        # HTTP has no connection handshake. Once retry backoff finishes, the
+        # stream is ready to accept a new speech boundary and prediction.
+        self._model._set_state("active")
+
         async def _send_task(input_ch: aio.Chan[npt.NDArray[np.int16]]) -> None:
             async for data in input_ch:
                 if (
