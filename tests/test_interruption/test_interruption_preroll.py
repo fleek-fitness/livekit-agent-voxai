@@ -46,7 +46,6 @@ def _detector() -> AdaptiveInterruptionDetector:
         http_session=AsyncMock(spec=aiohttp.ClientSession),
         audio_prefix_duration=4 / _SAMPLE_RATE,
         detection_interval=1 / _SAMPLE_RATE,
-        transport="http",
     )
 
 
