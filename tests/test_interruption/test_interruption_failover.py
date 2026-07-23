@@ -221,6 +221,34 @@ class TestHttpNonRetryable:
         assert len(unrecoverable_errors) == 1
 
 
+class TestHttpLifecycle:
+    @pytest.mark.asyncio
+    async def test_reopens_active_after_stream_close(self) -> None:
+        mock_session = AsyncMock(spec=aiohttp.ClientSession)
+        detector = _create_detector(mock_session, use_proxy=False)
+
+        first_stream = detector.stream(conn_options=CONN_OPTIONS)
+        await first_stream.aclose()
+        assert detector.state == "closed"
+
+        second_stream = detector.stream(conn_options=CONN_OPTIONS)
+        try:
+            assert detector.state == "active"
+        finally:
+            await second_stream.aclose()
+
+    @pytest.mark.asyncio
+    async def test_stream_close_preserves_terminal_fallback(self) -> None:
+        mock_session = AsyncMock(spec=aiohttp.ClientSession)
+        detector = _create_detector(mock_session, use_proxy=False)
+        stream = detector.stream(conn_options=CONN_OPTIONS)
+        detector.fail(RuntimeError("terminal"))
+
+        await stream.aclose()
+
+        assert detector.state == "fallback"
+
+
 # ---------------------------------------------------------------------------
 # WebSocket stream tests
 # ---------------------------------------------------------------------------
@@ -310,9 +338,7 @@ class TestWsHandshake:
         assert detector.state == "connecting"
         stream = detector.stream(conn_options=CONN_OPTIONS)
         try:
-            await asyncio.wait_for(
-                _wait_until(lambda: detector.state == "active"), timeout=1.0
-            )
+            await asyncio.wait_for(_wait_until(lambda: detector.state == "active"), timeout=1.0)
             assert [event.state for event in states] == ["active"]
         finally:
             await stream.aclose()

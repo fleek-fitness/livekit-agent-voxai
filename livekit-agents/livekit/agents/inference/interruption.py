@@ -451,6 +451,8 @@ class AdaptiveInterruptionDetector(
     def stream(
         self, *, conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS
     ) -> InterruptionHttpStream | InterruptionWebSocketStream:
+        if self._state == "closed":
+            self._set_state("connecting" if self._opts.use_proxy else "active")
         try:
             stream: InterruptionHttpStream | InterruptionWebSocketStream
             if self._opts.use_proxy:
@@ -462,6 +464,11 @@ class AdaptiveInterruptionDetector(
             raise
         self._streams.add(stream)
         return stream
+
+    def _stream_closed(self, stream: InterruptionHttpStream | InterruptionWebSocketStream) -> None:
+        self._streams.discard(stream)
+        if not self._streams and self._state != "fallback":
+            self._set_state("closed")
 
     def update_options(
         self,
@@ -597,7 +604,7 @@ class InterruptionStreamBase(ABC):
             await self._metrics_task
         finally:
             await self._tee_aiter.aclose()
-            self._model._set_state("closed")
+            self._model._stream_closed(self)
 
     async def __anext__(self) -> OverlappingSpeechEvent:
         try:

@@ -416,8 +416,7 @@ class AgentActivity(RecognitionHooks):
     @property
     def interruption_enabled(self) -> bool:
         return self._interruption_detection_enabled and (
-            self._audio_recognition is None
-            or self._audio_recognition.adaptive_interruption_active
+            self._audio_recognition is None or self._audio_recognition.adaptive_interruption_active
         )
 
     @property

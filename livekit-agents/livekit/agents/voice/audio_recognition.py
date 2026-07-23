@@ -791,15 +791,13 @@ class AudioRecognition:
         self._interruption_ready = ready
         # Do not activate a freshly reconnected detector in the middle of agent
         # speech: it did not receive that speech's start sentinel.
-        self._interruption_enabled = ready and self._vad is not None and not (
-            self._agent_speaking and not was_enabled
+        self._interruption_enabled = (
+            ready and self._vad is not None and not (self._agent_speaking and not was_enabled)
         )
 
         if was_enabled and not self._interruption_enabled:
             self._cancel_backchannel_boundary()
-            flush_task = asyncio.create_task(
-                self._flush_held_transcripts(cooldown=0.0, force=True)
-            )
+            flush_task = asyncio.create_task(self._flush_held_transcripts(cooldown=0.0, force=True))
             flush_task.add_done_callback(lambda _: self._tasks.discard(flush_task))
             self._tasks.add(flush_task)
 

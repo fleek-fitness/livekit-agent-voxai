@@ -291,9 +291,7 @@ class _ParticipantAudioOutput(io.AudioOutput):
                 await self._playback_enabled.wait()
                 if self._fade_out_ms > 0:
                     # ramp the first frames back in so resume doesn't pop
-                    self._fade_in_remaining = int(
-                        self._fade_in_ms / 1000 * self._sample_rate_hz
-                    )
+                    self._fade_in_remaining = int(self._fade_in_ms / 1000 * self._sample_rate_hz)
                 # TODO(long): save the frames in the queue and play them later
                 # TODO(long): ignore frames from previous syllable
 
