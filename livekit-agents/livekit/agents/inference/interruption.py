@@ -524,6 +524,7 @@ class InterruptionStreamBase(ABC):
         self._sample_rate = self._opts.sample_rate
 
         self._overlap_started_at: float | None = None
+        self._overlap_request_boundary_ns: int | None = None
         self._user_speech_span: trace.Span | None = None
         self._agent_speech_started: bool = False
         self._overlap_started: bool = False
@@ -573,6 +574,7 @@ class InterruptionStreamBase(ABC):
                     self._cache.clear()
                     self._overlap_started = False
                     self._overlap_started_at = None
+                    self._overlap_request_boundary_ns = None
                     self._user_speech_span = None
                     await self._num_requests.set(0)
 
@@ -666,6 +668,7 @@ class InterruptionStreamBase(ABC):
         async def _reset_state() -> None:
             self._agent_speech_started = False
             self._overlap_started = False
+            self._overlap_request_boundary_ns = None
             self._overlap_count = 0
             self._accumulated_samples = 0
             await self._num_requests.set(0)
@@ -686,6 +689,7 @@ class InterruptionStreamBase(ABC):
                     continue
                 case _OverlapSpeechStartedSentinel() if self._agent_speech_started:
                     self._overlap_started_at = input_frame._started_at
+                    self._overlap_request_boundary_ns = perf_counter_ns()
                     self._user_speech_span = input_frame._user_speaking_span
                     self._overlap_started = True
                     self._accumulated_samples = 0
@@ -732,6 +736,7 @@ class InterruptionStreamBase(ABC):
                     self._overlap_started = False
                     self._accumulated_samples = 0
                     self._overlap_started_at = None
+                    self._overlap_request_boundary_ns = None
                     self._cache.clear()
                 case rtc.AudioFrame() if self._agent_speech_started:
                     samples_written = self._audio_buffer.push_frame(input_frame)
@@ -745,6 +750,13 @@ class InterruptionStreamBase(ABC):
     def send(self, event: OverlappingSpeechEvent) -> None:
         self._event_ch.send_nowait(event)
         self._model.emit(event.type, event)
+
+    def _is_current_overlap_request(self, created_at: int) -> bool:
+        return (
+            self._overlap_started
+            and self._overlap_request_boundary_ns is not None
+            and created_at >= self._overlap_request_boundary_ns
+        )
 
     @utils.log_exceptions(logger=logger)
     async def _metrics_monitor_task(
@@ -831,6 +843,8 @@ class InterruptionHttpStream(InterruptionStreamBase):
                     )
                     self.send(ev)
                     self._overlap_started = False
+                    self._overlap_request_boundary_ns = None
+                    self._cache.clear()
 
         data_ch = aio.Chan[npt.NDArray[np.int16]]()
         tasks = [
@@ -1091,18 +1105,19 @@ class InterruptionWebSocketStream(InterruptionStreamBase):
                     case InterruptionWSDetectedMessage():
                         created_at = msg.created_at
                         overlap_started_at = self._overlap_started_at
-                        if overlap_started_at is None or not self._overlap_started:
+                        if overlap_started_at is None or not self._is_current_overlap_request(
+                            created_at
+                        ):
                             continue
-                        entry = self._cache.update_value(
+                        entry = self._cache.set_or_update(
                             created_at,
+                            lambda c=created_at: InterruptionCacheEntry(created_at=c),  # type: ignore[misc]
                             total_duration=(perf_counter_ns() - created_at) / 1e9,
                             probabilities=np.array(msg.probabilities, dtype=np.float32),
                             is_interruption=True,
                             prediction_duration=msg.prediction_duration,
                             detection_delay=time.time() - overlap_started_at,
                         )
-                        if entry is None:
-                            continue
                         if self._user_speech_span:
                             self._update_user_speech_span(self._user_speech_span, entry)
                             self._user_speech_span = None
@@ -1124,21 +1139,24 @@ class InterruptionWebSocketStream(InterruptionStreamBase):
                         ev.num_requests = await self._num_requests.get_and_reset()
                         self.send(ev)
                         self._overlap_started = False
+                        self._overlap_request_boundary_ns = None
+                        self._cache.clear()
                     case InterruptionWSInferenceDoneMessage():
                         created_at = msg.created_at
                         overlap_started_at = self._overlap_started_at
-                        if overlap_started_at is None or not self._overlap_started:
+                        if overlap_started_at is None or not self._is_current_overlap_request(
+                            created_at
+                        ):
                             continue
-                        entry = self._cache.update_value(
+                        entry = self._cache.set_or_update(
                             created_at,
+                            lambda c=created_at: InterruptionCacheEntry(created_at=c),  # type: ignore[misc]
                             total_duration=(perf_counter_ns() - created_at) / 1e9,
                             prediction_duration=msg.prediction_duration,
                             probabilities=np.array(msg.probabilities, dtype=np.float32),
                             is_interruption=False,
                             detection_delay=time.time() - overlap_started_at,
                         )
-                        if entry is None:
-                            continue
                         logger.trace(
                             "interruption inference done",
                             extra={

@@ -441,6 +441,75 @@ class TestWsLifecycle:
 
 class TestWsCacheTimeout:
     @pytest.mark.asyncio
+    async def test_preserves_current_overlap_detection_after_cache_eviction(self) -> None:
+        mock_session = AsyncMock(spec=aiohttp.ClientSession)
+        mock_ws = MagicMock(spec=aiohttp.ClientWebSocketResponse)
+        mock_ws.send_str = AsyncMock()
+        mock_ws.closed = False
+        mock_ws.close_code = None
+        mock_ws.close = AsyncMock(return_value=True)
+        request_sent = asyncio.Event()
+        release_response = asyncio.Event()
+        request_created_at: int | None = None
+
+        async def _send_bytes(data: bytes) -> None:
+            nonlocal request_created_at
+            request_created_at = int.from_bytes(data[:8], byteorder="little")
+            request_sent.set()
+
+        received_handshake = False
+        response_sent = False
+
+        async def _receive() -> aiohttp.WSMessage:
+            nonlocal received_handshake, response_sent
+            if not received_handshake:
+                received_handshake = True
+                return aiohttp.WSMessage(
+                    type=aiohttp.WSMsgType.TEXT,
+                    data='{"type":"session.created"}',
+                    extra=None,
+                )
+            if not response_sent:
+                await release_response.wait()
+                response_sent = True
+                assert request_created_at is not None
+                return aiohttp.WSMessage(
+                    type=aiohttp.WSMsgType.TEXT,
+                    data=(
+                        '{"type":"bargein_detected","created_at":'
+                        f"{request_created_at},"
+                        '"prediction_duration":0.01,"probabilities":[0.9]}'
+                    ),
+                    extra=None,
+                )
+            await asyncio.sleep(3600)
+            return aiohttp.WSMessage(type=aiohttp.WSMsgType.CLOSED, data=None, extra=None)
+
+        mock_ws.send_bytes = AsyncMock(side_effect=_send_bytes)
+        mock_ws.receive = _receive
+        mock_session.ws_connect = AsyncMock(return_value=mock_ws)
+        detector = _create_detector(mock_session, use_proxy=True, inference_timeout=1.0)
+        detected = asyncio.Event()
+        detector.on("overlapping_speech", lambda _: detected.set())
+        stream = detector.stream(conn_options=CONN_OPTIONS)
+
+        stream.push_frame(_AgentSpeechStartedSentinel())
+        stream.push_frame(
+            _OverlapSpeechStartedSentinel(speech_duration=0.5, started_at=time.time())
+        )
+        stream.push_frame(_make_audio_frame())
+        try:
+            await asyncio.wait_for(request_sent.wait(), timeout=1.0)
+            stream._cache.clear()
+            release_response.set()
+            await asyncio.wait_for(detected.wait(), timeout=1.0)
+            assert not stream._cache
+            assert detector.state == "active"
+        finally:
+            release_response.set()
+            await stream.aclose()
+
+    @pytest.mark.asyncio
     async def test_ignores_inflight_request_after_overlap_ends(self) -> None:
         mock_session = AsyncMock(spec=aiohttp.ClientSession)
         mock_ws = MagicMock(spec=aiohttp.ClientWebSocketResponse)
