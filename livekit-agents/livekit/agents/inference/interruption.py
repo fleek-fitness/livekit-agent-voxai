@@ -1029,6 +1029,8 @@ class InterruptionWebSocketStream(InterruptionStreamBase):
             interval = max(0.01, min(self._opts.inference_timeout / 2, 0.1))
             while True:
                 await asyncio.sleep(interval)
+                if closing_ws:
+                    return
                 now = perf_counter_ns()
                 for _key, entry in self._cache.items():
                     if entry.total_duration is not None:

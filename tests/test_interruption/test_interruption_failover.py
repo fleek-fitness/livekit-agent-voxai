@@ -344,6 +344,63 @@ class TestWsHandshake:
             await stream.aclose()
 
 
+class TestWsLifecycle:
+    @pytest.mark.asyncio
+    async def test_end_input_stops_timeout_watcher_and_completes_stream(self) -> None:
+        mock_session = AsyncMock(spec=aiohttp.ClientSession)
+        mock_ws = MagicMock(spec=aiohttp.ClientWebSocketResponse)
+        mock_ws.closed = False
+        mock_ws.close_code = None
+        mock_ws.close = AsyncMock(return_value=True)
+        session_close_sent = asyncio.Event()
+
+        async def _send_str(data: str) -> None:
+            if '"session.close"' in data:
+                session_close_sent.set()
+
+        receive_count = 0
+
+        async def _receive() -> aiohttp.WSMessage:
+            nonlocal receive_count
+            receive_count += 1
+            if receive_count == 1:
+                return aiohttp.WSMessage(
+                    type=aiohttp.WSMsgType.TEXT,
+                    data='{"type":"session.created"}',
+                    extra=None,
+                )
+            await session_close_sent.wait()
+            if receive_count == 2:
+                return aiohttp.WSMessage(
+                    type=aiohttp.WSMsgType.TEXT,
+                    data='{"type":"session.closed"}',
+                    extra=None,
+                )
+            return aiohttp.WSMessage(
+                type=aiohttp.WSMsgType.CLOSED,
+                data=None,
+                extra=None,
+            )
+
+        mock_ws.send_str = AsyncMock(side_effect=_send_str)
+        mock_ws.receive = _receive
+        mock_session.ws_connect = AsyncMock(return_value=mock_ws)
+        detector = _create_detector(
+            mock_session,
+            use_proxy=True,
+            inference_timeout=0.05,
+        )
+        stream = detector.stream(conn_options=CONN_OPTIONS)
+
+        stream.end_input()
+        try:
+            await asyncio.wait_for(stream._task, timeout=1.0)
+        finally:
+            await stream.aclose()
+
+        assert session_close_sent.is_set()
+
+
 class TestWsCacheTimeout:
     @pytest.mark.asyncio
     async def test_times_out_without_another_audio_frame(self) -> None:
