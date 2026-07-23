@@ -801,7 +801,7 @@ async def test_agent_start_connects_vad_speech_that_started_before_playout() -> 
         assert isinstance(agent_started, _AgentSpeechStartedSentinel)
         assert isinstance(overlap_started, _OverlapSpeechStartedSentinel)
         assert overlap_started._speech_duration == pytest.approx(0.7)
-        assert overlap_started._started_at == 100.7
+        assert overlap_started._started_at == 100.0
         assert overlap_started._user_speaking_span is session._user_speaking_span
         assert recognition._interruption_ch.empty()
     finally:

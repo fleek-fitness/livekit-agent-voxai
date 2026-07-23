@@ -356,7 +356,9 @@ class AudioRecognition:
                 self._interruption_ch.send_nowait(  # type: ignore[union-attr]
                     _OverlapSpeechStartedSentinel(
                         speech_duration=speech_duration,
-                        started_at=started_at,
+                        # Preserve the current user turn's transcript boundary;
+                        # agent playout may begin in the middle of this VAD segment.
+                        started_at=self._speech_start_time,
                         user_speaking_span=self._session._user_speaking_span,
                     )
                 )
