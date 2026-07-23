@@ -70,6 +70,22 @@ class InterruptionDetectionError(BaseModel):
     recoverable: bool
 
 
+InterruptionDetectorState: TypeAlias = Literal[
+    "connecting", "active", "reconnecting", "fallback", "closed"
+]
+
+
+class InterruptionDetectionStateChangedEvent(BaseModel):
+    """A lifecycle transition emitted by an adaptive interruption detector."""
+
+    type: Literal["state_changed"] = "state_changed"
+    timestamp: float = Field(default_factory=time.time)
+    previous_state: InterruptionDetectorState
+    state: InterruptionDetectorState
+    reason: str | None = None
+    retry_count: int = 0
+
+
 @dataclass(slots=True, kw_only=True)
 class InterruptionOptions:
     sample_rate: int
@@ -263,6 +279,7 @@ class AdaptiveInterruptionDetector(
             "overlapping_speech",
             "error",
             "metrics_collected",
+            "state_changed",
         ]
     ],
 ):
@@ -279,6 +296,7 @@ class AdaptiveInterruptionDetector(
         api_key: str | None = None,
         api_secret: str | None = None,
         http_session: aiohttp.ClientSession | None = None,
+        transport: Literal["auto", "http", "websocket"] = "auto",
     ) -> None:
         """
         Initialize a AdaptiveInterruptionDetector instance.
@@ -294,6 +312,8 @@ class AdaptiveInterruptionDetector(
             api_key (str, optional): The API key for the interruption detection, defaults to the LIVEKIT_INFERENCE_API_KEY environment variable.
             api_secret (str, optional): The API secret for the interruption detection, defaults to the LIVEKIT_INFERENCE_API_SECRET environment variable.
             http_session (aiohttp.ClientSession, optional): The HTTP session to use for the interruption detection.
+            transport: Transport used by the detector. ``auto`` preserves the existing
+                hosted-WebSocket/custom-HTTP behavior.
         """
         super().__init__()
         if max_audio_duration > 3.0:
@@ -329,9 +349,9 @@ class AdaptiveInterruptionDetector(
                     "api_secret is required, either as argument or set LIVEKIT_API_SECRET environmental variable"
                 )
 
-            use_proxy = True
-        else:
-            use_proxy = False
+        if transport not in ("auto", "http", "websocket"):
+            raise ValueError("transport must be one of: auto, http, websocket")
+        use_proxy = is_inference_url if transport == "auto" else transport == "websocket"
 
         self._opts = InterruptionOptions(
             sample_rate=SAMPLE_RATE,
@@ -350,6 +370,7 @@ class AdaptiveInterruptionDetector(
         self._sample_rate = SAMPLE_RATE
         self._session = http_session
         self._streams = weakref.WeakSet[InterruptionHttpStream | InterruptionWebSocketStream]()
+        self._state: InterruptionDetectorState = "connecting" if use_proxy else "active"
 
         logger.info(
             "adaptive interruption detector initialized",
@@ -381,6 +402,37 @@ class AdaptiveInterruptionDetector(
     def sample_rate(self) -> int:
         return self._sample_rate
 
+    @property
+    def state(self) -> InterruptionDetectorState:
+        return self._state
+
+    def _set_state(
+        self,
+        state: InterruptionDetectorState,
+        *,
+        reason: str | None = None,
+        retry_count: int = 0,
+    ) -> None:
+        previous_state = self._state
+        if previous_state == state and state != "reconnecting":
+            return
+        self._state = state
+        self.emit(
+            "state_changed",
+            InterruptionDetectionStateChangedEvent(
+                previous_state=previous_state,
+                state=state,
+                reason=reason,
+                retry_count=retry_count,
+            ),
+        )
+
+    def fail(self, error: Exception) -> None:
+        """Permanently fail this detector and let its owner fall back safely."""
+
+        self._set_state("fallback", reason=str(error))
+        self._emit_error(error, recoverable=False)
+
     def _emit_error(self, api_error: Exception, recoverable: bool) -> None:
         self.emit(
             "error",
@@ -406,7 +458,7 @@ class AdaptiveInterruptionDetector(
             else:
                 stream = InterruptionHttpStream(model=self, conn_options=conn_options)
         except Exception as e:
-            self._emit_error(e, recoverable=False)
+            self.fail(e)
             raise
         self._streams.add(stream)
         return stream
@@ -477,14 +529,19 @@ class InterruptionStreamBase(ABC):
                 return await self._run()
             except APIError as e:
                 if max_retries == 0 or not e.retryable:
+                    self._model._set_state("fallback", reason=str(e), retry_count=self._num_retries)
                     self._emit_error(e, recoverable=False)
                     raise
                 elif self._num_retries == max_retries:
+                    self._model._set_state("fallback", reason=str(e), retry_count=self._num_retries)
                     self._emit_error(e, recoverable=False)
                     raise APIConnectionError(
                         f"failed to detect interruption after {self._num_retries} attempts",
                     ) from e
                 else:
+                    self._model._set_state(
+                        "reconnecting", reason=str(e), retry_count=self._num_retries + 1
+                    )
                     self._emit_error(e, recoverable=True)
 
                     retry_interval = self._conn_options._interval_for_retry(self._num_retries)
@@ -498,9 +555,16 @@ class InterruptionStreamBase(ABC):
                     )
                     await asyncio.sleep(retry_interval)
 
+                    self._cache.clear()
+                    self._overlap_started = False
+                    self._overlap_started_at = None
+                    self._user_speech_span = None
+                    await self._num_requests.set(0)
+
                 self._num_retries += 1
 
             except Exception as e:
+                self._model._set_state("fallback", reason=str(e), retry_count=self._num_retries)
                 self._emit_error(e, recoverable=False)
                 raise
 
@@ -533,6 +597,7 @@ class InterruptionStreamBase(ABC):
             await self._metrics_task
         finally:
             await self._tee_aiter.aclose()
+            self._model._set_state("closed")
 
     async def __anext__(self) -> OverlappingSpeechEvent:
         try:
@@ -608,19 +673,17 @@ class InterruptionStreamBase(ABC):
                     self._overlap_started = True
                     self._accumulated_samples = 0
                     self._overlap_count += 1
-                    # include the audio prefix in the window and
-                    # only shift (remove leading silence) when the first overlap speech started
-                    # otherwise, keep the existing data
-                    if self._overlap_count == 1:
-                        shift_size = max(
-                            0,
-                            len(self._audio_buffer)
-                            - (
-                                int(input_frame._speech_duration * self._sample_rate)
-                                + self._prefix_size
-                            ),
-                        )
-                        self._audio_buffer.shift(shift_size)
+                    # Re-anchor every overlap. Otherwise a later overlap can include stale
+                    # audio from an earlier attempt and produce a false interruption.
+                    shift_size = max(
+                        0,
+                        len(self._audio_buffer)
+                        - (
+                            int(input_frame._speech_duration * self._sample_rate)
+                            + self._prefix_size
+                        ),
+                    )
+                    self._audio_buffer.shift(shift_size)
                     logger.trace(
                         "overlap speech started, starting interruption inference",
                         extra={
@@ -782,6 +845,7 @@ class InterruptionHttpStream(InterruptionStreamBase):
                             ),
                         }
                     )
+                    self._model._set_state("active")
 
                     logger.trace(
                         "interruption inference done",
@@ -924,6 +988,7 @@ class InterruptionWebSocketStream(InterruptionStreamBase):
             self._opts.threshold = threshold
         if is_given(min_interruption_duration):
             self._opts.min_frames = math.ceil(min_interruption_duration * _FRAMES_PER_SECOND)
+        self._model._set_state("reconnecting", reason="interruption options updated")
         self._reconnect_event.set()
 
     async def _run(self) -> None:
@@ -933,22 +998,8 @@ class InterruptionWebSocketStream(InterruptionStreamBase):
             ws: aiohttp.ClientWebSocketResponse, input_ch: aio.Chan[npt.NDArray[np.int16]]
         ) -> None:
             nonlocal closing_ws
-            timeout_ns = int(self._opts.inference_timeout * 1e9)
 
             async for audio_data in input_ch:
-                now = perf_counter_ns()
-                for _key, entry in self._cache.items():
-                    if entry.total_duration is not None:
-                        continue
-                    if now - entry.created_at > timeout_ns:
-                        raise APIStatusError(
-                            f"interruption inference timed out after "
-                            f"{(now - entry.created_at) / 1e9:.1f}s (ws)",
-                            status_code=408,
-                            retryable=False,
-                        )
-                    break  # oldest unanswered entry is still within timeout
-
                 await self._num_requests.increment()
                 created_at = perf_counter_ns()
                 header = struct.pack("<Q", created_at)  # 8 bytes
@@ -963,6 +1014,24 @@ class InterruptionWebSocketStream(InterruptionStreamBase):
                 type=InterruptionWSMessageType.SESSION_CLOSE,
             )
             await ws.send_str(msg.model_dump_json())
+
+        async def timeout_task() -> None:
+            timeout_ns = int(self._opts.inference_timeout * 1e9)
+            interval = max(0.01, min(self._opts.inference_timeout / 2, 0.1))
+            while True:
+                await asyncio.sleep(interval)
+                now = perf_counter_ns()
+                for _key, entry in self._cache.items():
+                    if entry.total_duration is not None:
+                        continue
+                    if now - entry.created_at > timeout_ns:
+                        raise APIStatusError(
+                            f"interruption inference timed out after "
+                            f"{(now - entry.created_at) / 1e9:.1f}s (ws)",
+                            status_code=408,
+                            retryable=True,
+                        )
+                    break
 
         async def recv_task(ws: aiohttp.ClientWebSocketResponse) -> None:
             nonlocal closing_ws
@@ -1076,6 +1145,7 @@ class InterruptionWebSocketStream(InterruptionStreamBase):
                     asyncio.create_task(self._forward_data(data_ch)),
                     asyncio.create_task(send_task(ws, data_ch)),
                     asyncio.create_task(recv_task(ws)),
+                    asyncio.create_task(timeout_task()),
                 ]
                 tasks_group = asyncio.gather(*tasks)
                 wait_reconnect_task = asyncio.create_task(self._reconnect_event.wait())
@@ -1141,12 +1211,12 @@ class InterruptionWebSocketStream(InterruptionStreamBase):
                 raise APIStatusError(
                     "LiveKit Adaptive Interruption quota exceeded",
                     status_code=e.status,
-                    retryable=False,
+                    retryable=True,
                 ) from e
             elif isinstance(e, asyncio.TimeoutError):
                 raise APIConnectionError(
                     "failed to connect to LiveKit Adaptive Interruption: timeout",
-                    retryable=False,
+                    retryable=True,
                 ) from e
             raise APIConnectionError("failed to connect to LiveKit Adaptive Interruption") from e
 
@@ -1156,8 +1226,33 @@ class InterruptionWebSocketStream(InterruptionStreamBase):
                 settings=settings,
             )
             await ws.send_str(msg.model_dump_json())
+            ws_msg = await asyncio.wait_for(ws.receive(), timeout=self._opts.inference_timeout)
+            if ws_msg.type != aiohttp.WSMsgType.TEXT:
+                raise APIConnectionError(
+                    f"unexpected session.create response: {ws_msg.type}", retryable=True
+                )
+            response = InterruptionWSMessage.validate_json(ws_msg.data)
+            if isinstance(response, InterruptionWSErrorMessage):
+                raise APIStatusError(
+                    f"LiveKit Adaptive Interruption returned error: {response.code}",
+                    body=response.message,
+                    status_code=response.code,
+                )
+            if not isinstance(response, InterruptionWSSessionCreatedMessage):
+                raise APIConnectionError(
+                    f"unexpected session.create response: {response.type}", retryable=False
+                )
+            self._model._set_state("active", retry_count=self._num_retries)
+        except asyncio.TimeoutError as e:
+            await ws.close()
+            raise APIConnectionError(
+                "timed out waiting for session.created from LiveKit Adaptive Interruption",
+                retryable=True,
+            ) from e
         except Exception as e:
             await ws.close()
+            if isinstance(e, APIError):
+                raise
             raise APIConnectionError(
                 "failed to send session.create message to LiveKit Adaptive Interruption"
             ) from e

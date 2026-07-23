@@ -2,6 +2,8 @@ from .interruption import (
     AdaptiveInterruptionDetector,
     InterruptionDataFrameType,
     InterruptionDetectionError,
+    InterruptionDetectionStateChangedEvent,
+    InterruptionDetectorState,
     OverlappingSpeechEvent,
 )
 from .llm import LLM, LLMModels, LLMStream
@@ -18,6 +20,8 @@ __all__ = [
     "LLMModels",
     "AdaptiveInterruptionDetector",
     "InterruptionDetectionError",
+    "InterruptionDetectionStateChangedEvent",
+    "InterruptionDetectorState",
     "OverlappingSpeechEvent",
     "InterruptionDataFrameType",
 ]

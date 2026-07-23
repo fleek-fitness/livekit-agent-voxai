@@ -890,6 +890,83 @@ async def test_interruption_detection_error_is_not_session_error() -> None:
         await _close_test_session(session)
 
 
+async def test_reconnected_detector_waits_for_agent_speech_boundary() -> None:
+    session = create_session(FakeActions())
+    detector = inference.AdaptiveInterruptionDetector(
+        base_url="http://localhost:9999",
+        api_key="test-key",
+        api_secret="test-secret",
+        transport="websocket",
+    )
+    recognition = AudioRecognition(
+        session,
+        hooks=_TestRecognitionHooks(),
+        endpointing=BaseEndpointing(min_delay=0.1, max_delay=1.0),
+        stt=None,
+        vad=MagicMock(),
+        interruption_detection=detector,
+        turn_detection="vad",
+    )
+    recognition._interruption_ch = aio.Chan[inference.InterruptionDataFrameType]()
+    recognition._agent_speaking = True
+
+    try:
+        detector._set_state("active")
+        recognition.set_interruption_detection_available(True)
+        assert recognition.adaptive_interruption_active is False
+
+        recognition.on_end_of_agent_speech(ignore_user_transcript_until=time.time())
+        assert recognition.adaptive_interruption_active is True
+    finally:
+        recognition._interruption_ch.close()
+        await _close_test_session(session)
+
+
+async def test_detector_state_switches_interruption_owner() -> None:
+    session = create_session(FakeActions())
+    activity = AgentActivity(MyAgent(), session)
+    audio_recognition = MagicMock()
+    activity._audio_recognition = audio_recognition
+    activity._interruption_by_audio_activity_enabled = False
+    activity._default_interruption_by_audio_activity_enabled = True
+
+    try:
+        activity._on_interruption_state_changed(
+            inference.InterruptionDetectionStateChangedEvent(
+                previous_state="active",
+                state="reconnecting",
+                reason="temporary outage",
+                retry_count=1,
+            )
+        )
+        audio_recognition.set_interruption_detection_available.assert_called_once_with(False)
+        assert activity._interruption_by_audio_activity_enabled is True
+
+        audio_recognition.reset_mock()
+        activity._on_interruption_state_changed(
+            inference.InterruptionDetectionStateChangedEvent(
+                previous_state="reconnecting",
+                state="active",
+                retry_count=1,
+            )
+        )
+        audio_recognition.set_interruption_detection_available.assert_called_once_with(True)
+
+        fallback = Mock()
+        activity._fallback_to_vad_interruption = fallback
+        activity._on_interruption_state_changed(
+            inference.InterruptionDetectionStateChangedEvent(
+                previous_state="reconnecting",
+                state="fallback",
+                reason="retry budget exhausted",
+                retry_count=3,
+            )
+        )
+        fallback.assert_called_once_with()
+    finally:
+        await _close_test_session(session)
+
+
 async def test_vad_fallback_uses_next_vad_inference_event(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Callable
 from unittest.mock import AsyncMock, MagicMock, Mock
 
 import aiohttp
@@ -21,6 +22,7 @@ from livekit.agents._exceptions import APIError
 from livekit.agents.inference.interruption import (
     AdaptiveInterruptionDetector,
     InterruptionDetectionError,
+    InterruptionDetectionStateChangedEvent,
     InterruptionHttpStream,
     InterruptionWebSocketStream,
     _AgentSpeechStartedSentinel,
@@ -53,8 +55,8 @@ def _create_detector(
         api_secret="test-secret",
         http_session=mock_session,
         inference_timeout=inference_timeout,
+        transport="websocket" if use_proxy else "http",
     )
-    detector._opts.use_proxy = use_proxy
     return detector
 
 
@@ -64,6 +66,14 @@ def _collect_errors(
     errors: list[InterruptionDetectionError] = []
     detector.on("error", lambda e: errors.append(e))
     return errors
+
+
+def _collect_states(
+    detector: AdaptiveInterruptionDetector,
+) -> list[InterruptionDetectionStateChangedEvent]:
+    states: list[InterruptionDetectionStateChangedEvent] = []
+    detector.on("state_changed", states.append)
+    return states
 
 
 async def _feed_audio_continuously(
@@ -128,7 +138,17 @@ class TestHttpTimeout:
         errors = _collect_errors(detector)
         stream = detector.stream(conn_options=CONN_OPTIONS)
 
-        exc = await _wait_for_stream_failure(stream)
+        stream.push_frame(_AgentSpeechStartedSentinel())
+        stream.push_frame(
+            _OverlapSpeechStartedSentinel(speech_duration=0.5, started_at=time.time())
+        )
+        stream.push_frame(_make_audio_frame())
+        try:
+            with pytest.raises(APIError) as exc_info:
+                await asyncio.wait_for(stream._task, timeout=1.0)
+            exc: Exception | None = exc_info.value
+        finally:
+            await stream.aclose()
 
         assert exc is not None, f"Expected exception, got None. Errors: {errors}"
         assert isinstance(exc, APIError)
@@ -214,6 +234,7 @@ class TestWsConnectionTimeout:
 
         detector = _create_detector(mock_session, use_proxy=True)
         errors = _collect_errors(detector)
+        states = _collect_states(detector)
         stream = detector.stream(conn_options=CONN_OPTIONS)
 
         exc = await _wait_for_stream_failure(stream)
@@ -223,13 +244,16 @@ class TestWsConnectionTimeout:
 
         recoverable_errors = [e for e in errors if e.recoverable]
         unrecoverable_errors = [e for e in errors if not e.recoverable]
-        assert len(recoverable_errors) == 0
+        assert len(recoverable_errors) == MAX_RETRY
         assert len(unrecoverable_errors) == 1
+        assert states[0].state == "reconnecting"
+        assert len([event for event in states if event.state == "reconnecting"]) == MAX_RETRY
+        assert states[-1].state in ("fallback", "closed")
 
 
 class TestWsConnection429:
     @pytest.mark.asyncio
-    async def test_immediate_unrecoverable(self) -> None:
+    async def test_retries_then_emits_unrecoverable(self) -> None:
         mock_session = AsyncMock(spec=aiohttp.ClientSession)
         mock_session.ws_connect = AsyncMock(
             side_effect=aiohttp.ClientResponseError(
@@ -249,16 +273,54 @@ class TestWsConnection429:
         assert exc is not None
         assert isinstance(exc, APIError)
 
-        # 429 -> APIStatusError(retryable=False) so no retries, immediate unrecoverable
         recoverable_errors = [e for e in errors if e.recoverable]
         unrecoverable_errors = [e for e in errors if not e.recoverable]
-        assert len(recoverable_errors) == 0
+        assert len(recoverable_errors) == MAX_RETRY
         assert len(unrecoverable_errors) == 1
+
+
+class TestWsHandshake:
+    @pytest.mark.asyncio
+    async def test_becomes_active_only_after_session_created(self) -> None:
+        mock_session = AsyncMock(spec=aiohttp.ClientSession)
+        mock_ws = MagicMock(spec=aiohttp.ClientWebSocketResponse)
+        mock_ws.send_str = AsyncMock()
+        mock_ws.closed = False
+        mock_ws.close_code = None
+        mock_ws.close = AsyncMock(return_value=True)
+        responses = [
+            aiohttp.WSMessage(
+                type=aiohttp.WSMsgType.TEXT,
+                data='{"type":"session.created"}',
+                extra=None,
+            )
+        ]
+
+        async def _receive() -> aiohttp.WSMessage:
+            if responses:
+                return responses.pop()
+            await asyncio.sleep(3600)
+            raise AssertionError("unreachable")
+
+        mock_ws.receive = _receive
+        mock_session.ws_connect = AsyncMock(return_value=mock_ws)
+        detector = _create_detector(mock_session, use_proxy=True)
+        states = _collect_states(detector)
+
+        assert detector.state == "connecting"
+        stream = detector.stream(conn_options=CONN_OPTIONS)
+        try:
+            await asyncio.wait_for(
+                _wait_until(lambda: detector.state == "active"), timeout=1.0
+            )
+            assert [event.state for event in states] == ["active"]
+        finally:
+            await stream.aclose()
 
 
 class TestWsCacheTimeout:
     @pytest.mark.asyncio
-    async def test_retries_then_emits_unrecoverable(self) -> None:
+    async def test_times_out_without_another_audio_frame(self) -> None:
         mock_session = AsyncMock(spec=aiohttp.ClientSession)
 
         inference_timeout = 0.05
@@ -274,7 +336,17 @@ class TestWsCacheTimeout:
 
             mock_ws.send_bytes = _slow_send_bytes
 
+            received_handshake = False
+
             async def _receive_hang() -> aiohttp.WSMessage:
+                nonlocal received_handshake
+                if not received_handshake:
+                    received_handshake = True
+                    return aiohttp.WSMessage(
+                        type=aiohttp.WSMsgType.TEXT,
+                        data='{"type":"session.created"}',
+                        extra=None,
+                    )
                 await asyncio.sleep(3600)
                 return aiohttp.WSMessage(type=aiohttp.WSMsgType.CLOSED, data=None, extra=None)
 
@@ -288,14 +360,32 @@ class TestWsCacheTimeout:
             mock_session, use_proxy=True, inference_timeout=inference_timeout
         )
         errors = _collect_errors(detector)
-        stream = detector.stream(conn_options=CONN_OPTIONS)
+        # A zero retry budget makes the assertion about the independent timeout
+        # deterministic: no second audio frame is needed to discover the failure.
+        stream = detector.stream(
+            conn_options=APIConnectOptions(max_retry=0, retry_interval=0.0, timeout=1.0)
+        )
 
-        exc = await _wait_for_stream_failure(stream)
+        stream.push_frame(_AgentSpeechStartedSentinel())
+        stream.push_frame(
+            _OverlapSpeechStartedSentinel(speech_duration=0.5, started_at=time.time())
+        )
+        stream.push_frame(_make_audio_frame())
+        try:
+            with pytest.raises(APIError) as exc_info:
+                await asyncio.wait_for(stream._task, timeout=1.0)
+            exc: Exception | None = exc_info.value
+        finally:
+            await stream.aclose()
 
         assert exc is not None
         assert isinstance(exc, APIError)
 
-        recoverable_errors = [e for e in errors if e.recoverable]
         unrecoverable_errors = [e for e in errors if not e.recoverable]
-        assert len(recoverable_errors) == 0
         assert len(unrecoverable_errors) == 1
+        assert "timed out" in str(unrecoverable_errors[0].error)
+
+
+async def _wait_until(predicate: Callable[[], bool]) -> None:
+    while not predicate():
+        await asyncio.sleep(0)

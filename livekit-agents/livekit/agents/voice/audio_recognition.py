@@ -201,7 +201,10 @@ class AudioRecognition:
         self._input_started_at: float | None = None
         self._ignore_user_transcript_until: NotGivenOr[float] = NOT_GIVEN
         self._transcript_buffer: deque[SpeechEvent] = deque()
-        self._interruption_enabled: bool = interruption_detection is not None and vad is not None
+        self._interruption_ready: bool = (
+            interruption_detection is not None and interruption_detection.state == "active"
+        )
+        self._interruption_enabled: bool = self._interruption_ready and vad is not None
         self._agent_speaking: bool = False
 
         _backchannel_boundary: float | tuple[float, float] | None = (
@@ -328,6 +331,8 @@ class AudioRecognition:
     # endregion
 
     def on_start_of_agent_speech(self, started_at: float) -> None:
+        if self._interruption_ready and not self._agent_speaking:
+            self._interruption_enabled = self._vad is not None
         self._agent_speaking = True
         self._endpointing.on_start_of_agent_speech(started_at=started_at)
 
@@ -351,6 +356,10 @@ class AudioRecognition:
 
         if not self.adaptive_interruption_active:
             self._agent_speaking = False
+            if self._interruption_ready:
+                # A reconnect can complete while the agent is speaking. Start using
+                # the detector only after that speech finishes, at a clean boundary.
+                self._interruption_enabled = self._vad is not None
             return
 
         self._interruption_ch.send_nowait(_AgentSpeechEndedSentinel())  # type: ignore[union-attr]
@@ -721,9 +730,7 @@ class AudioRecognition:
             self._vad_ch = None
             self._vad_stream = None
 
-        self._interruption_enabled = (
-            self._interruption_detection is not None and self._vad is not None
-        )
+        self._interruption_enabled = self._interruption_ready and self._vad is not None
 
     async def detach_stt(self) -> _STTPipeline | None:
         """Detach the STT pipeline for handoff to another AudioRecognition.
@@ -746,6 +753,9 @@ class AudioRecognition:
         self, interruption_detection: inference.AdaptiveInterruptionDetector | None
     ) -> None:
         self._interruption_detection = interruption_detection
+        self._interruption_ready = (
+            interruption_detection is not None and interruption_detection.state == "active"
+        )
         if interruption_detection is not None:
             self._interruption_ch = aio.Chan[inference.InterruptionDataFrameType]()
             self._interruption_atask = asyncio.create_task(
@@ -767,9 +777,31 @@ class AudioRecognition:
             flush_task.add_done_callback(lambda _: self._tasks.discard(flush_task))
             self._tasks.add(flush_task)
 
-        self._interruption_enabled = (
-            self._interruption_detection is not None and self._vad is not None
+        self._interruption_enabled = self._interruption_ready and self._vad is not None
+
+    def set_interruption_detection_available(self, available: bool) -> None:
+        """Switch interruption ownership without tearing down the detector stream."""
+
+        ready = (
+            available
+            and self._interruption_detection is not None
+            and self._interruption_detection.state == "active"
         )
+        was_enabled = self._interruption_enabled
+        self._interruption_ready = ready
+        # Do not activate a freshly reconnected detector in the middle of agent
+        # speech: it did not receive that speech's start sentinel.
+        self._interruption_enabled = ready and self._vad is not None and not (
+            self._agent_speaking and not was_enabled
+        )
+
+        if was_enabled and not self._interruption_enabled:
+            self._cancel_backchannel_boundary()
+            flush_task = asyncio.create_task(
+                self._flush_held_transcripts(cooldown=0.0, force=True)
+            )
+            flush_task.add_done_callback(lambda _: self._tasks.discard(flush_task))
+            self._tasks.add(flush_task)
 
     def clear_user_turn(self) -> None:
         self._audio_transcript = ""

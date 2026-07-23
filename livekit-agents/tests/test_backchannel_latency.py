@@ -4,6 +4,7 @@ import asyncio
 import logging
 import time
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -180,6 +181,45 @@ def test_vad_start_keeps_context_when_speech_was_already_interrupted() -> None:
     assert activity._user_speech_started_during_interruptible_agent_speech is True
     assert activity._stt_eos_received is False
     assert updates[-1][0] == "speaking"
+
+
+def _activity_for_interruption_candidate(transcript: str) -> tuple[AgentActivity, Mock]:
+    opts = _opts(min_interruption_words=3)
+    opts.interruption["false_interruption_timeout"] = None
+    speech = Mock(interrupted=False, allow_interruptions=True)
+    activity = AgentActivity.__new__(AgentActivity)
+    activity._opts = opts
+    activity._agent = SimpleNamespace(stt=object(), llm=None)
+    activity._session = SimpleNamespace(
+        options=opts,
+        _aec_warmup_remaining=0,
+        _aec_warmup_timer=None,
+        agent_state="speaking",
+    )
+    activity._audio_recognition = SimpleNamespace(
+        current_transcript=transcript,
+        _endpointing=SimpleNamespace(overlapping=True),
+    )
+    activity._interruption_by_audio_activity_enabled = True
+    activity._rt_session = None
+    activity._current_speech = speech
+    activity._false_interruption_timer = None
+    activity._pause_enabled = lambda: False
+    activity._record_dynamic_continuation_collision = lambda: None
+    return activity, speech
+
+
+def test_detector_overlap_bypasses_min_words_but_not_ignore_words() -> None:
+    activity, speech = _activity_for_interruption_candidate("")
+    activity._interrupt_by_audio_activity(source="vad")
+    speech.interrupt.assert_not_called()
+
+    activity._interrupt_by_audio_activity(source="overlap")
+    speech.interrupt.assert_called_once_with()
+
+    ignored_activity, ignored_speech = _activity_for_interruption_candidate("네")
+    ignored_activity._interrupt_by_audio_activity(source="overlap")
+    ignored_speech.interrupt.assert_not_called()
 
 
 def test_suppressed_transcript_commits_without_latency_anchor() -> None:

@@ -46,6 +46,9 @@ class Agent:
         stt: NotGivenOr[stt.STT | STTModels | str | None] = NOT_GIVEN,
         vad: NotGivenOr[vad.VAD | None] = NOT_GIVEN,
         turn_handling: NotGivenOr[TurnHandlingOptions] = NOT_GIVEN,
+        interruption_detection: NotGivenOr[
+            Literal["adaptive", "vad"] | inference.AdaptiveInterruptionDetector
+        ] = NOT_GIVEN,
         tool_handling: NotGivenOr[ToolHandlingOptions] = NOT_GIVEN,
         llm: NotGivenOr[llm.LLM | llm.RealtimeModel | LLMModels | str | None] = NOT_GIVEN,
         tts: NotGivenOr[tts.TTS | TTSModels | str | None] = NOT_GIVEN,
@@ -95,11 +98,13 @@ class Agent:
         self._vad = vad
 
         self._allow_interruptions: NotGivenOr[bool] = NOT_GIVEN
-        self._interruption_detection: NotGivenOr[Literal["adaptive", "vad"]] = NOT_GIVEN
+        self._interruption_detection: NotGivenOr[
+            Literal["adaptive", "vad"] | inference.AdaptiveInterruptionDetector
+        ] = interruption_detection
         if is_given(raw_interruption := turn_handling.get("interruption", NOT_GIVEN)):
             if "enabled" in raw_interruption:
                 self._allow_interruptions = raw_interruption["enabled"]
-            if "mode" in raw_interruption:
+            if "mode" in raw_interruption and not is_given(interruption_detection):
                 self._interruption_detection = raw_interruption["mode"]
         endpointing = turn_handling.get("endpointing", {})
         self._min_consecutive_speech_delay = min_consecutive_speech_delay
@@ -166,7 +171,9 @@ class Agent:
         return _ReadOnlyChatContext(self._chat_ctx.items)
 
     @property
-    def interruption_detection(self) -> NotGivenOr[Literal["adaptive", "vad"]]:
+    def interruption_detection(
+        self,
+    ) -> NotGivenOr[Literal["adaptive", "vad"] | inference.AdaptiveInterruptionDetector]:
         return self._interruption_detection
 
     async def update_instructions(self, instructions: str) -> None:

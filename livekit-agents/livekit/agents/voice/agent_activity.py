@@ -415,7 +415,10 @@ class AgentActivity(RecognitionHooks):
 
     @property
     def interruption_enabled(self) -> bool:
-        return self._interruption_detection_enabled
+        return self._interruption_detection_enabled and (
+            self._audio_recognition is None
+            or self._audio_recognition.adaptive_interruption_active
+        )
 
     @property
     def mcp_servers(self) -> list[mcp.MCPServer] | None:
@@ -843,6 +846,7 @@ class AgentActivity(RecognitionHooks):
             self._interruption_detector.on("metrics_collected", self._on_metrics_collected)
             self._interruption_detector.on("error", self._on_error)
             self._interruption_detector.on("overlapping_speech", self._on_overlap_speech_ended)
+            self._interruption_detector.on("state_changed", self._on_interruption_state_changed)
 
         if isinstance(self.llm, llm.RealtimeModel):
             rt_reused = reuse_resources is not None and reuse_resources.rt_session is not None
@@ -1120,6 +1124,7 @@ class AgentActivity(RecognitionHooks):
             self._interruption_detector.off("metrics_collected", self._on_metrics_collected)
             self._interruption_detector.off("error", self._on_error)
             self._interruption_detector.off("overlapping_speech", self._on_overlap_speech_ended)
+            self._interruption_detector.off("state_changed", self._on_interruption_state_changed)
 
         if self._rt_session is not None:
             await self._rt_session.aclose()
@@ -1847,6 +1852,35 @@ class AgentActivity(RecognitionHooks):
 
         self._session._on_error(error)
 
+    def _on_interruption_state_changed(
+        self, event: inference.InterruptionDetectionStateChangedEvent
+    ) -> None:
+        if event.state == "active":
+            if self._audio_recognition:
+                self._audio_recognition.set_interruption_detection_available(True)
+            logger.info(
+                "adaptive interruption detector active",
+                extra={"previous_state": event.previous_state, "retry_count": event.retry_count},
+            )
+            return
+
+        if event.state in ("connecting", "reconnecting"):
+            self._restore_interruption_by_audio_activity()
+            if self._audio_recognition:
+                self._audio_recognition.set_interruption_detection_available(False)
+            logger.info(
+                "adaptive interruption detector unavailable; VAD owns interruption",
+                extra={
+                    "state": event.state,
+                    "reason": event.reason,
+                    "retry_count": event.retry_count,
+                },
+            )
+            return
+
+        if event.state == "fallback":
+            self._fallback_to_vad_interruption()
+
     def _on_overlap_speech_ended(self, ev: inference.OverlappingSpeechEvent) -> None:
         if ev.is_interruption:
             self._interruption_detected = True
@@ -2010,12 +2044,13 @@ class AgentActivity(RecognitionHooks):
                 else None
             )
 
-            if dyn_min_words > 0 and word_count < dyn_min_words:
+            detector_overlap = source == "overlap"
+            if not detector_overlap and dyn_min_words > 0 and word_count < dyn_min_words:
                 return
 
             if opts.interruption_ignore_words:
                 is_empty = text.strip() == ""
-                if is_empty and dyn_min_words > 0:
+                if not detector_overlap and is_empty and dyn_min_words > 0:
                     return
                 ignore_match = (
                     _matches_ignore_words(text, opts.interruption_ignore_words)
@@ -2143,7 +2178,7 @@ class AgentActivity(RecognitionHooks):
                 ended_at=speech_end_time,
                 user_speaking_span=self._session._user_speaking_span,
                 interruption=self._interruption_detected
-                if self._interruption_detection_enabled
+                if self.interruption_enabled
                 else NOT_GIVEN,
             )
 
@@ -4235,6 +4270,9 @@ class AgentActivity(RecognitionHooks):
 
     def _disable_vad_interruption_soon(self) -> None:
         """Disable VAD interruption after the backchannel boundary expires."""
+        if not self.interruption_enabled:
+            self._restore_interruption_by_audio_activity()
+            return
         if self._audio_recognition and self._audio_recognition.backchannel_boundary_active:
 
             def _disable_vad_interruption() -> None:
@@ -4277,6 +4315,7 @@ class AgentActivity(RecognitionHooks):
             self._interruption_detector.off("metrics_collected", self._on_metrics_collected)
             self._interruption_detector.off("error", self._on_error)
             self._interruption_detector.off("overlapping_speech", self._on_overlap_speech_ended)
+            self._interruption_detector.off("state_changed", self._on_interruption_state_changed)
 
         if self._audio_recognition:
             # this also releases any held transcripts
@@ -4318,6 +4357,14 @@ class AgentActivity(RecognitionHooks):
         return self._agent.vad if is_given(self._agent.vad) else self._session.vad
 
     def _resolve_interruption_detection(self) -> inference.AdaptiveInterruptionDetector | None:
+        configured_detector = (
+            self._agent.interruption_detection
+            if is_given(self._agent.interruption_detection)
+            and isinstance(
+                self._agent.interruption_detection, inference.AdaptiveInterruptionDetector
+            )
+            else None
+        )
         if not (
             self.stt is not None
             and self.stt.capabilities.aligned_transcript
@@ -4327,8 +4374,11 @@ class AgentActivity(RecognitionHooks):
             and not isinstance(self.llm, llm.RealtimeModel)
         ):
             if (
-                is_given(self._agent.interruption_detection)
-                and self._agent.interruption_detection == "adaptive"
+                configured_detector is not None
+                or (
+                    is_given(self._agent.interruption_detection)
+                    and self._agent.interruption_detection == "adaptive"
+                )
             ) or (
                 is_given(self._session.interruption_detection)
                 and self._session.interruption_detection == "adaptive"
@@ -4340,6 +4390,9 @@ class AgentActivity(RecognitionHooks):
 
         if not self.allow_interruptions:
             return None
+
+        if configured_detector is not None:
+            return configured_detector
 
         if (
             is_given(self._agent.interruption_detection)
