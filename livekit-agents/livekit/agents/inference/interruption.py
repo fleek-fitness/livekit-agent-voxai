@@ -12,7 +12,7 @@ from collections.abc import AsyncIterable, AsyncIterator
 from dataclasses import dataclass, field
 from enum import Enum
 from time import perf_counter_ns
-from typing import Annotated, Any, Literal, TypeAlias
+from typing import Annotated, Any, Literal, TypeAlias, cast
 
 import aiohttp
 import numpy as np
@@ -604,7 +604,9 @@ class InterruptionStreamBase(ABC):
             await self._metrics_task
         finally:
             await self._tee_aiter.aclose()
-            self._model._stream_closed(self)
+            self._model._stream_closed(
+                cast(InterruptionHttpStream | InterruptionWebSocketStream, self)
+            )
 
     async def __anext__(self) -> OverlappingSpeechEvent:
         try:
