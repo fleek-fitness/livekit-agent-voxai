@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import multiprocessing as mp
+import signal
 import socket
 from unittest.mock import AsyncMock, patch
 
@@ -158,27 +159,48 @@ class TestDrainTimeout:
 
         mock_aclose.assert_not_awaited()
 
-    def test_exitcli_during_drain_forces_exit(self) -> None:
-        """When drain() raises _ExitCli (second SIGTERM), the handler
-        calls os._exit(1) for a forceful shutdown.
-        """
+    def test_duplicate_signal_during_drain_does_not_skip_aclose(self) -> None:
+        """A second signal must not interrupt an in-progress graceful drain."""
         server = _make_server()
+        handlers = {}
+
+        async def _run_until_signal(*args, **kwargs) -> None:
+            handlers[signal.SIGTERM](signal.SIGTERM, None)
+            await asyncio.Future()
+
+        async def _drain_after_duplicate_signal(*args, **kwargs) -> None:
+            handlers[signal.SIGTERM](signal.SIGTERM, None)
 
         with (
-            patch.object(
-                server,
-                "drain",
-                new_callable=AsyncMock,
-                side_effect=_ExitCli(),
-            ),
+            patch.object(server, "drain", side_effect=_drain_after_duplicate_signal),
             patch.object(server, "aclose", new_callable=AsyncMock) as mock_aclose,
-            patch.object(server, "run", new_callable=AsyncMock),
-            patch("os._exit") as mock_exit,
+            patch.object(server, "run", side_effect=_run_until_signal),
+            patch("livekit.agents.cli.cli.signal.signal", side_effect=handlers.__setitem__),
         ):
             _run_worker(server, args=_CLI_ARGS)
 
-        mock_aclose.assert_not_awaited()
-        mock_exit.assert_called_once_with(1)
+        mock_aclose.assert_awaited_once()
+
+    def test_signal_from_asyncio_callback_frame_reaches_drain(self) -> None:
+        """Signal callbacks request shutdown without raising into Handle._run."""
+        server = _make_server()
+        handlers = {}
+
+        async def _run_until_signal(*args, **kwargs) -> None:
+            loop = asyncio.get_running_loop()
+            loop.call_soon(handlers[signal.SIGTERM], signal.SIGTERM, None)
+            await asyncio.Future()
+
+        with (
+            patch.object(server, "drain", new_callable=AsyncMock) as mock_drain,
+            patch.object(server, "aclose", new_callable=AsyncMock) as mock_aclose,
+            patch.object(server, "run", side_effect=_run_until_signal),
+            patch("livekit.agents.cli.cli.signal.signal", side_effect=handlers.__setitem__),
+        ):
+            _run_worker(server, args=_CLI_ARGS)
+
+        mock_drain.assert_awaited_once()
+        mock_aclose.assert_awaited_once()
 
     def test_memory_monitor_does_not_swallow_exitcli(self) -> None:
         """SIGTERM/SIGINT should not be eaten by broad Exception handlers.

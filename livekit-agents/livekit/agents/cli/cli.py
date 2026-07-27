@@ -1578,25 +1578,21 @@ def _run_worker(server: AgentServer, args: proto.CliArgs, jupyter: bool = False)
     if args.devmode:
         c = AgentsConsole.get_instance()  # colored logs
 
-    exit_triggered = False
-
-    if not jupyter:
-
-        def _handle_exit(sig: int, frame: FrameType | None) -> None:
-            nonlocal exit_triggered
-            if not exit_triggered:
-                exit_triggered = True
-                raise _ExitCli()
-
-        for sig in HANDLED_SIGNALS:
-            signal.signal(sig, _handle_exit)
-
     _configure_logger(c, args.log_level)
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
     loop.slow_callback_duration = 0.1  # 100ms
+    shutdown_requested = asyncio.Event()
+
+    if not jupyter:
+
+        def _handle_exit(sig: int, frame: FrameType | None) -> None:
+            loop.call_soon_threadsafe(shutdown_requested.set)
+
+        for sig in HANDLED_SIGNALS:
+            signal.signal(sig, _handle_exit)
 
     async def _worker_run(worker: AgentServer) -> None:
         try:
@@ -1614,29 +1610,36 @@ def _run_worker(server: AgentServer, args: proto.CliArgs, jupyter: bool = False)
 
     try:
         main_task = loop.create_task(_worker_run(server), name="worker_main_task_cli")
-        try:
-            loop.run_until_complete(main_task)
-        except _ExitCli:
-            pass
 
-        try:
-            exit_triggered = False  # allow a new _ExitCLI raise
-            if not args.devmode:
-                try:
-                    loop.run_until_complete(server.drain())
-                except asyncio.TimeoutError:
-                    logger.warning("drain timed out, forcing shutdown")
+        async def _wait_for_worker_or_shutdown() -> None:
+            shutdown_task = asyncio.create_task(
+                shutdown_requested.wait(),
+                name="worker_shutdown_signal_cli",
+            )
+            try:
+                done, _ = await asyncio.wait(
+                    {main_task, shutdown_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if main_task in done:
+                    await main_task
+            finally:
+                shutdown_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await shutdown_task
 
-            loop.run_until_complete(server.aclose())
+        loop.run_until_complete(_wait_for_worker_or_shutdown())
 
-            if watch_client:
-                loop.run_until_complete(watch_client.aclose())
-        except _ExitCli:
-            if not jupyter:
-                logger.warning("exiting forcefully")
-                import os
+        if not args.devmode:
+            try:
+                loop.run_until_complete(server.drain())
+            except asyncio.TimeoutError:
+                logger.warning("drain timed out, forcing shutdown")
 
-                os._exit(1)  # TODO(theomonnom): add aclose(force=True) in worker
+        loop.run_until_complete(server.aclose())
+
+        if watch_client:
+            loop.run_until_complete(watch_client.aclose())
     finally:
         if jupyter:
             loop.close()  # close can only be called from the main thread
