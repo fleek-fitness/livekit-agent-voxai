@@ -11,6 +11,7 @@ import pytest
 from livekit.agents import (
     Agent,
     AgentFalseInterruptionEvent,
+    AgentSession,
     AgentStateChangedEvent,
     ConversationItemAddedEvent,
     FlushSentinel,
@@ -22,6 +23,10 @@ from livekit.agents import (
     function_tool,
     inference,
     vad,
+)
+from livekit.agents.inference.interruption import (
+    _AgentSpeechStartedSentinel,
+    _OverlapSpeechStartedSentinel,
 )
 from livekit.agents.llm import (
     FunctionToolCall,
@@ -765,6 +770,107 @@ async def test_backchannel_boundary_suppresses_start_boundary_backchannel() -> N
         await _close_test_session(session)
 
 
+def _active_adaptive_recognition() -> tuple[AgentSession, AudioRecognition]:
+    session = create_session(FakeActions())
+    detector = MagicMock()
+    detector.state = "active"
+    recognition = AudioRecognition(
+        session,
+        hooks=_TestRecognitionHooks(),
+        endpointing=BaseEndpointing(min_delay=0.1, max_delay=1.0),
+        stt=None,
+        vad=MagicMock(),
+        interruption_detection=detector,
+        turn_detection="vad",
+    )
+    recognition._interruption_ch = aio.Chan[inference.InterruptionDataFrameType]()
+    return session, recognition
+
+
+async def test_agent_start_connects_vad_speech_that_started_before_playout() -> None:
+    session, recognition = _active_adaptive_recognition()
+    recognition._speaking = True
+    recognition._vad_speech_started = True
+    recognition._speech_start_time = 100.0
+
+    try:
+        recognition.on_start_of_agent_speech(started_at=100.7)
+
+        agent_started = recognition._interruption_ch.recv_nowait()
+        overlap_started = recognition._interruption_ch.recv_nowait()
+        assert isinstance(agent_started, _AgentSpeechStartedSentinel)
+        assert isinstance(overlap_started, _OverlapSpeechStartedSentinel)
+        assert overlap_started._speech_duration == pytest.approx(0.7)
+        assert overlap_started._started_at == 100.0
+        assert overlap_started._user_speaking_span is session._user_speaking_span
+        assert recognition._interruption_ch.empty()
+    finally:
+        recognition._interruption_ch.close()
+        await _close_test_session(session)
+
+
+async def test_agent_start_does_not_connect_vad_speech_that_already_ended() -> None:
+    session, recognition = _active_adaptive_recognition()
+    recognition._vad_speech_started = False
+    recognition._speech_start_time = 100.0
+
+    try:
+        recognition.on_start_of_agent_speech(started_at=100.7)
+
+        assert isinstance(
+            recognition._interruption_ch.recv_nowait(),
+            _AgentSpeechStartedSentinel,
+        )
+        assert recognition._interruption_ch.empty()
+    finally:
+        recognition._interruption_ch.close()
+        await _close_test_session(session)
+
+
+async def test_agent_start_does_not_connect_stale_vad_segment_after_stt_eos() -> None:
+    session, recognition = _active_adaptive_recognition()
+    recognition._turn_detection_mode = "stt"
+    recognition._speaking = False
+    recognition._vad_speech_started = True
+    recognition._speech_start_time = 100.0
+
+    try:
+        recognition.on_start_of_agent_speech(started_at=100.7)
+
+        assert isinstance(
+            recognition._interruption_ch.recv_nowait(),
+            _AgentSpeechStartedSentinel,
+        )
+        assert recognition._interruption_ch.empty()
+    finally:
+        recognition._interruption_ch.close()
+        await _close_test_session(session)
+
+
+async def test_vad_start_after_agent_uses_normal_overlap_path_once() -> None:
+    session, recognition = _active_adaptive_recognition()
+
+    try:
+        recognition.on_start_of_agent_speech(started_at=100.0)
+        assert isinstance(
+            recognition._interruption_ch.recv_nowait(),
+            _AgentSpeechStartedSentinel,
+        )
+
+        recognition.on_start_of_speech(
+            started_at=100.2,
+            speech_duration=0.05,
+        )
+        overlap_started = recognition._interruption_ch.recv_nowait()
+        assert isinstance(overlap_started, _OverlapSpeechStartedSentinel)
+        assert overlap_started._speech_duration == 0.05
+        assert overlap_started._started_at == 100.2
+        assert recognition._interruption_ch.empty()
+    finally:
+        recognition._interruption_ch.close()
+        await _close_test_session(session)
+
+
 async def _make_stt_eos_recognition() -> AudioRecognition:
     return AudioRecognition(
         create_session(FakeActions()),
@@ -1405,6 +1511,58 @@ async def test_silent_tool_call_pause_state_does_not_leak_into_tool_reply() -> N
     assert transitions[silent_step_finished + 1] == ("listening", "speaking")
     assert false_interruption_events
     assert false_interruption_events[-1].resumed is True
+
+
+async def test_ignore_word_final_keeps_paused_speech() -> None:
+    """A backchannel final ("네") must resume the paused speech, not kill it.
+
+    Before the fix, on_final_transcript unconditionally cancelled the speech
+    pause: the paused speech was interrupted while the ignore-word gate in
+    on_end_of_turn dropped the transcript without a reply — dead air.
+    """
+    speed = 5.0
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.5, "Tell me a story.")
+    actions.add_llm("Here is a long story for you ... the end.")
+    actions.add_tts(10.0)  # playout starts at 3.5s
+
+    # Backchannel while the agent is speaking. The VAD pause fires before the
+    # transcript is known; the final arrives after end-of-speech.
+    actions.add_user_speech(5.0, 5.8, "네", stt_delay=0.3)
+
+    session = create_session(
+        actions,
+        speed_factor=speed,
+        can_pause_audio=True,
+        turn_handling={"interruption": {"false_interruption_timeout": 0.3 / speed}},
+        extra_kwargs={"interruption_ignore_words": ["네"]},
+    )
+    agent = MyAgent()
+
+    agent_state_events: list[AgentStateChangedEvent] = []
+    false_interruption_events: list[AgentFalseInterruptionEvent] = []
+    playback_finished_events: list[PlaybackFinishedEvent] = []
+    session.on("agent_state_changed", agent_state_events.append)
+    session.on("agent_false_interruption", false_interruption_events.append)
+    session.output.audio.on("playback_finished", playback_finished_events.append)
+
+    await asyncio.wait_for(run_session(session, agent), timeout=SESSION_TIMEOUT)
+
+    # the pause was recognized as a false interruption and playback resumed
+    assert false_interruption_events
+    assert false_interruption_events[-1].resumed is True
+    transitions = [(ev.old_state, ev.new_state) for ev in agent_state_events]
+    assert ("listening", "speaking") in transitions[transitions.index(("speaking", "listening")) :]
+
+    # the story played to completion and the backchannel produced no reply
+    # (the "네" transcript itself may still be flushed into the chat context
+    # during session drain — only a generated reply would be a regression)
+    assert playback_finished_events[-1].interrupted is False
+    assistant_messages = [
+        item for item in agent.chat_ctx.items if item.type == "message" and item.role == "assistant"
+    ]
+    assert len(assistant_messages) == 1
+    assert assistant_messages[-1].interrupted is False
 
 
 class FlushMultiSegmentAgent(Agent):

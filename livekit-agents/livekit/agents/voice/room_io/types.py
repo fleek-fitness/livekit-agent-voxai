@@ -88,6 +88,9 @@ class AudioOutputOptions:
     )
     track_name: NotGivenOr[str] = NOT_GIVEN
     """The name of the audio track to publish. If not provided, default to "roomio_audio"."""
+    fade_out_ms: int = 0
+    """voxai: fade the audio out over this window on pause/interrupt instead of
+    cutting instantly. 0 (default) keeps the stock clear_queue behavior."""
 
 
 @dataclass

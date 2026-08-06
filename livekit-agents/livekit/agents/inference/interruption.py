@@ -588,7 +588,8 @@ class InterruptionStreamBase(ABC):
             self._accumulated_samples = 0
             await self._num_requests.set(0)
 
-            self._audio_buffer.reset()
+            # Keep customer PCM across agent boundaries so the next overlap can
+            # recover its VAD-onset prefix from the existing ring buffer.
             self._cache.clear()
             self._user_speech_span = None
 
@@ -608,23 +609,35 @@ class InterruptionStreamBase(ABC):
                     self._overlap_started = True
                     self._accumulated_samples = 0
                     self._overlap_count += 1
-                    # include the audio prefix in the window and
-                    # only shift (remove leading silence) when the first overlap speech started
-                    # otherwise, keep the existing data
-                    if self._overlap_count == 1:
-                        shift_size = max(
-                            0,
-                            len(self._audio_buffer)
-                            - (
-                                int(input_frame._speech_duration * self._sample_rate)
-                                + self._prefix_size
-                            ),
-                        )
-                        self._audio_buffer.shift(shift_size)
-                    logger.trace(
+                    # Re-anchor every overlap. Otherwise a later overlap can include stale
+                    # audio from an earlier attempt and produce a false interruption.
+                    buffer_samples_before_trim = len(self._audio_buffer)
+                    speech_samples = int(input_frame._speech_duration * self._sample_rate)
+                    shift_size = max(
+                        0,
+                        buffer_samples_before_trim - (speech_samples + self._prefix_size),
+                    )
+                    self._audio_buffer.shift(shift_size)
+                    prefix_samples_available = max(
+                        0,
+                        min(
+                            self._prefix_size,
+                            buffer_samples_before_trim - speech_samples,
+                        ),
+                    )
+                    logger.debug(
                         "overlap speech started, starting interruption inference",
                         extra={
                             "overlap_count": self._overlap_count,
+                            "buffer_samples_before_trim": buffer_samples_before_trim,
+                            "buffer_samples_after_trim": len(self._audio_buffer),
+                            "speech_samples": speech_samples,
+                            "prefix_samples_target": self._prefix_size,
+                            "prefix_samples_available": prefix_samples_available,
+                            "prefix_underflow_samples": (
+                                self._prefix_size - prefix_samples_available
+                            ),
+                            "shift_size": shift_size,
                         },
                     )
                     self._cache.clear()
@@ -653,10 +666,14 @@ class InterruptionStreamBase(ABC):
                     self._accumulated_samples = 0
                     self._overlap_started_at = None
                     # we don't clear the cache here since responses might be in flight
-                case rtc.AudioFrame() if self._agent_speech_started:
+                case rtc.AudioFrame():
+                    # Capture continuously; agent/overlap state gates inference only.
                     samples_written = self._audio_buffer.push_frame(input_frame)
+                    if not self._agent_speech_started or not self._overlap_started:
+                        continue
+
                     self._accumulated_samples += samples_written
-                    if self._accumulated_samples >= self._batch_size and self._overlap_started:
+                    if self._accumulated_samples >= self._batch_size:
                         output_ch.send_nowait(self._audio_buffer.read())
                         self._accumulated_samples = 0
 
@@ -735,7 +752,15 @@ class InterruptionHttpStream(InterruptionStreamBase):
                     is_interruption=resp.is_bargein,
                 )
                 if entry.is_interruption and self._overlap_started:
-                    logger.debug("user interruption detected")
+                    logger.debug(
+                        "user interruption detected",
+                        extra={
+                            "input_samples": (
+                                len(entry.speech_input) if entry.speech_input is not None else None
+                            ),
+                            "probability": entry.get_probability(),
+                        },
+                    )
                     if self._user_speech_span:
                         self._update_user_speech_span(self._user_speech_span, entry)
                         self._user_speech_span = None
@@ -1016,6 +1041,11 @@ class InterruptionWebSocketStream(InterruptionStreamBase):
                             logger.debug(
                                 "interruption detected",
                                 extra={
+                                    "input_samples": (
+                                        len(entry.speech_input)
+                                        if entry.speech_input is not None
+                                        else None
+                                    ),
                                     "total_duration": entry.get_total_duration(),
                                     "prediction_duration": entry.get_prediction_duration(),
                                     "detection_delay": entry.get_detection_delay(),
@@ -1048,6 +1078,11 @@ class InterruptionWebSocketStream(InterruptionStreamBase):
                             logger.trace(
                                 "interruption inference done",
                                 extra={
+                                    "input_samples": (
+                                        len(entry.speech_input)
+                                        if entry.speech_input is not None
+                                        else None
+                                    ),
                                     "total_duration": entry.get_total_duration(),
                                     "prediction_duration": entry.get_prediction_duration(),
                                     "probability": entry.get_probability(),
