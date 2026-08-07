@@ -37,7 +37,7 @@ from livekit.agents.utils import aio
 from livekit.agents.voice.agent_activity import AgentActivity
 from livekit.agents.voice.audio_recognition import AudioRecognition, _EndOfTurnInfo
 from livekit.agents.voice.endpointing import BaseEndpointing
-from livekit.agents.voice.events import FunctionToolsExecutedEvent
+from livekit.agents.voice.events import CloseReason, FunctionToolsExecutedEvent
 from livekit.agents.voice.io import PlaybackFinishedEvent
 
 from .fake_session import FakeActions, create_session, run_session
@@ -87,6 +87,48 @@ class MyAgent(Agent):
 
         if self.on_user_turn_completed_delay > 0.0:
             await asyncio.sleep(self.on_user_turn_completed_delay)
+
+
+class _CancellingCloseActivity:
+    agent = object()
+    current_speech = None
+    _audio_recognition = None
+
+    async def interrupt(self, *, force: bool) -> None:
+        return None
+
+    async def drain(self) -> None:
+        raise asyncio.CancelledError
+
+
+async def test_aclose_logs_cancelled_stage_without_identifiers(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    session = AgentSession.__new__(AgentSession)
+    session._root_span_context = None
+    session._lock = asyncio.Lock()
+    session._started = True
+    session._closing = False
+    session._cancel_user_away_timer = Mock()
+    session._on_aec_warmup_expired = Mock()
+    session._amd = None
+    session._activity = _CancellingCloseActivity()
+
+    caplog.set_level(logging.WARNING, logger="livekit.agents")
+
+    with pytest.raises(asyncio.CancelledError):
+        await session._aclose_impl(reason=CloseReason.USER_INITIATED)
+
+    record = next(
+        record for record in caplog.records if record.message == "agent session close cancelled"
+    )
+    fields = vars(record)
+    assert fields["reason"] == CloseReason.USER_INITIATED.value
+    assert fields["stage"] == "activity_drain"
+    assert fields["drain"] is False
+    assert fields["closing"] is True
+    assert fields["has_activity"] is True
+    assert {"room", "job", "agent", "transcript"}.isdisjoint(fields)
 
 
 SESSION_TIMEOUT = 60.0

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import time
-from collections.abc import AsyncIterable, AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import AbstractContextManager, asynccontextmanager, nullcontext
 from contextvars import Token
 from dataclasses import dataclass
@@ -948,6 +948,32 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
             | None
         ) = None,
     ) -> None:
+        close_started_at = time.perf_counter()
+
+        async def await_close_step(awaitable: Awaitable[Any], *, stage: str) -> Any:
+            try:
+                return await awaitable
+            except asyncio.CancelledError:
+                # Deliberately exclude room, job, agent, and transcript identifiers.
+                task = asyncio.current_task()
+                logger.warning(
+                    "agent session close cancelled",
+                    extra={
+                        "reason": reason.value,
+                        "stage": stage,
+                        "drain": drain,
+                        "elapsed_ms": round((time.perf_counter() - close_started_at) * 1000, 1),
+                        "task_cancelling_count": task.cancelling() if task is not None else None,
+                        "started": bool(getattr(self, "_started", False)),
+                        "closing": bool(getattr(self, "_closing", False)),
+                        "has_activity": getattr(self, "_activity", None) is not None,
+                        "has_room_io": getattr(self, "_room_io", None) is not None,
+                        "has_recorder_io": getattr(self, "_recorder_io", None) is not None,
+                        "has_session_host": getattr(self, "_session_host", None) is not None,
+                    },
+                )
+                raise
+
         if self._root_span_context:
             # make `activity.drain` and `on_exit` under the root span
             otel_context.attach(self._root_span_context)
@@ -961,14 +987,16 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
             self._on_aec_warmup_expired()  # always clear aec warmup when closing the session
 
             if self._amd is not None:
-                await self._amd.aclose()
+                await await_close_step(self._amd.aclose(), stage="amd_close")
                 self._amd = None
 
             activity = self._activity
             while activity and isinstance(agent_task := activity.agent, AgentTask):
                 # notify AgentTask to complete and wait it to resume the parent agent
                 agent_task.cancel()
-                await agent_task._wait_for_inactive()
+                await await_close_step(
+                    agent_task._wait_for_inactive(), stage="agent_task_wait_inactive"
+                )
 
                 if old_agent := agent_task._old_agent:
                     activity = old_agent._activity
@@ -979,15 +1007,17 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
                 if not drain:
                     try:
                         # force interrupt speeches when closing the session
-                        await activity.interrupt(force=True)
+                        await await_close_step(
+                            activity.interrupt(force=True), stage="activity_interrupt"
+                        )
                     except RuntimeError:
                         # uninterruptible speech
                         pass
-                await activity.drain()
+                await await_close_step(activity.drain(), stage="activity_drain")
 
                 # wait any uninterruptible speech to finish
                 if activity.current_speech:
-                    await activity.current_speech
+                    await await_close_step(activity.current_speech, stage="current_speech_wait")
 
                 # detach the inputs and outputs
                 self.input.audio = None
@@ -1005,7 +1035,7 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
                         transcript_timeout=self._opts.session_close_transcript_timeout,
                     )
 
-                await activity.aclose()
+                await await_close_step(activity.aclose(), stage="activity_close")
             self._activity = None
 
             if self._agent_speaking_span:
@@ -1017,19 +1047,25 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
                 self._user_speaking_span = None
 
             if self._forward_audio_atask is not None:
-                await utils.aio.cancel_and_wait(self._forward_audio_atask)
+                await await_close_step(
+                    utils.aio.cancel_and_wait(self._forward_audio_atask),
+                    stage="forward_audio_cancel",
+                )
 
             if self._recorder_io:
-                await self._recorder_io.aclose()
+                await await_close_step(self._recorder_io.aclose(), stage="recorder_close")
 
             if self._ivr_activity is not None:
-                await self._ivr_activity.aclose()
+                await await_close_step(self._ivr_activity.aclose(), stage="ivr_activity_close")
 
             toolsets = [tool for tool in self._tools if isinstance(tool, llm.Toolset)]
             if toolsets:
-                await asyncio.gather(
-                    *(toolset.aclose() for toolset in toolsets),
-                    return_exceptions=True,
+                await await_close_step(
+                    asyncio.gather(
+                        *(toolset.aclose() for toolset in toolsets),
+                        return_exceptions=True,
+                    ),
+                    stage="toolsets_close",
                 )
 
             if self._session_span:
@@ -1048,12 +1084,12 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
             self._root_span_context = None
 
             if self._session_host:
-                await self._session_host.aclose()
+                await await_close_step(self._session_host.aclose(), stage="session_host_close")
                 self._session_host = None
 
             # close room io after close event is emitted
             if self._room_io:
-                await self._room_io.aclose()
+                await await_close_step(self._room_io.aclose(), stage="room_io_close")
                 self._room_io = None
 
         logger.debug("session closed", extra={"reason": reason.value, "error": error})
