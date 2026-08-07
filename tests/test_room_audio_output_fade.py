@@ -39,7 +39,9 @@ class _FakeAudioSource:
         return None
 
 
-def _make_output(monkeypatch, *, fade_out_ms: int) -> tuple[_ParticipantAudioOutput, _FakeAudioSource]:
+def _make_output(
+    monkeypatch, *, fade_out_ms: int
+) -> tuple[_ParticipantAudioOutput, _FakeAudioSource]:
     monkeypatch.setattr(output_module.rtc, "AudioSource", _FakeAudioSource)
     out = _ParticipantAudioOutput(
         room=object(),  # unused by the paths under test
