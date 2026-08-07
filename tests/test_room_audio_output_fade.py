@@ -7,8 +7,6 @@ queue content as a cosine ramp instead of cutting mid-phoneme.
 
 from __future__ import annotations
 
-import asyncio
-
 import numpy as np
 import pytest
 
