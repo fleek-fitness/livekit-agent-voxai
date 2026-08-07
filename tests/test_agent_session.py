@@ -13,6 +13,7 @@ from livekit.agents import (
     AgentFalseInterruptionEvent,
     AgentSession,
     AgentStateChangedEvent,
+    AgentTask,
     ConversationItemAddedEvent,
     FlushSentinel,
     LanguageCode,
@@ -101,9 +102,37 @@ class _CancellingCloseActivity:
         raise asyncio.CancelledError
 
 
-async def test_aclose_logs_cancelled_stage_without_identifiers(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
+class _BlockingCloseActivity(_CancellingCloseActivity):
+    def __init__(self) -> None:
+        self.drain_started = asyncio.Event()
+        self.release_drain = asyncio.Event()
+
+    async def drain(self) -> None:
+        self.drain_started.set()
+        await self.release_drain.wait()
+
+
+class _CancellingAgentTask(AgentTask[None]):
+    def __init__(self) -> None:
+        self._old_agent = None
+        self.cancel_called = False
+
+    def cancel(self) -> None:
+        self.cancel_called = True
+
+    async def _wait_for_inactive(self) -> None:
+        raise asyncio.CancelledError
+
+
+class _AgentTaskCloseActivity:
+    current_speech = None
+    _audio_recognition = None
+
+    def __init__(self, agent: AgentTask[None]) -> None:
+        self.agent = agent
+
+
+def _create_closing_test_session(activity: object) -> AgentSession:
     session = AgentSession.__new__(AgentSession)
     session._root_span_context = None
     session._lock = asyncio.Lock()
@@ -112,7 +141,14 @@ async def test_aclose_logs_cancelled_stage_without_identifiers(
     session._cancel_user_away_timer = Mock()
     session._on_aec_warmup_expired = Mock()
     session._amd = None
-    session._activity = _CancellingCloseActivity()
+    session._activity = activity
+    return session
+
+
+async def test_aclose_logs_cancelled_stage_without_identifiers(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    session = _create_closing_test_session(_CancellingCloseActivity())
 
     caplog.set_level(logging.WARNING, logger="livekit.agents")
 
@@ -129,6 +165,65 @@ async def test_aclose_logs_cancelled_stage_without_identifiers(
     assert fields["closing"] is True
     assert fields["has_activity"] is True
     assert {"room", "job", "agent", "transcript"}.isdisjoint(fields)
+
+
+async def test_aclose_logs_child_agent_task_cancellation(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    agent_task = _CancellingAgentTask()
+    session = _create_closing_test_session(_AgentTaskCloseActivity(agent_task))
+
+    caplog.set_level(logging.WARNING, logger="livekit.agents")
+
+    with pytest.raises(asyncio.CancelledError):
+        await session._aclose_impl(reason=CloseReason.USER_INITIATED)
+
+    record = next(
+        record for record in caplog.records if record.message == "agent session close cancelled"
+    )
+    assert agent_task.cancel_called is True
+    assert record.stage == "agent_task_wait_inactive"
+
+
+async def test_aclose_preserves_parent_cancellation(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    activity = _BlockingCloseActivity()
+    session = _create_closing_test_session(activity)
+    close_task = asyncio.create_task(session._aclose_impl(reason=CloseReason.USER_INITIATED))
+
+    await activity.drain_started.wait()
+    close_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await close_task
+
+    record = next(
+        record for record in caplog.records if record.message == "agent session close cancelled"
+    )
+    assert record.stage == "activity_drain"
+
+
+async def test_aclose_handles_task_without_cancelling_method(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    activity = _BlockingCloseActivity()
+    session = _create_closing_test_session(activity)
+    close_task = asyncio.create_task(session._aclose_impl(reason=CloseReason.USER_INITIATED))
+
+    await activity.drain_started.wait()
+    monkeypatch.setattr(asyncio, "current_task", lambda *args, **kwargs: object())
+    activity.release_drain.set()
+    close_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await close_task
+
+    record = next(
+        record for record in caplog.records if record.message == "agent session close cancelled"
+    )
+    assert record.task_cancelling_count is None
 
 
 SESSION_TIMEOUT = 60.0

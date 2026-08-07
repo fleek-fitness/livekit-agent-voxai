@@ -956,6 +956,7 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
             except asyncio.CancelledError:
                 # Deliberately exclude room, job, agent, and transcript identifiers.
                 task = asyncio.current_task()
+                cancelling = getattr(task, "cancelling", None)
                 logger.warning(
                     "agent session close cancelled",
                     extra={
@@ -963,7 +964,7 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
                         "stage": stage,
                         "drain": drain,
                         "elapsed_ms": round((time.perf_counter() - close_started_at) * 1000, 1),
-                        "task_cancelling_count": task.cancelling() if task is not None else None,
+                        "task_cancelling_count": cancelling() if callable(cancelling) else None,
                         "started": bool(getattr(self, "_started", False)),
                         "closing": bool(getattr(self, "_closing", False)),
                         "has_activity": getattr(self, "_activity", None) is not None,
