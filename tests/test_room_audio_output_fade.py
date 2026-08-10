@@ -7,8 +7,6 @@ queue content as a cosine ramp instead of cutting mid-phoneme.
 
 from __future__ import annotations
 
-import asyncio
-
 import numpy as np
 import pytest
 
@@ -41,7 +39,9 @@ class _FakeAudioSource:
         return None
 
 
-def _make_output(monkeypatch, *, fade_out_ms: int) -> tuple[_ParticipantAudioOutput, _FakeAudioSource]:
+def _make_output(
+    monkeypatch, *, fade_out_ms: int
+) -> tuple[_ParticipantAudioOutput, _FakeAudioSource]:
     monkeypatch.setattr(output_module.rtc, "AudioSource", _FakeAudioSource)
     out = _ParticipantAudioOutput(
         room=object(),  # unused by the paths under test
