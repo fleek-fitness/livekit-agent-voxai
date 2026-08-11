@@ -3058,6 +3058,7 @@ class AgentActivity(RecognitionHooks):
         class _SpeechSegment:
             text: utils.aio.Chan[str]  # transcript text for this segment
             tts: _TTSGenerationData | None = None  # audio + timed transcript, when enabled
+            tts_task: asyncio.Task[bool] | None = None
             id: str | None = None
             terminal_emitted: bool = False
 
@@ -3109,6 +3110,7 @@ class AgentActivity(RecognitionHooks):
                 # but the next starts during the previous segment's playout, not after
                 nonlocal tts_text, prev_tts_task
                 tts_data: _TTSGenerationData | None = None
+                segment_tts_task: asyncio.Task[bool] | None = None
                 tts_text = None
                 if audio_output is not None:
                     if prev_tts_task is not None:
@@ -3123,7 +3125,12 @@ class AgentActivity(RecognitionHooks):
                         provider=self.tts.provider if self.tts else None,
                     )
                     tasks.append(prev_tts_task)
-                seg = _SpeechSegment(text=utils.aio.Chan[str](), tts=tts_data)
+                    segment_tts_task = prev_tts_task
+                seg = _SpeechSegment(
+                    text=utils.aio.Chan[str](),
+                    tts=tts_data,
+                    tts_task=segment_tts_task,
+                )
                 segments.append(seg)
                 segment_ch.send_nowait(seg)
                 return seg
@@ -3133,6 +3140,8 @@ class AgentActivity(RecognitionHooks):
                 if current is not None:
                     current.id = segment_id
                     current.text.close()
+                else:
+                    _emit_segment_id(segment_id, "skipped")
                 if tts_text is not None:
                     tts_text.close()  # let this segment's TTS inference finish
                 current, tts_text = None, None
@@ -3337,13 +3346,26 @@ class AgentActivity(RecognitionHooks):
             )
             segment_outputs.append(out)
             segment_played = out.played
-            if audio_output is not None and (
-                out.audio_out is None
-                or not out.audio_out.first_frame_fut.done()
-                or out.audio_out.first_frame_fut.cancelled()
-            ):
-                # Text generation alone does not mean the voice segment was heard.
-                segment_played = "skipped"
+            if audio_output is not None:
+                audio_started = bool(
+                    out.audio_out is not None
+                    and out.audio_out.first_frame_fut.done()
+                    and not out.audio_out.first_frame_fut.cancelled()
+                )
+                if not audio_started:
+                    # Text generation alone does not mean the voice segment was heard.
+                    segment_played = "skipped"
+                elif segment.tts_task is not None:
+                    try:
+                        tts_succeeded = (
+                            segment.tts_task.done()
+                            and not segment.tts_task.cancelled()
+                            and segment.tts_task.result()
+                        )
+                    except Exception:
+                        tts_succeeded = False
+                    if not tts_succeeded and segment_played == "full":
+                        segment_played = "partial"
             _emit_segment_finished(segment, segment_played)
             if speech_handle.interrupted:
                 break

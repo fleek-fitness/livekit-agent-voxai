@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 
+from livekit import rtc
 from livekit.agents import (
     Agent,
     AgentFalseInterruptionEvent,
@@ -1754,6 +1755,34 @@ class FailingAudioFlushMultiSegmentAgent(FlushMultiSegmentAgent):
             yield
 
 
+class PartiallyFailingAudioFlushMultiSegmentAgent(FlushMultiSegmentAgent):
+    async def tts_node(
+        self, text: AsyncIterable[str], model_settings: ModelSettings
+    ) -> AsyncIterable[rtc.AudioFrame]:
+        async for _ in text:
+            pass
+        yield rtc.AudioFrame(
+            data=b"\x00\x00" * 2400,
+            sample_rate=24000,
+            num_channels=1,
+            samples_per_channel=2400,
+        )
+        raise RuntimeError("synthetic partial TTS failure")
+
+
+class EmptyLabelledSegmentAgent(Agent):
+    def __init__(self) -> None:
+        super().__init__(instructions="You are a helpful assistant.")
+
+    async def llm_node(
+        self,
+        chat_ctx: ChatContext,
+        tools: list,
+        model_settings: ModelSettings,
+    ) -> AsyncIterable[str | FlushSentinel]:
+        yield FlushSentinel(segment_id="empty")
+
+
 async def test_pipeline_multi_segment_flush() -> None:
     speed = 5.0
     actions = FakeActions()
@@ -1892,5 +1921,40 @@ async def test_labelled_segments_finalize_when_tts_fails() -> None:
 
     assert [(event.segment_id, event.played) for event in segment_finished_events] == [
         ("acknowledgement", "skipped"),
+        ("followup", "skipped"),
+    ]
+
+
+async def test_empty_labelled_segment_emits_skipped() -> None:
+    speed = 5.0
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.5, "Hello, how are you?", stt_delay=0.2)
+
+    session = create_session(actions, speed_factor=speed)
+    agent = EmptyLabelledSegmentAgent()
+    segment_finished_events: list[SpeechSegmentFinishedEvent] = []
+    session.on("speech_segment_finished", segment_finished_events.append)
+
+    await asyncio.wait_for(run_session(session, agent), timeout=SESSION_TIMEOUT)
+
+    assert [(event.segment_id, event.played) for event in segment_finished_events] == [
+        ("empty", "skipped")
+    ]
+
+
+async def test_partially_failed_audio_segment_emits_partial() -> None:
+    speed = 5.0
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.5, "Hello, how are you?", stt_delay=0.2)
+
+    session = create_session(actions, speed_factor=speed)
+    agent = PartiallyFailingAudioFlushMultiSegmentAgent()
+    segment_finished_events: list[SpeechSegmentFinishedEvent] = []
+    session.on("speech_segment_finished", segment_finished_events.append)
+
+    await asyncio.wait_for(run_session(session, agent), timeout=SESSION_TIMEOUT)
+
+    assert [(event.segment_id, event.played) for event in segment_finished_events] == [
+        ("acknowledgement", "partial"),
         ("followup", "skipped"),
     ]
