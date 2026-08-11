@@ -1805,6 +1805,29 @@ class FailingTranscriptionFlushMultiSegmentAgent(FlushMultiSegmentAgent):
         raise RuntimeError("synthetic transcription failure")
 
 
+class DelayedLabelSingleSegmentAgent(Agent):
+    def __init__(self) -> None:
+        super().__init__(instructions="You are a helpful assistant.")
+
+    async def llm_node(
+        self,
+        chat_ctx: ChatContext,
+        tools: list,
+        model_settings: ModelSettings,
+    ) -> AsyncIterable[str | FlushSentinel]:
+        yield "Hello "
+        await asyncio.sleep(0.1)
+        yield "there."
+        yield FlushSentinel(segment_id="acknowledgement")
+
+    async def transcription_node(
+        self, text: AsyncIterable[str], model_settings: ModelSettings
+    ) -> AsyncIterable[str]:
+        async for delta in text:
+            yield delta
+            return
+
+
 async def test_pipeline_multi_segment_flush() -> None:
     speed = 5.0
     actions = FakeActions()
@@ -2084,4 +2107,23 @@ async def test_labelled_segment_with_all_outputs_disabled_emits_skipped() -> Non
 
     assert [(event.segment_id, event.played) for event in segment_finished_events] == [
         ("acknowledgement", "skipped")
+    ]
+
+
+async def test_terminal_event_waits_for_delayed_segment_label() -> None:
+    speed = 5.0
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.5, "Hello, how are you?", stt_delay=0.2)
+
+    session = create_session(actions, speed_factor=speed)
+    session.output.set_audio_enabled(False)
+
+    agent = DelayedLabelSingleSegmentAgent()
+    segment_finished_events: list[SpeechSegmentFinishedEvent] = []
+    session.on("speech_segment_finished", segment_finished_events.append)
+
+    await asyncio.wait_for(run_session(session, agent), timeout=SESSION_TIMEOUT)
+
+    assert [(event.segment_id, event.played) for event in segment_finished_events] == [
+        ("acknowledgement", "full")
     ]

@@ -3057,9 +3057,9 @@ class AgentActivity(RecognitionHooks):
         @dataclass
         class _SpeechSegment:
             text: utils.aio.Chan[str]  # transcript text for this segment
+            label_fut: asyncio.Future[str | None]
             tts: _TTSGenerationData | None = None  # audio + timed transcript, when enabled
             tts_task: asyncio.Task[bool] | None = None
-            id: str | None = None
             terminal_emitted: bool = False
 
         segment_ch = utils.aio.Chan[_SpeechSegment]()
@@ -3079,17 +3079,20 @@ class AgentActivity(RecognitionHooks):
                 ),
             )
 
-        def _emit_segment_finished(
+        async def _emit_segment_finished(
             segment: _SpeechSegment, played: Literal["full", "partial", "skipped"]
         ) -> None:
             if segment.terminal_emitted:
                 return
+            segment_id = await segment.label_fut
+            if segment.terminal_emitted:
+                return
             segment.terminal_emitted = True
-            _emit_segment_id(segment.id, played)
+            _emit_segment_id(segment_id, played)
 
         async def _emit_unfinished_segments() -> None:
             for segment in segments:
-                _emit_segment_finished(segment, "skipped")
+                await _emit_segment_finished(segment, "skipped")
 
             # _produce_segments may have been cancelled while waiting for the
             # previous segment's TTS. Drain labels that were generated but not
@@ -3128,6 +3131,7 @@ class AgentActivity(RecognitionHooks):
                     segment_tts_task = prev_tts_task
                 seg = _SpeechSegment(
                     text=utils.aio.Chan[str](),
+                    label_fut=asyncio.Future(),
                     tts=tts_data,
                     tts_task=segment_tts_task,
                 )
@@ -3138,7 +3142,8 @@ class AgentActivity(RecognitionHooks):
             def _end_segment(segment_id: str | None = None) -> None:
                 nonlocal current, tts_text
                 if current is not None:
-                    current.id = segment_id
+                    if not current.label_fut.done():
+                        current.label_fut.set_result(segment_id)
                     current.text.close()
                 else:
                     _emit_segment_id(segment_id, "skipped")
@@ -3360,7 +3365,9 @@ class AgentActivity(RecognitionHooks):
                 )
             except BaseException:
                 await utils.aio.cancel_and_wait(*tasks)
-                _emit_segment_finished(segment, "partial" if segment_audio_started else "skipped")
+                await _emit_segment_finished(
+                    segment, "partial" if segment_audio_started else "skipped"
+                )
                 await _emit_unfinished_segments()
                 raise
             segment_outputs.append(out)
@@ -3397,7 +3404,7 @@ class AgentActivity(RecognitionHooks):
                     and not out.text_out.first_text_fut.cancelled()
                 )
                 segment_played = "partial" if text_started else "skipped"
-            _emit_segment_finished(segment, segment_played)
+            await _emit_segment_finished(segment, segment_played)
             if speech_handle.interrupted:
                 break
 
