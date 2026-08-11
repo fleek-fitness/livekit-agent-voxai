@@ -3348,6 +3348,16 @@ class AgentActivity(RecognitionHooks):
             if speech_handle.interrupted:
                 break
 
+        if not speech_handle.interrupted:
+            try:
+                await synthesize_task
+            except Exception:
+                # A failed TTS can stop segment production while later labelled
+                # text is still buffered. Stop the remaining generation before
+                # draining those labels so every observed label is finalized.
+                await utils.aio.cancel_and_wait(*tasks)
+                await _emit_unfinished_segments()
+
         stopped_speaking_at = time.time()
         assistant_metrics: llm.MetricsReport = {}
 

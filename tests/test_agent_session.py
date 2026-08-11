@@ -1743,6 +1743,17 @@ class EmptyAudioFlushMultiSegmentAgent(FlushMultiSegmentAgent):
             yield
 
 
+class FailingAudioFlushMultiSegmentAgent(FlushMultiSegmentAgent):
+    async def tts_node(
+        self, text: AsyncIterable[str], model_settings: ModelSettings
+    ) -> AsyncIterable:
+        async for _ in text:
+            pass
+        raise RuntimeError("synthetic TTS failure")
+        if False:  # make this an async generator without yielding audio
+            yield
+
+
 async def test_pipeline_multi_segment_flush() -> None:
     speed = 5.0
     actions = FakeActions()
@@ -1856,6 +1867,24 @@ async def test_labelled_segments_without_audio_emit_skipped() -> None:
 
     session = create_session(actions, speed_factor=speed)
     agent = EmptyAudioFlushMultiSegmentAgent()
+    segment_finished_events: list[SpeechSegmentFinishedEvent] = []
+    session.on("speech_segment_finished", segment_finished_events.append)
+
+    await asyncio.wait_for(run_session(session, agent), timeout=SESSION_TIMEOUT)
+
+    assert [(event.segment_id, event.played) for event in segment_finished_events] == [
+        ("acknowledgement", "skipped"),
+        ("followup", "skipped"),
+    ]
+
+
+async def test_labelled_segments_finalize_when_tts_fails() -> None:
+    speed = 5.0
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.5, "Hello, how are you?", stt_delay=0.2)
+
+    session = create_session(actions, speed_factor=speed)
+    agent = FailingAudioFlushMultiSegmentAgent()
     segment_finished_events: list[SpeechSegmentFinishedEvent] = []
     session.on("speech_segment_finished", segment_finished_events.append)
 
