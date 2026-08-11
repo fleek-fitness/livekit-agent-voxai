@@ -1783,6 +1783,13 @@ class EmptyLabelledSegmentAgent(Agent):
         yield FlushSentinel(segment_id="empty")
 
 
+class FailingTranscriptionFlushMultiSegmentAgent(FlushMultiSegmentAgent):
+    async def transcription_node(
+        self, text: AsyncIterable[str], model_settings: ModelSettings
+    ) -> AsyncIterable[str]:
+        raise RuntimeError("synthetic transcription failure")
+
+
 async def test_pipeline_multi_segment_flush() -> None:
     speed = 5.0
     actions = FakeActions()
@@ -1956,5 +1963,28 @@ async def test_partially_failed_audio_segment_emits_partial() -> None:
 
     assert [(event.segment_id, event.played) for event in segment_finished_events] == [
         ("acknowledgement", "partial"),
+        ("followup", "skipped"),
+    ]
+
+
+async def test_labelled_segments_finalize_when_transcription_setup_fails() -> None:
+    speed = 5.0
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.5, "Hello, how are you?", stt_delay=0.2)
+    actions.add_tts(1.0, input="Hello there. ", ttfb=0.1, duration=0.1)
+    actions.add_tts(1.0, input="How are you?", ttfb=0.1, duration=0.1)
+
+    session = create_session(actions, speed_factor=speed)
+    agent = FailingTranscriptionFlushMultiSegmentAgent()
+    segment_finished_events: list[SpeechSegmentFinishedEvent] = []
+    speech_handles: list = []
+    session.on("speech_segment_finished", segment_finished_events.append)
+    session.on("speech_created", lambda event: speech_handles.append(event.speech_handle))
+
+    await asyncio.wait_for(run_session(session, agent), timeout=SESSION_TIMEOUT)
+
+    assert isinstance(speech_handles[0]._tasks[0].exception(), RuntimeError)
+    assert [(event.segment_id, event.played) for event in segment_finished_events] == [
+        ("acknowledgement", "skipped"),
         ("followup", "skipped"),
     ]

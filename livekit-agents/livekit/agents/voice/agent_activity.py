@@ -3320,30 +3320,49 @@ class AgentActivity(RecognitionHooks):
                 return None
 
         while (segment := await _next_segment()) is not None:
-            if first_tts_gen_data is None:
-                first_tts_gen_data = segment.tts
+            segment_audio_started = False
 
-            transcript: AsyncIterable[str] = segment.text
-            if (
-                segment.tts is not None
-                and use_aligned_transcript
-                and (timed_texts := await segment.tts.timed_texts_fut)
-            ):
-                transcript = timed_texts
-                read_transcript_from_tts = True
+            def _on_segment_first_frame(
+                fut: asyncio.Future[Any], audio_out: _AudioOutput | None = None
+            ) -> None:
+                nonlocal segment_audio_started
+                try:
+                    fut.result()
+                    segment_audio_started = audio_out is not None
+                except BaseException:
+                    pass
+                _on_first_frame(fut, audio_out)
 
-            tr_node = self._agent.transcription_node(transcript, model_settings)
-            text_source = await tr_node if asyncio.iscoroutine(tr_node) else tr_node
-            audio_source = segment.tts.audio_ch if segment.tts else None
+            try:
+                if first_tts_gen_data is None:
+                    first_tts_gen_data = segment.tts
 
-            out = await forward_generation(
-                speech_handle=speech_handle,
-                audio_output=audio_output,
-                text_output=text_output,
-                audio_source=audio_source,
-                text_source=text_source,
-                on_first_frame=_on_first_frame,
-            )
+                transcript: AsyncIterable[str] = segment.text
+                if (
+                    segment.tts is not None
+                    and use_aligned_transcript
+                    and (timed_texts := await segment.tts.timed_texts_fut)
+                ):
+                    transcript = timed_texts
+                    read_transcript_from_tts = True
+
+                tr_node = self._agent.transcription_node(transcript, model_settings)
+                text_source = await tr_node if asyncio.iscoroutine(tr_node) else tr_node
+                audio_source = segment.tts.audio_ch if segment.tts else None
+
+                out = await forward_generation(
+                    speech_handle=speech_handle,
+                    audio_output=audio_output,
+                    text_output=text_output,
+                    audio_source=audio_source,
+                    text_source=text_source,
+                    on_first_frame=_on_segment_first_frame,
+                )
+            except BaseException:
+                await utils.aio.cancel_and_wait(*tasks)
+                _emit_segment_finished(segment, "partial" if segment_audio_started else "skipped")
+                await _emit_unfinished_segments()
+                raise
             segment_outputs.append(out)
             segment_played = out.played
             if audio_output is not None:
