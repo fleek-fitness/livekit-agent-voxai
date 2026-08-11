@@ -1706,8 +1706,15 @@ async def test_ignore_word_final_keeps_paused_speech() -> None:
 class FlushMultiSegmentAgent(Agent):
     """Agent whose llm_node flushes the reply into two segments via FlushSentinel."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, on_user_turn_completed_delay: float = 0.0) -> None:
         super().__init__(instructions="You are a helpful assistant.")
+        self.on_user_turn_completed_delay = on_user_turn_completed_delay
+
+    async def on_user_turn_completed(
+        self, turn_ctx: ChatContext, new_message: ChatMessage
+    ) -> None:
+        if self.on_user_turn_completed_delay > 0.0:
+            await asyncio.sleep(self.on_user_turn_completed_delay)
 
     async def llm_node(
         self,
@@ -1718,6 +1725,7 @@ class FlushMultiSegmentAgent(Agent):
         yield "Hello there. "
         yield FlushSentinel(segment_id="acknowledgement")
         yield "How are you?"
+        yield FlushSentinel(segment_id="followup")
 
 
 async def test_pipeline_multi_segment_flush() -> None:
@@ -1742,9 +1750,11 @@ async def test_pipeline_multi_segment_flush() -> None:
     # each FlushSentinel-delimited segment plays out independently
     assert len(playback_finished_events) == 2
     assert all(not ev.interrupted for ev in playback_finished_events)
-    assert [ev.segment_id for ev in segment_finished_events] == ["acknowledgement"]
-    assert segment_finished_events[0].played == "full"
-    assert segment_finished_events[0].speech_id
+    assert [(ev.segment_id, ev.played) for ev in segment_finished_events] == [
+        ("acknowledgement", "full"),
+        ("followup", "full"),
+    ]
+    assert all(ev.speech_id for ev in segment_finished_events)
 
     # but both segments join into a single assistant message
     assistant_msgs = [
@@ -1766,7 +1776,9 @@ async def test_pipeline_multi_segment_interrupted() -> None:
     agent = FlushMultiSegmentAgent()
 
     playback_finished_events: list[PlaybackFinishedEvent] = []
+    segment_finished_events: list[SpeechSegmentFinishedEvent] = []
     session.output.audio.on("playback_finished", playback_finished_events.append)
+    session.on("speech_segment_finished", segment_finished_events.append)
 
     asyncio.get_event_loop().call_later(5 / speed, session.interrupt)
 
@@ -1776,6 +1788,10 @@ async def test_pipeline_multi_segment_interrupted() -> None:
     # segment is never forwarded
     assert len(playback_finished_events) == 1
     assert playback_finished_events[0].interrupted is True
+    assert [(ev.segment_id, ev.played) for ev in segment_finished_events] == [
+        ("acknowledgement", "partial"),
+        ("followup", "skipped"),
+    ]
 
     assistant_msgs = [
         it for it in agent.chat_ctx.items if it.type == "message" and it.role == "assistant"
@@ -1783,3 +1799,38 @@ async def test_pipeline_multi_segment_interrupted() -> None:
     assert len(assistant_msgs) == 1
     assert assistant_msgs[0].interrupted is True
     assert "How are you?" not in (assistant_msgs[0].text_content or "")
+
+
+async def test_preemptive_labelled_segments_interrupted_before_scheduling_emit_skipped() -> None:
+    speed = 5.0
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.0, "Tell me something", stt_delay=0.1)
+    actions.add_tts(1.0, input="Hello there. ", ttfb=0.1, duration=0.1)
+    actions.add_tts(1.0, input="How are you?", ttfb=0.1, duration=0.1)
+    actions.add_user_speech(2.6, 3.2, "Actually, start over", stt_delay=0.1)
+    actions.add_tts(1.0, input="Hello there. ", ttfb=0.1, duration=0.1)
+    actions.add_tts(1.0, input="How are you?", ttfb=0.1, duration=0.1)
+
+    session = create_session(
+        actions,
+        speed_factor=speed,
+        turn_handling={
+            "preemptive_generation": {"enabled": True, "preemptive_tts": True}
+        },
+    )
+    agent = FlushMultiSegmentAgent(on_user_turn_completed_delay=2.0 / speed)
+    segment_finished_events: list[SpeechSegmentFinishedEvent] = []
+    session.on("speech_segment_finished", segment_finished_events.append)
+
+    await asyncio.wait_for(
+        run_session(session, agent, drain_delay=1.0), timeout=SESSION_TIMEOUT
+    )
+
+    first_speech_id = segment_finished_events[0].speech_id
+    first_speech_events = [
+        event for event in segment_finished_events if event.speech_id == first_speech_id
+    ]
+    assert [(event.segment_id, event.played) for event in first_speech_events] == [
+        ("acknowledgement", "skipped"),
+        ("followup", "skipped"),
+    ]

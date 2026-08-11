@@ -3059,8 +3059,29 @@ class AgentActivity(RecognitionHooks):
             text: utils.aio.Chan[str]  # transcript text for this segment
             tts: _TTSGenerationData | None = None  # audio + timed transcript, when enabled
             id: str | None = None
+            terminal_emitted: bool = False
 
         segment_ch = utils.aio.Chan[_SpeechSegment]()
+        segments: list[_SpeechSegment] = []
+
+        def _emit_segment_finished(
+            segment: _SpeechSegment, played: Literal["full", "partial", "skipped"]
+        ) -> None:
+            if segment.id is None or segment.terminal_emitted:
+                return
+            segment.terminal_emitted = True
+            self._session.emit(
+                "speech_segment_finished",
+                SpeechSegmentFinishedEvent(
+                    speech_id=speech_handle.id,
+                    segment_id=segment.id,
+                    played=played,
+                ),
+            )
+
+        def _emit_unfinished_segments() -> None:
+            for segment in segments:
+                _emit_segment_finished(segment, "skipped")
 
         @utils.log_exceptions(logger=logger)
         async def _produce_segments() -> None:
@@ -3089,6 +3110,7 @@ class AgentActivity(RecognitionHooks):
                     )
                     tasks.append(prev_tts_task)
                 seg = _SpeechSegment(text=utils.aio.Chan[str](), tts=tts_data)
+                segments.append(seg)
                 segment_ch.send_nowait(seg)
                 return seg
 
@@ -3143,6 +3165,7 @@ class AgentActivity(RecognitionHooks):
         if speech_handle.interrupted:
             current_span.set_attribute(trace_types.ATTR_SPEECH_INTERRUPTED, True)
             await utils.aio.cancel_and_wait(*tasks, wait_for_scheduled)
+            _emit_unfinished_segments()
             return
 
         # start synthesis now if it wasn't started preemptively
@@ -3166,6 +3189,7 @@ class AgentActivity(RecognitionHooks):
         if speech_handle.interrupted:
             current_span.set_attribute(trace_types.ATTR_SPEECH_INTERRUPTED, True)
             await utils.aio.cancel_and_wait(*tasks, *authorization_tasks)
+            _emit_unfinished_segments()
             return
 
         reply_started_at = time.time()
@@ -3298,15 +3322,7 @@ class AgentActivity(RecognitionHooks):
                 on_first_frame=_on_first_frame,
             )
             segment_outputs.append(out)
-            if segment.id is not None:
-                self._session.emit(
-                    "speech_segment_finished",
-                    SpeechSegmentFinishedEvent(
-                        speech_id=speech_handle.id,
-                        segment_id=segment.id,
-                        played=out.played,
-                    ),
-                )
+            _emit_segment_finished(segment, out.played)
             if speech_handle.interrupted:
                 break
 
@@ -3353,6 +3369,7 @@ class AgentActivity(RecognitionHooks):
         if speech_handle.interrupted:
             # forward_generation already cleared the buffer and waited for playout
             await utils.aio.cancel_and_wait(*tasks)
+            _emit_unfinished_segments()
         elif read_transcript_from_tts and any(
             out.played != "skipped" and out.text_out is not None and not out.text_out.text
             for out in segment_outputs
