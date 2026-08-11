@@ -1709,10 +1709,9 @@ class FlushMultiSegmentAgent(Agent):
     def __init__(self, *, on_user_turn_completed_delay: float = 0.0) -> None:
         super().__init__(instructions="You are a helpful assistant.")
         self.on_user_turn_completed_delay = on_user_turn_completed_delay
+        self.generation_count = 0
 
-    async def on_user_turn_completed(
-        self, turn_ctx: ChatContext, new_message: ChatMessage
-    ) -> None:
+    async def on_user_turn_completed(self, turn_ctx: ChatContext, new_message: ChatMessage) -> None:
         if self.on_user_turn_completed_delay > 0.0:
             await asyncio.sleep(self.on_user_turn_completed_delay)
 
@@ -1722,10 +1721,26 @@ class FlushMultiSegmentAgent(Agent):
         tools: list,
         model_settings: ModelSettings,
     ) -> AsyncIterable[str | FlushSentinel]:
-        yield "Hello there. "
+        self.generation_count += 1
+        if self.generation_count == 1:
+            first, second = "Hello there. ", "How are you?"
+        else:
+            first, second = "Starting over. ", "What next?"
+
+        yield first
         yield FlushSentinel(segment_id="acknowledgement")
-        yield "How are you?"
+        yield second
         yield FlushSentinel(segment_id="followup")
+
+
+class EmptyAudioFlushMultiSegmentAgent(FlushMultiSegmentAgent):
+    async def tts_node(
+        self, text: AsyncIterable[str], model_settings: ModelSettings
+    ) -> AsyncIterable:
+        async for _ in text:
+            pass
+        if False:  # make this an async generator without yielding audio
+            yield
 
 
 async def test_pipeline_multi_segment_flush() -> None:
@@ -1805,32 +1820,48 @@ async def test_preemptive_labelled_segments_interrupted_before_scheduling_emit_s
     speed = 5.0
     actions = FakeActions()
     actions.add_user_speech(0.5, 2.0, "Tell me something", stt_delay=0.1)
-    actions.add_tts(1.0, input="Hello there. ", ttfb=0.1, duration=0.1)
+    # Keep the first TTS task alive so the second label remains buffered in the
+    # LLM channel when the preemptive generation is cancelled.
+    actions.add_tts(1.0, input="Hello there. ", ttfb=0.1, duration=10.0)
     actions.add_tts(1.0, input="How are you?", ttfb=0.1, duration=0.1)
     actions.add_user_speech(2.6, 3.2, "Actually, start over", stt_delay=0.1)
-    actions.add_tts(1.0, input="Hello there. ", ttfb=0.1, duration=0.1)
-    actions.add_tts(1.0, input="How are you?", ttfb=0.1, duration=0.1)
+    actions.add_tts(1.0, input="Starting over. ", ttfb=0.1, duration=0.1)
+    actions.add_tts(1.0, input="What next?", ttfb=0.1, duration=0.1)
 
     session = create_session(
         actions,
         speed_factor=speed,
-        turn_handling={
-            "preemptive_generation": {"enabled": True, "preemptive_tts": True}
-        },
+        turn_handling={"preemptive_generation": {"enabled": True, "preemptive_tts": True}},
     )
     agent = FlushMultiSegmentAgent(on_user_turn_completed_delay=2.0 / speed)
     segment_finished_events: list[SpeechSegmentFinishedEvent] = []
     session.on("speech_segment_finished", segment_finished_events.append)
 
-    await asyncio.wait_for(
-        run_session(session, agent, drain_delay=1.0), timeout=SESSION_TIMEOUT
-    )
+    await asyncio.wait_for(run_session(session, agent, drain_delay=1.0), timeout=SESSION_TIMEOUT)
 
     first_speech_id = segment_finished_events[0].speech_id
     first_speech_events = [
         event for event in segment_finished_events if event.speech_id == first_speech_id
     ]
     assert [(event.segment_id, event.played) for event in first_speech_events] == [
+        ("acknowledgement", "skipped"),
+        ("followup", "skipped"),
+    ]
+
+
+async def test_labelled_segments_without_audio_emit_skipped() -> None:
+    speed = 5.0
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.5, "Hello, how are you?", stt_delay=0.2)
+
+    session = create_session(actions, speed_factor=speed)
+    agent = EmptyAudioFlushMultiSegmentAgent()
+    segment_finished_events: list[SpeechSegmentFinishedEvent] = []
+    session.on("speech_segment_finished", segment_finished_events.append)
+
+    await asyncio.wait_for(run_session(session, agent), timeout=SESSION_TIMEOUT)
+
+    assert [(event.segment_id, event.played) for event in segment_finished_events] == [
         ("acknowledgement", "skipped"),
         ("followup", "skipped"),
     ]

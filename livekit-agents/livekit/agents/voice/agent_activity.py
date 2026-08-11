@@ -3064,24 +3064,38 @@ class AgentActivity(RecognitionHooks):
         segment_ch = utils.aio.Chan[_SpeechSegment]()
         segments: list[_SpeechSegment] = []
 
-        def _emit_segment_finished(
-            segment: _SpeechSegment, played: Literal["full", "partial", "skipped"]
+        def _emit_segment_id(
+            segment_id: str | None, played: Literal["full", "partial", "skipped"]
         ) -> None:
-            if segment.id is None or segment.terminal_emitted:
+            if segment_id is None:
                 return
-            segment.terminal_emitted = True
             self._session.emit(
                 "speech_segment_finished",
                 SpeechSegmentFinishedEvent(
                     speech_id=speech_handle.id,
-                    segment_id=segment.id,
+                    segment_id=segment_id,
                     played=played,
                 ),
             )
 
-        def _emit_unfinished_segments() -> None:
+        def _emit_segment_finished(
+            segment: _SpeechSegment, played: Literal["full", "partial", "skipped"]
+        ) -> None:
+            if segment.terminal_emitted:
+                return
+            segment.terminal_emitted = True
+            _emit_segment_id(segment.id, played)
+
+        async def _emit_unfinished_segments() -> None:
             for segment in segments:
                 _emit_segment_finished(segment, "skipped")
+
+            # _produce_segments may have been cancelled while waiting for the
+            # previous segment's TTS. Drain labels that were generated but not
+            # yet materialized as _SpeechSegment objects.
+            async for chunk in llm_gen_data.text_ch:
+                if isinstance(chunk, FlushSentinel):
+                    _emit_segment_id(chunk.segment_id, "skipped")
 
         @utils.log_exceptions(logger=logger)
         async def _produce_segments() -> None:
@@ -3165,7 +3179,7 @@ class AgentActivity(RecognitionHooks):
         if speech_handle.interrupted:
             current_span.set_attribute(trace_types.ATTR_SPEECH_INTERRUPTED, True)
             await utils.aio.cancel_and_wait(*tasks, wait_for_scheduled)
-            _emit_unfinished_segments()
+            await _emit_unfinished_segments()
             return
 
         # start synthesis now if it wasn't started preemptively
@@ -3189,7 +3203,7 @@ class AgentActivity(RecognitionHooks):
         if speech_handle.interrupted:
             current_span.set_attribute(trace_types.ATTR_SPEECH_INTERRUPTED, True)
             await utils.aio.cancel_and_wait(*tasks, *authorization_tasks)
-            _emit_unfinished_segments()
+            await _emit_unfinished_segments()
             return
 
         reply_started_at = time.time()
@@ -3322,7 +3336,15 @@ class AgentActivity(RecognitionHooks):
                 on_first_frame=_on_first_frame,
             )
             segment_outputs.append(out)
-            _emit_segment_finished(segment, out.played)
+            segment_played = out.played
+            if audio_output is not None and (
+                out.audio_out is None
+                or not out.audio_out.first_frame_fut.done()
+                or out.audio_out.first_frame_fut.cancelled()
+            ):
+                # Text generation alone does not mean the voice segment was heard.
+                segment_played = "skipped"
+            _emit_segment_finished(segment, segment_played)
             if speech_handle.interrupted:
                 break
 
@@ -3369,7 +3391,7 @@ class AgentActivity(RecognitionHooks):
         if speech_handle.interrupted:
             # forward_generation already cleared the buffer and waited for playout
             await utils.aio.cancel_and_wait(*tasks)
-            _emit_unfinished_segments()
+            await _emit_unfinished_segments()
         elif read_transcript_from_tts and any(
             out.played != "skipped" and out.text_out is not None and not out.text_out.text
             for out in segment_outputs
