@@ -3320,11 +3320,15 @@ class AgentActivity(RecognitionHooks):
         while (segment := await _next_segment()) is not None:
 
             def _on_segment_first_frame(
-                fut: asyncio.Future[Any], audio_out: _AudioOutput | None = None
+                fut: asyncio.Future[Any],
+                audio_out: _AudioOutput | None = None,
+                current_segment: _SpeechSegment = segment,
             ) -> None:
                 try:
                     fut.result()
-                    segment.output_started = audio_out is not None or text_output is not None
+                    current_segment.output_started = (
+                        audio_out is not None or text_output is not None
+                    )
                 except BaseException:
                     pass
                 _on_first_frame(fut, audio_out)
