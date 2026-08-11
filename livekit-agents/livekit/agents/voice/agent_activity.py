@@ -37,7 +37,7 @@ from ..metrics import (
 )
 from ..telemetry import otel_metrics, trace_types, tracer, utils as trace_utils
 from ..tokenize.basic import split_words
-from ..types import NOT_GIVEN, FlushSentinel, NotGivenOr
+from ..types import NOT_GIVEN, FlushSentinel, NotGivenOr, SpeechSegmentGate
 from ..utils.misc import is_given
 from ._utils import _set_participant_attributes
 from .agent import (
@@ -3057,6 +3057,7 @@ class AgentActivity(RecognitionHooks):
         class _SpeechSegment:
             text: utils.aio.Chan[str]  # transcript text for this segment
             tts: _TTSGenerationData | None = None  # audio + timed transcript, when enabled
+            playout_gate_fut: asyncio.Future[bool] | None = None
             playout_fut: asyncio.Future[bool] | None = None
             playout_result: bool | None = None
             output_started: bool = False
@@ -3069,11 +3070,16 @@ class AgentActivity(RecognitionHooks):
             if fut is not None and not fut.done():
                 fut.set_result(heard)
 
-        def _attach_playout_fut(segment: _SpeechSegment, fut: asyncio.Future[bool] | None) -> None:
+        def _attach_playout_futs(
+            segment: _SpeechSegment,
+            gate_fut: asyncio.Future[bool] | None,
+            result_fut: asyncio.Future[bool] | None,
+        ) -> None:
             segment.boundary_seen = True
-            segment.playout_fut = fut
+            segment.playout_gate_fut = gate_fut
+            segment.playout_fut = result_fut
             if segment.playout_result is not None:
-                _set_playout_result(fut, segment.playout_result)
+                _set_playout_result(result_fut, segment.playout_result)
 
         def _finish_segment(segment: _SpeechSegment, heard: bool) -> None:
             if segment.playout_result is not None:
@@ -3090,10 +3096,13 @@ class AgentActivity(RecognitionHooks):
             # buffered tickets with the oldest segment that has no ticket yet.
             unlabelled = [segment for segment in segments if not segment.boundary_seen]
             async for chunk in llm_gen_data.text_ch:
+                if isinstance(chunk, SpeechSegmentGate):
+                    _set_playout_result(chunk.playout_fut, False)
+                    continue
                 if not isinstance(chunk, FlushSentinel) or chunk.playout_fut is None:
                     continue
                 if unlabelled:
-                    _attach_playout_fut(unlabelled.pop(0), chunk.playout_fut)
+                    _attach_playout_futs(unlabelled.pop(0), None, chunk.playout_fut)
                 else:
                     _set_playout_result(chunk.playout_fut, False)
 
@@ -3103,11 +3112,13 @@ class AgentActivity(RecognitionHooks):
             current: _SpeechSegment | None = None
             tts_text: utils.aio.Chan[str] | None = None
             prev_tts_task: asyncio.Task[bool] | None = None
+            pending_gate_fut: asyncio.Future[bool] | None = None
+            pending_playout_fut: asyncio.Future[bool] | None = None
 
             async def _start_segment() -> _SpeechSegment:
                 # start this segment's tts; one inference at a time (await the previous),
                 # but the next starts during the previous segment's playout, not after
-                nonlocal tts_text, prev_tts_task
+                nonlocal tts_text, prev_tts_task, pending_gate_fut, pending_playout_fut
                 tts_data: _TTSGenerationData | None = None
                 tts_text = None
                 if audio_output is not None:
@@ -3124,6 +3135,9 @@ class AgentActivity(RecognitionHooks):
                     )
                     tasks.append(prev_tts_task)
                 seg = _SpeechSegment(text=utils.aio.Chan[str](), tts=tts_data)
+                if pending_gate_fut is not None:
+                    _attach_playout_futs(seg, pending_gate_fut, pending_playout_fut)
+                    pending_gate_fut = pending_playout_fut = None
                 segments.append(seg)
                 segment_ch.send_nowait(seg)
                 return seg
@@ -3136,7 +3150,11 @@ class AgentActivity(RecognitionHooks):
                 nonlocal current, tts_text
                 if current is not None:
                     if boundary_seen:
-                        _attach_playout_fut(current, playout_fut)
+                        current.boundary_seen = True
+                        if playout_fut is not None:
+                            current.playout_fut = playout_fut
+                            if current.playout_result is not None:
+                                _set_playout_result(playout_fut, current.playout_result)
                     current.text.close()
                 else:
                     _set_playout_result(playout_fut, False)
@@ -3146,6 +3164,12 @@ class AgentActivity(RecognitionHooks):
 
             try:
                 async for chunk in llm_gen_data.text_ch:
+                    if isinstance(chunk, SpeechSegmentGate):
+                        _end_segment()
+                        _set_playout_result(pending_playout_fut, False)
+                        pending_gate_fut = chunk.playout_gate_fut
+                        pending_playout_fut = chunk.playout_fut
+                        continue
                     if isinstance(chunk, FlushSentinel):
                         _end_segment(chunk.playout_fut, boundary_seen=True)
                         continue
@@ -3156,6 +3180,7 @@ class AgentActivity(RecognitionHooks):
                         tts_text.send_nowait(chunk)
             finally:
                 _end_segment()
+                _set_playout_result(pending_playout_fut, False)
                 segment_ch.close()
 
         # start synthesis preemptively (before the speech is scheduled) when enabled;
@@ -3318,6 +3343,21 @@ class AgentActivity(RecognitionHooks):
                 return None
 
         while (segment := await _next_segment()) is not None:
+
+            if segment.playout_gate_fut is not None:
+                gate_wait = asyncio.ensure_future(asyncio.shield(segment.playout_gate_fut))
+                await speech_handle.wait_if_not_interrupted([gate_wait])
+                if speech_handle.interrupted:
+                    await utils.aio.cancel_and_wait(gate_wait)
+                    _finish_segment(segment, False)
+                    break
+                try:
+                    playout_allowed = gate_wait.result()
+                except BaseException:
+                    playout_allowed = False
+                if not playout_allowed:
+                    _finish_segment(segment, False)
+                    continue
 
             def _on_segment_first_frame(
                 fut: asyncio.Future[Any],

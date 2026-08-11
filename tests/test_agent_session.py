@@ -20,6 +20,7 @@ from livekit.agents import (
     LanguageCode,
     MetricsCollectedEvent,
     ModelSettings,
+    SpeechSegmentGate,
     UserInputTranscribedEvent,
     UserStateChangedEvent,
     function_tool,
@@ -1788,6 +1789,28 @@ class EmptyTicketAgent(FlushMultiSegmentAgent):
         yield FlushSentinel(playout_fut=self._playout_fut())
 
 
+class GatedTicketAgent(FlushMultiSegmentAgent):
+    def __init__(self, *, allowed: bool) -> None:
+        super().__init__()
+        self.allowed = allowed
+
+    async def llm_node(
+        self,
+        chat_ctx: ChatContext,
+        tools: list,
+        model_settings: ModelSettings,
+    ) -> AsyncIterable[str | FlushSentinel | SpeechSegmentGate]:
+        gate_fut = asyncio.get_running_loop().create_future()
+        yield SpeechSegmentGate(
+            playout_gate_fut=gate_fut,
+            playout_fut=self._playout_fut(),
+        )
+        yield "Speculative announcement."
+        yield FlushSentinel()
+        await asyncio.sleep(0.1)
+        gate_fut.set_result(self.allowed)
+
+
 class PreemptiveTicketAgent(FlushMultiSegmentAgent):
     def __init__(self) -> None:
         super().__init__()
@@ -1920,6 +1943,35 @@ async def test_pipeline_playout_ticket_is_false_for_empty_segment() -> None:
     await asyncio.wait_for(run_session(session, agent), timeout=SESSION_TIMEOUT)
 
     assert [fut.result() for fut in agent.playout_futs] == [False]
+
+
+@pytest.mark.parametrize("allowed", [False, True])
+async def test_pipeline_playout_gate_controls_forwarding(allowed: bool) -> None:
+    speed = 5.0
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.5, "Please do it", stt_delay=0.2)
+    actions.add_tts(
+        1.0,
+        input="Speculative announcement.",
+        ttfb=0.1,
+        duration=0.1,
+    )
+
+    session = create_session(actions, speed_factor=speed)
+    agent = GatedTicketAgent(allowed=allowed)
+    playback_finished_events: list[PlaybackFinishedEvent] = []
+    session.output.audio.on("playback_finished", playback_finished_events.append)
+
+    await asyncio.wait_for(run_session(session, agent), timeout=SESSION_TIMEOUT)
+
+    assert [fut.result() for fut in agent.playout_futs] == [allowed]
+    assert len(playback_finished_events) == int(allowed)
+    assistant_msgs = [
+        item
+        for item in agent.chat_ctx.items
+        if item.type == "message" and item.role == "assistant"
+    ]
+    assert len(assistant_msgs) == int(allowed)
 
 
 async def test_pipeline_playout_ticket_is_false_when_outputs_are_disabled() -> None:

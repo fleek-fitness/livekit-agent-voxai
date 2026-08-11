@@ -60,6 +60,14 @@ class FlushSentinel:
     playout_fut: asyncio.Future[bool] | None = field(default=None, compare=False, repr=False)
 
 
+@dataclass(frozen=True, eq=False)
+class SpeechSegmentGate:
+    """Gate the next speech segment while allowing its TTS to start eagerly."""
+
+    playout_gate_fut: asyncio.Future[bool] = field(compare=False, repr=False)
+    playout_fut: asyncio.Future[bool] | None = field(default=None, compare=False, repr=False)
+
+
 class NotGiven:
     __slots__ = ()
 

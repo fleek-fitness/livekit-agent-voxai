@@ -25,7 +25,12 @@ from ..llm.chat_context import Instructions
 from ..log import logger
 from ..metrics import AgentLLMMetrics, ToolExecutionMetrics
 from ..telemetry import trace_types, tracer
-from ..types import USERDATA_TIMED_TRANSCRIPT, FlushSentinel, NotGivenOr
+from ..types import (
+    USERDATA_TIMED_TRANSCRIPT,
+    FlushSentinel,
+    NotGivenOr,
+    SpeechSegmentGate,
+)
 from ..utils import aio
 from ..utils.aio import itertools
 from . import io
@@ -47,7 +52,7 @@ class _ACloseable(Protocol):
 
 @dataclass
 class _LLMGenerationData:
-    text_ch: aio.Chan[str | FlushSentinel]
+    text_ch: aio.Chan[str | FlushSentinel | SpeechSegmentGate]
     function_ch: aio.Chan[llm.FunctionCall]
     generated_text: str = ""
     generated_functions: list[llm.FunctionCall] = field(default_factory=list)
@@ -67,7 +72,7 @@ def perform_llm_inference(
     provider: str | None = None,
     session: AgentSession | None = None,
 ) -> tuple[asyncio.Task[bool], _LLMGenerationData]:
-    text_ch = aio.Chan[str | FlushSentinel]()
+    text_ch = aio.Chan[str | FlushSentinel | SpeechSegmentGate]()
     function_ch = aio.Chan[llm.FunctionCall]()
     data = _LLMGenerationData(text_ch=text_ch, function_ch=function_ch)
     llm_task = asyncio.create_task(
@@ -218,7 +223,7 @@ async def _llm_inference_task(
                         ttft_captured = True
                         _emit_agent_ttft(time.time() - agent_llm_start_time)
 
-            elif isinstance(chunk, FlushSentinel):
+            elif isinstance(chunk, FlushSentinel | SpeechSegmentGate):
                 text_ch.send_nowait(chunk)
             else:
                 logger.warning(

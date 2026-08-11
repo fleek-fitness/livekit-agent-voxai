@@ -65,6 +65,7 @@ from .types import (
     FlushSentinel,
     NotGiven,
     NotGivenOr,
+    SpeechSegmentGate,
 )
 from .version import __version__
 from .voice import (
@@ -207,6 +208,7 @@ __all__ = [
     "AudioConfig",
     "PlayHandle",
     "FlushSentinel",
+    "SpeechSegmentGate",
     "LanguageCode",
     "io",
     "avatar",
