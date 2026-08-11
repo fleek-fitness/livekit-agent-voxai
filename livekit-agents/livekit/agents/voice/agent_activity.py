@@ -3374,16 +3374,19 @@ class AgentActivity(RecognitionHooks):
                 if not audio_started:
                     # Text generation alone does not mean the voice segment was heard.
                     segment_played = "skipped"
-                elif segment.tts_task is not None:
-                    try:
-                        tts_succeeded = (
-                            segment.tts_task.done()
-                            and not segment.tts_task.cancelled()
-                            and segment.tts_task.result()
-                        )
-                    except Exception:
-                        tts_succeeded = False
-                    if not tts_succeeded and segment_played == "full":
+                else:
+                    audio_incomplete = out.audio_forwarding_succeeded is False
+                    if segment.tts_task is not None:
+                        try:
+                            tts_succeeded = (
+                                segment.tts_task.done()
+                                and not segment.tts_task.cancelled()
+                                and segment.tts_task.result()
+                            )
+                        except Exception:
+                            tts_succeeded = False
+                        audio_incomplete = audio_incomplete or not tts_succeeded
+                    if audio_incomplete and segment_played == "full":
                         segment_played = "partial"
             _emit_segment_finished(segment, segment_played)
             if speech_handle.interrupted:

@@ -460,6 +460,7 @@ class _ForwardOutput:
 
     text_out: _TextOutput | None = None
     audio_out: _AudioOutput | None = None
+    audio_forwarding_succeeded: bool | None = None
     played: Literal["full", "partial", "skipped"] = "skipped"
     playback_position: float = 0.0
     synchronized_transcript: str | None = None
@@ -494,6 +495,7 @@ async def forward_generation(
     forward_tasks: list[asyncio.Task[Any]] = []
     try:
         audio_out: _AudioOutput | None = None
+        forward_audio_task: asyncio.Task[None] | None = None
         if audio_output is not None and audio_source is not None:
             forward_audio_task, audio_out = perform_audio_forwarding(
                 audio_output=audio_output, tts_output=audio_source
@@ -515,6 +517,15 @@ async def forward_generation(
 
         playout_fut: asyncio.Future[Any] | None = None
         await speech_handle.wait_if_not_interrupted(list(forward_tasks))
+        if forward_audio_task is not None:
+            try:
+                out.audio_forwarding_succeeded = (
+                    forward_audio_task.done()
+                    and not forward_audio_task.cancelled()
+                    and forward_audio_task.exception() is None
+                )
+            except BaseException:
+                out.audio_forwarding_succeeded = False
         if not speech_handle.interrupted and audio_output is not None:
             playout_fut = asyncio.ensure_future(audio_output.wait_for_playout())
             await speech_handle.wait_if_not_interrupted([playout_fut])
