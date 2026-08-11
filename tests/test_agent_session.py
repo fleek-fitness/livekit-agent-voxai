@@ -95,11 +95,17 @@ class _CancellingCloseActivity:
     current_speech = None
     _audio_recognition = None
 
+    def __init__(self) -> None:
+        self.close_called = False
+
     async def interrupt(self, *, force: bool) -> None:
         return None
 
     async def drain(self) -> None:
         raise asyncio.CancelledError
+
+    async def aclose(self) -> None:
+        self.close_called = True
 
 
 class _BlockingCloseActivity(_CancellingCloseActivity):
@@ -130,6 +136,24 @@ class _AgentTaskCloseActivity:
 
     def __init__(self, agent: AgentTask[None]) -> None:
         self.agent = agent
+        self.close_called = False
+
+    async def interrupt(self, *, force: bool) -> None:
+        return None
+
+    async def drain(self) -> None:
+        return None
+
+    async def aclose(self) -> None:
+        self.close_called = True
+
+
+class _CloseRecorder:
+    def __init__(self) -> None:
+        self.close_called = False
+
+    async def aclose(self) -> None:
+        self.close_called = True
 
 
 def _create_closing_test_session(activity: object) -> AgentSession:
@@ -142,47 +166,71 @@ def _create_closing_test_session(activity: object) -> AgentSession:
     session._on_aec_warmup_expired = Mock()
     session._amd = None
     session._activity = activity
+    session._agent_speaking_span = None
+    session._user_speaking_span = None
+    session._forward_audio_atask = None
+    session._recorder_io = None
+    session._ivr_activity = None
+    session._tools = []
+    session._session_span = None
+    session._session_host = None
+    session._room_io = _CloseRecorder()
+    session._input = MagicMock(audio=object(), video=object())
+    session._output = MagicMock(audio=object(), transcription=object())
+    session.emit = Mock()
+    session._user_state = "listening"
+    session._agent_state = "initializing"
+    session._llm_error_counts = 0
+    session._tts_error_counts = 0
     return session
 
 
 async def test_aclose_logs_cancelled_stage_without_identifiers(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    session = _create_closing_test_session(_CancellingCloseActivity())
+    activity = _CancellingCloseActivity()
+    session = _create_closing_test_session(activity)
+    room_io = session._room_io
 
     caplog.set_level(logging.WARNING, logger="livekit.agents")
 
-    with pytest.raises(asyncio.CancelledError):
-        await session._aclose_impl(reason=CloseReason.USER_INITIATED)
+    await session._aclose_impl(reason=CloseReason.USER_INITIATED)
 
     record = next(
-        record for record in caplog.records if record.message == "agent session close cancelled"
+        record
+        for record in caplog.records
+        if record.message == "agent session close step cancelled"
     )
     fields = vars(record)
     assert fields["reason"] == CloseReason.USER_INITIATED.value
     assert fields["stage"] == "activity_drain"
     assert fields["drain"] is False
-    assert fields["closing"] is True
-    assert fields["has_activity"] is True
     assert {"room", "job", "agent", "transcript"}.isdisjoint(fields)
+    assert activity.close_called is True
+    assert room_io.close_called is True
+    assert session._started is False
+    session.emit.assert_called_once()
 
 
 async def test_aclose_logs_child_agent_task_cancellation(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     agent_task = _CancellingAgentTask()
-    session = _create_closing_test_session(_AgentTaskCloseActivity(agent_task))
+    activity = _AgentTaskCloseActivity(agent_task)
+    session = _create_closing_test_session(activity)
 
     caplog.set_level(logging.WARNING, logger="livekit.agents")
 
-    with pytest.raises(asyncio.CancelledError):
-        await session._aclose_impl(reason=CloseReason.USER_INITIATED)
+    await session._aclose_impl(reason=CloseReason.USER_INITIATED)
 
     record = next(
-        record for record in caplog.records if record.message == "agent session close cancelled"
+        record
+        for record in caplog.records
+        if record.message == "agent session close step cancelled"
     )
     assert agent_task.cancel_called is True
     assert record.stage == "agent_task_wait_inactive"
+    assert activity.close_called is True
 
 
 async def test_aclose_preserves_parent_cancellation(
