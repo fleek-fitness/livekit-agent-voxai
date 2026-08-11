@@ -1793,7 +1793,8 @@ class SingleLabelledSegmentAgent(Agent):
         tools: list,
         model_settings: ModelSettings,
     ) -> AsyncIterable[str | FlushSentinel]:
-        yield "Hello there."
+        yield "Hello "
+        yield "there."
         yield FlushSentinel(segment_id="acknowledgement")
 
 
@@ -2023,6 +2024,37 @@ async def test_audio_output_failure_after_first_frame_emits_partial() -> None:
         await original_capture_frame(frame)
 
     downstream_audio.capture_frame = failing_capture_frame
+
+    agent = SingleLabelledSegmentAgent()
+    segment_finished_events: list[SpeechSegmentFinishedEvent] = []
+    session.on("speech_segment_finished", segment_finished_events.append)
+
+    await asyncio.wait_for(run_session(session, agent), timeout=SESSION_TIMEOUT)
+
+    assert [(event.segment_id, event.played) for event in segment_finished_events] == [
+        ("acknowledgement", "partial")
+    ]
+
+
+async def test_text_output_failure_after_first_delta_emits_partial() -> None:
+    speed = 5.0
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.5, "Hello, how are you?", stt_delay=0.2)
+
+    session = create_session(actions, speed_factor=speed)
+    session.output.set_audio_enabled(False)
+    downstream_text = session.output.transcription._next_in_chain
+    original_capture_text = downstream_text.capture_text
+    capture_count = 0
+
+    async def failing_capture_text(text: str) -> None:
+        nonlocal capture_count
+        capture_count += 1
+        if capture_count == 2:
+            raise RuntimeError("synthetic text output failure")
+        await original_capture_text(text)
+
+    downstream_text.capture_text = failing_capture_text
 
     agent = SingleLabelledSegmentAgent()
     segment_finished_events: list[SpeechSegmentFinishedEvent] = []

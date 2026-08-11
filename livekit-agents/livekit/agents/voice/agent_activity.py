@@ -3388,6 +3388,13 @@ class AgentActivity(RecognitionHooks):
                         audio_incomplete = audio_incomplete or not tts_succeeded
                     if audio_incomplete and segment_played == "full":
                         segment_played = "partial"
+            elif out.text_forwarding_succeeded is False:
+                text_started = bool(
+                    out.text_out is not None
+                    and out.text_out.first_text_fut.done()
+                    and not out.text_out.first_text_fut.cancelled()
+                )
+                segment_played = "partial" if text_started else "skipped"
             _emit_segment_finished(segment, segment_played)
             if speech_handle.interrupted:
                 break
