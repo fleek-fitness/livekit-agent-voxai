@@ -1811,6 +1811,10 @@ class PreemptiveTicketAgent(FlushMultiSegmentAgent):
         yield FlushSentinel(playout_fut=self._playout_fut())
 
 
+def test_flush_sentinel_keeps_identity_equality() -> None:
+    assert FlushSentinel() != FlushSentinel()
+
+
 async def test_pipeline_multi_segment_flush() -> None:
     speed = 5.0
     actions = FakeActions()

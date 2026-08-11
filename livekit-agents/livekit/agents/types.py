@@ -48,7 +48,7 @@ The key for the timed transcripts in the audio frame userdata.
 _T = TypeVar("_T")
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class FlushSentinel:
     """Close the current speech segment.
 
