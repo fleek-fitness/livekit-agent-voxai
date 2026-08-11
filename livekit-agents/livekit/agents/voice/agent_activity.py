@@ -3057,8 +3057,45 @@ class AgentActivity(RecognitionHooks):
         class _SpeechSegment:
             text: utils.aio.Chan[str]  # transcript text for this segment
             tts: _TTSGenerationData | None = None  # audio + timed transcript, when enabled
+            playout_fut: asyncio.Future[bool] | None = None
+            playout_result: bool | None = None
+            output_started: bool = False
+            boundary_seen: bool = False
 
         segment_ch = utils.aio.Chan[_SpeechSegment]()
+        segments: list[_SpeechSegment] = []
+
+        def _set_playout_result(fut: asyncio.Future[bool] | None, heard: bool) -> None:
+            if fut is not None and not fut.done():
+                fut.set_result(heard)
+
+        def _attach_playout_fut(segment: _SpeechSegment, fut: asyncio.Future[bool] | None) -> None:
+            segment.boundary_seen = True
+            segment.playout_fut = fut
+            if segment.playout_result is not None:
+                _set_playout_result(fut, segment.playout_result)
+
+        def _finish_segment(segment: _SpeechSegment, heard: bool) -> None:
+            if segment.playout_result is not None:
+                return
+            segment.playout_result = heard
+            _set_playout_result(segment.playout_fut, heard)
+
+        async def _finish_unresolved_segments() -> None:
+            for segment in segments:
+                _finish_segment(segment, segment.output_started)
+
+            # Cancellation can leave a sentinel buffered after its segment was
+            # materialized, or before the next segment was materialized. Pair
+            # buffered tickets with the oldest segment that has no ticket yet.
+            unlabelled = [segment for segment in segments if not segment.boundary_seen]
+            async for chunk in llm_gen_data.text_ch:
+                if not isinstance(chunk, FlushSentinel) or chunk.playout_fut is None:
+                    continue
+                if unlabelled:
+                    _attach_playout_fut(unlabelled.pop(0), chunk.playout_fut)
+                else:
+                    _set_playout_result(chunk.playout_fut, False)
 
         @utils.log_exceptions(logger=logger)
         async def _produce_segments() -> None:
@@ -3087,13 +3124,22 @@ class AgentActivity(RecognitionHooks):
                     )
                     tasks.append(prev_tts_task)
                 seg = _SpeechSegment(text=utils.aio.Chan[str](), tts=tts_data)
+                segments.append(seg)
                 segment_ch.send_nowait(seg)
                 return seg
 
-            def _end_segment() -> None:
+            def _end_segment(
+                playout_fut: asyncio.Future[bool] | None = None,
+                *,
+                boundary_seen: bool = False,
+            ) -> None:
                 nonlocal current, tts_text
                 if current is not None:
+                    if boundary_seen:
+                        _attach_playout_fut(current, playout_fut)
                     current.text.close()
+                else:
+                    _set_playout_result(playout_fut, False)
                 if tts_text is not None:
                     tts_text.close()  # let this segment's TTS inference finish
                 current, tts_text = None, None
@@ -3101,7 +3147,7 @@ class AgentActivity(RecognitionHooks):
             try:
                 async for chunk in llm_gen_data.text_ch:
                     if isinstance(chunk, FlushSentinel):
-                        _end_segment()
+                        _end_segment(chunk.playout_fut, boundary_seen=True)
                         continue
                     if current is None:
                         current = await _start_segment()
@@ -3140,6 +3186,7 @@ class AgentActivity(RecognitionHooks):
         if speech_handle.interrupted:
             current_span.set_attribute(trace_types.ATTR_SPEECH_INTERRUPTED, True)
             await utils.aio.cancel_and_wait(*tasks, wait_for_scheduled)
+            await _finish_unresolved_segments()
             return
 
         # start synthesis now if it wasn't started preemptively
@@ -3163,6 +3210,7 @@ class AgentActivity(RecognitionHooks):
         if speech_handle.interrupted:
             current_span.set_attribute(trace_types.ATTR_SPEECH_INTERRUPTED, True)
             await utils.aio.cancel_and_wait(*tasks, *authorization_tasks)
+            await _finish_unresolved_segments()
             return
 
         reply_started_at = time.time()
@@ -3270,33 +3318,68 @@ class AgentActivity(RecognitionHooks):
                 return None
 
         while (segment := await _next_segment()) is not None:
-            if first_tts_gen_data is None:
-                first_tts_gen_data = segment.tts
 
-            transcript: AsyncIterable[str] = segment.text
-            if (
-                segment.tts is not None
-                and use_aligned_transcript
-                and (timed_texts := await segment.tts.timed_texts_fut)
-            ):
-                transcript = timed_texts
-                read_transcript_from_tts = True
+            def _on_segment_first_frame(
+                fut: asyncio.Future[Any], audio_out: _AudioOutput | None = None
+            ) -> None:
+                try:
+                    fut.result()
+                    segment.output_started = audio_out is not None or text_output is not None
+                except BaseException:
+                    pass
+                _on_first_frame(fut, audio_out)
 
-            tr_node = self._agent.transcription_node(transcript, model_settings)
-            text_source = await tr_node if asyncio.iscoroutine(tr_node) else tr_node
-            audio_source = segment.tts.audio_ch if segment.tts else None
+            try:
+                if first_tts_gen_data is None:
+                    first_tts_gen_data = segment.tts
 
-            out = await forward_generation(
-                speech_handle=speech_handle,
-                audio_output=audio_output,
-                text_output=text_output,
-                audio_source=audio_source,
-                text_source=text_source,
-                on_first_frame=_on_first_frame,
-            )
+                transcript: AsyncIterable[str] = segment.text
+                if (
+                    segment.tts is not None
+                    and use_aligned_transcript
+                    and (timed_texts := await segment.tts.timed_texts_fut)
+                ):
+                    transcript = timed_texts
+                    read_transcript_from_tts = True
+
+                tr_node = self._agent.transcription_node(transcript, model_settings)
+                text_source = await tr_node if asyncio.iscoroutine(tr_node) else tr_node
+                audio_source = segment.tts.audio_ch if segment.tts else None
+
+                out = await forward_generation(
+                    speech_handle=speech_handle,
+                    audio_output=audio_output,
+                    text_output=text_output,
+                    audio_source=audio_source,
+                    text_source=text_source,
+                    on_first_frame=_on_segment_first_frame,
+                )
+            except BaseException:
+                await utils.aio.cancel_and_wait(*tasks)
+                _finish_segment(segment, segment.output_started)
+                await _finish_unresolved_segments()
+                raise
             segment_outputs.append(out)
+            if audio_output is not None and out.audio_out is not None:
+                first_frame_fut = out.audio_out.first_frame_fut
+                segment.output_started = segment.output_started or (
+                    first_frame_fut.done()
+                    and not first_frame_fut.cancelled()
+                    and first_frame_fut.exception() is None
+                )
+            elif text_output is not None and out.text_out is not None:
+                segment.output_started = segment.output_started or bool(out.text_out.text)
+            _finish_segment(
+                segment,
+                segment.output_started and out.played != "skipped",
+            )
             if speech_handle.interrupted:
                 break
+
+        if not speech_handle.interrupted:
+            if synthesize_task is not None:
+                await asyncio.gather(synthesize_task, return_exceptions=True)
+            await _finish_unresolved_segments()
 
         stopped_speaking_at = time.time()
         assistant_metrics: llm.MetricsReport = {}
@@ -3341,6 +3424,7 @@ class AgentActivity(RecognitionHooks):
         if speech_handle.interrupted:
             # forward_generation already cleared the buffer and waited for playout
             await utils.aio.cancel_and_wait(*tasks)
+            await _finish_unresolved_segments()
         elif read_transcript_from_tts and any(
             out.played != "skipped" and out.text_out is not None and not out.text_out.text
             for out in segment_outputs

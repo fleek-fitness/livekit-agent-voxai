@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 
+from livekit import rtc
 from livekit.agents import (
     Agent,
     AgentFalseInterruptionEvent,
@@ -1707,6 +1708,12 @@ class FlushMultiSegmentAgent(Agent):
 
     def __init__(self) -> None:
         super().__init__(instructions="You are a helpful assistant.")
+        self.playout_futs: list[asyncio.Future[bool]] = []
+
+    def _playout_fut(self) -> asyncio.Future[bool]:
+        fut = asyncio.get_running_loop().create_future()
+        self.playout_futs.append(fut)
+        return fut
 
     async def llm_node(
         self,
@@ -1715,8 +1722,93 @@ class FlushMultiSegmentAgent(Agent):
         model_settings: ModelSettings,
     ) -> AsyncIterable[str | FlushSentinel]:
         yield "Hello there. "
-        yield FlushSentinel()
+        yield FlushSentinel(playout_fut=self._playout_fut())
         yield "How are you?"
+        yield FlushSentinel(playout_fut=self._playout_fut())
+
+
+class EmptyAudioFlushMultiSegmentAgent(FlushMultiSegmentAgent):
+    async def tts_node(
+        self, text: AsyncIterable[str], model_settings: ModelSettings
+    ) -> AsyncIterable[rtc.AudioFrame]:
+        async for _ in text:
+            pass
+        if False:
+            yield
+
+
+class FailingAudioFlushMultiSegmentAgent(FlushMultiSegmentAgent):
+    def __init__(self, *, after_first_frame: bool) -> None:
+        super().__init__()
+        self.after_first_frame = after_first_frame
+
+    async def tts_node(
+        self, text: AsyncIterable[str], model_settings: ModelSettings
+    ) -> AsyncIterable[rtc.AudioFrame]:
+        async for _ in text:
+            pass
+        if self.after_first_frame:
+            yield rtc.AudioFrame(
+                data=b"\x00\x00" * 2400,
+                sample_rate=24000,
+                num_channels=1,
+                samples_per_channel=2400,
+            )
+        raise RuntimeError("synthetic TTS failure")
+
+
+class DelayedTicketAgent(FlushMultiSegmentAgent):
+    async def llm_node(
+        self,
+        chat_ctx: ChatContext,
+        tools: list,
+        model_settings: ModelSettings,
+    ) -> AsyncIterable[str | FlushSentinel]:
+        fut = self._playout_fut()
+        yield "Hello "
+        await asyncio.sleep(0.1)
+        yield "there."
+        yield FlushSentinel(playout_fut=fut)
+
+    async def transcription_node(
+        self, text: AsyncIterable[str], model_settings: ModelSettings
+    ) -> AsyncIterable[str]:
+        async for delta in text:
+            yield delta
+            return
+
+
+class EmptyTicketAgent(FlushMultiSegmentAgent):
+    async def llm_node(
+        self,
+        chat_ctx: ChatContext,
+        tools: list,
+        model_settings: ModelSettings,
+    ) -> AsyncIterable[str | FlushSentinel]:
+        yield FlushSentinel(playout_fut=self._playout_fut())
+
+
+class PreemptiveTicketAgent(FlushMultiSegmentAgent):
+    def __init__(self) -> None:
+        super().__init__()
+        self.generation_count = 0
+
+    async def on_user_turn_completed(self, turn_ctx: ChatContext, new_message: ChatMessage) -> None:
+        await asyncio.sleep(0.4)
+
+    async def llm_node(
+        self,
+        chat_ctx: ChatContext,
+        tools: list,
+        model_settings: ModelSettings,
+    ) -> AsyncIterable[str | FlushSentinel]:
+        self.generation_count += 1
+        first = "Hello there. " if self.generation_count == 1 else "Starting over. "
+        second = "How are you?" if self.generation_count == 1 else "What next?"
+        yield first
+        yield FlushSentinel(playout_fut=self._playout_fut())
+        yield second
+        yield FlushSentinel(playout_fut=self._playout_fut())
 
 
 async def test_pipeline_multi_segment_flush() -> None:
@@ -1739,6 +1831,7 @@ async def test_pipeline_multi_segment_flush() -> None:
     # each FlushSentinel-delimited segment plays out independently
     assert len(playback_finished_events) == 2
     assert all(not ev.interrupted for ev in playback_finished_events)
+    assert [fut.result() for fut in agent.playout_futs] == [True, True]
 
     # but both segments join into a single assistant message
     assistant_msgs = [
@@ -1770,6 +1863,7 @@ async def test_pipeline_multi_segment_interrupted() -> None:
     # segment is never forwarded
     assert len(playback_finished_events) == 1
     assert playback_finished_events[0].interrupted is True
+    assert [fut.result() for fut in agent.playout_futs] == [True, False]
 
     assistant_msgs = [
         it for it in agent.chat_ctx.items if it.type == "message" and it.role == "assistant"
@@ -1777,3 +1871,99 @@ async def test_pipeline_multi_segment_interrupted() -> None:
     assert len(assistant_msgs) == 1
     assert assistant_msgs[0].interrupted is True
     assert "How are you?" not in (assistant_msgs[0].text_content or "")
+
+
+async def test_pipeline_playout_ticket_is_false_without_audio() -> None:
+    speed = 5.0
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.5, "Hello, how are you?", stt_delay=0.2)
+
+    session = create_session(actions, speed_factor=speed)
+    agent = EmptyAudioFlushMultiSegmentAgent()
+
+    await asyncio.wait_for(run_session(session, agent), timeout=SESSION_TIMEOUT)
+
+    assert [fut.result() for fut in agent.playout_futs] == [False, False]
+
+
+@pytest.mark.parametrize(
+    ("after_first_frame", "expected"),
+    [(False, False), (True, True)],
+)
+async def test_pipeline_playout_ticket_tracks_tts_failure(
+    after_first_frame: bool, expected: bool
+) -> None:
+    speed = 5.0
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.5, "Hello, how are you?", stt_delay=0.2)
+
+    session = create_session(actions, speed_factor=speed)
+    agent = FailingAudioFlushMultiSegmentAgent(after_first_frame=after_first_frame)
+
+    await asyncio.wait_for(run_session(session, agent), timeout=SESSION_TIMEOUT)
+
+    assert [fut.result() for fut in agent.playout_futs] == [expected, False]
+
+
+async def test_pipeline_playout_ticket_is_false_for_empty_segment() -> None:
+    speed = 5.0
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.5, "Hello, how are you?", stt_delay=0.2)
+
+    session = create_session(actions, speed_factor=speed)
+    agent = EmptyTicketAgent()
+
+    await asyncio.wait_for(run_session(session, agent), timeout=SESSION_TIMEOUT)
+
+    assert [fut.result() for fut in agent.playout_futs] == [False]
+
+
+async def test_pipeline_playout_ticket_is_false_when_outputs_are_disabled() -> None:
+    speed = 5.0
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.5, "Hello, how are you?", stt_delay=0.2)
+
+    session = create_session(actions, speed_factor=speed)
+    session.output.set_audio_enabled(False)
+    session.output.set_transcription_enabled(False)
+    agent = FlushMultiSegmentAgent()
+
+    await asyncio.wait_for(run_session(session, agent), timeout=SESSION_TIMEOUT)
+
+    assert [fut.result() for fut in agent.playout_futs] == [False, False]
+
+
+async def test_pipeline_playout_ticket_can_arrive_after_output_finishes() -> None:
+    speed = 5.0
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.5, "Hello, how are you?", stt_delay=0.2)
+
+    session = create_session(actions, speed_factor=speed)
+    session.output.set_audio_enabled(False)
+    agent = DelayedTicketAgent()
+
+    await asyncio.wait_for(run_session(session, agent), timeout=SESSION_TIMEOUT)
+
+    assert [fut.result() for fut in agent.playout_futs] == [True]
+
+
+async def test_preemptive_cancel_finishes_buffered_playout_tickets() -> None:
+    speed = 5.0
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.0, "Tell me something", stt_delay=0.1)
+    actions.add_tts(1.0, input="Hello there. ", ttfb=0.1, duration=10.0)
+    actions.add_tts(1.0, input="How are you?", ttfb=0.1, duration=0.1)
+    actions.add_user_speech(2.6, 3.2, "Actually, start over", stt_delay=0.1)
+    actions.add_tts(1.0, input="Starting over. ", ttfb=0.1, duration=0.1)
+    actions.add_tts(1.0, input="What next?", ttfb=0.1, duration=0.1)
+
+    session = create_session(
+        actions,
+        speed_factor=speed,
+        turn_handling={"preemptive_generation": {"enabled": True, "preemptive_tts": True}},
+    )
+    agent = PreemptiveTicketAgent()
+
+    await asyncio.wait_for(run_session(session, agent, drain_delay=1.0), timeout=SESSION_TIMEOUT)
+
+    assert [fut.result() for fut in agent.playout_futs[:2]] == [False, False]
