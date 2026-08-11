@@ -47,8 +47,16 @@ The key for the timed transcripts in the audio frame userdata.
 _T = TypeVar("_T")
 
 
+@dataclass(frozen=True)
 class FlushSentinel:
-    pass
+    """Close the current speech segment.
+
+    ``segment_id`` is optional application metadata returned with the matching
+    ``speech_segment_finished`` event. It does not change synthesis, playout,
+    or interruption behavior.
+    """
+
+    segment_id: str | None = None
 
 
 class NotGiven:

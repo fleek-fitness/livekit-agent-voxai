@@ -19,6 +19,7 @@ from livekit.agents import (
     LanguageCode,
     MetricsCollectedEvent,
     ModelSettings,
+    SpeechSegmentFinishedEvent,
     UserInputTranscribedEvent,
     UserStateChangedEvent,
     function_tool,
@@ -1715,7 +1716,7 @@ class FlushMultiSegmentAgent(Agent):
         model_settings: ModelSettings,
     ) -> AsyncIterable[str | FlushSentinel]:
         yield "Hello there. "
-        yield FlushSentinel()
+        yield FlushSentinel(segment_id="acknowledgement")
         yield "How are you?"
 
 
@@ -1732,13 +1733,18 @@ async def test_pipeline_multi_segment_flush() -> None:
     agent = FlushMultiSegmentAgent()
 
     playback_finished_events: list[PlaybackFinishedEvent] = []
+    segment_finished_events: list[SpeechSegmentFinishedEvent] = []
     session.output.audio.on("playback_finished", playback_finished_events.append)
+    session.on("speech_segment_finished", segment_finished_events.append)
 
     await asyncio.wait_for(run_session(session, agent), timeout=SESSION_TIMEOUT)
 
     # each FlushSentinel-delimited segment plays out independently
     assert len(playback_finished_events) == 2
     assert all(not ev.interrupted for ev in playback_finished_events)
+    assert [ev.segment_id for ev in segment_finished_events] == ["acknowledgement"]
+    assert segment_finished_events[0].played == "full"
+    assert segment_finished_events[0].speech_id
 
     # but both segments join into a single assistant message
     assistant_msgs = [

@@ -289,6 +289,7 @@ EventTypes = Literal[
     "metrics_collected",
     "session_usage_updated",
     "speech_created",
+    "speech_segment_finished",
     "error",
     "close",
     "debug_message",
@@ -443,6 +444,16 @@ class SpeechCreatedEvent(BaseModel):
     created_at: float = Field(default_factory=time.time)
 
 
+class SpeechSegmentFinishedEvent(BaseModel):
+    """Emitted after a labelled ``FlushSentinel`` segment finishes playout."""
+
+    type: Literal["speech_segment_finished"] = "speech_segment_finished"
+    speech_id: str
+    segment_id: str
+    played: Literal["full", "partial", "skipped"]
+    created_at: float = Field(default_factory=time.time)
+
+
 class UserTurnExceededEvent(BaseModel):
     type: Literal["user_turn_exceeded"] = "user_turn_exceeded"
     transcript: str
@@ -508,6 +519,7 @@ AgentEvent = Annotated[
     | ConversationItemAddedEvent
     | FunctionToolsExecutedEvent
     | SpeechCreatedEvent
+    | SpeechSegmentFinishedEvent
     | ErrorEvent
     | CloseEvent
     | OverlappingSpeechEvent,

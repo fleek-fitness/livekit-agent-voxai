@@ -65,6 +65,7 @@ from .events import (
     PreemptiveGenerationOutcomeEvent,
     SessionUsageUpdatedEvent,
     SpeechCreatedEvent,
+    SpeechSegmentFinishedEvent,
     UserInputTranscribedEvent,
     UserTurnExceededEvent,
 )
@@ -3057,6 +3058,7 @@ class AgentActivity(RecognitionHooks):
         class _SpeechSegment:
             text: utils.aio.Chan[str]  # transcript text for this segment
             tts: _TTSGenerationData | None = None  # audio + timed transcript, when enabled
+            id: str | None = None
 
         segment_ch = utils.aio.Chan[_SpeechSegment]()
 
@@ -3090,9 +3092,10 @@ class AgentActivity(RecognitionHooks):
                 segment_ch.send_nowait(seg)
                 return seg
 
-            def _end_segment() -> None:
+            def _end_segment(segment_id: str | None = None) -> None:
                 nonlocal current, tts_text
                 if current is not None:
+                    current.id = segment_id
                     current.text.close()
                 if tts_text is not None:
                     tts_text.close()  # let this segment's TTS inference finish
@@ -3101,7 +3104,7 @@ class AgentActivity(RecognitionHooks):
             try:
                 async for chunk in llm_gen_data.text_ch:
                     if isinstance(chunk, FlushSentinel):
-                        _end_segment()
+                        _end_segment(chunk.segment_id)
                         continue
                     if current is None:
                         current = await _start_segment()
@@ -3295,6 +3298,15 @@ class AgentActivity(RecognitionHooks):
                 on_first_frame=_on_first_frame,
             )
             segment_outputs.append(out)
+            if segment.id is not None:
+                self._session.emit(
+                    "speech_segment_finished",
+                    SpeechSegmentFinishedEvent(
+                        speech_id=speech_handle.id,
+                        segment_id=segment.id,
+                        played=out.played,
+                    ),
+                )
             if speech_handle.interrupted:
                 break
 
