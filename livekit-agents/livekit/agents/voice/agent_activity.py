@@ -3343,7 +3343,6 @@ class AgentActivity(RecognitionHooks):
                 return None
 
         while (segment := await _next_segment()) is not None:
-
             if segment.playout_gate_fut is not None:
                 gate_wait = asyncio.ensure_future(asyncio.shield(segment.playout_gate_fut))
                 await speech_handle.wait_if_not_interrupted([gate_wait])

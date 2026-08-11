@@ -1967,9 +1967,7 @@ async def test_pipeline_playout_gate_controls_forwarding(allowed: bool) -> None:
     assert [fut.result() for fut in agent.playout_futs] == [allowed]
     assert len(playback_finished_events) == int(allowed)
     assistant_msgs = [
-        item
-        for item in agent.chat_ctx.items
-        if item.type == "message" and item.role == "assistant"
+        item for item in agent.chat_ctx.items if item.type == "message" and item.role == "assistant"
     ]
     assert len(assistant_msgs) == int(allowed)
 
