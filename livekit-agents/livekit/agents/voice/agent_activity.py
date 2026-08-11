@@ -3365,7 +3365,9 @@ class AgentActivity(RecognitionHooks):
                 raise
             segment_outputs.append(out)
             segment_played = out.played
-            if audio_output is not None:
+            if audio_output is None and text_output is None:
+                segment_played = "skipped"
+            elif audio_output is not None:
                 audio_started = bool(
                     out.audio_out is not None
                     and out.audio_out.first_frame_fut.done()

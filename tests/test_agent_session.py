@@ -2065,3 +2065,23 @@ async def test_text_output_failure_after_first_delta_emits_partial() -> None:
     assert [(event.segment_id, event.played) for event in segment_finished_events] == [
         ("acknowledgement", "partial")
     ]
+
+
+async def test_labelled_segment_with_all_outputs_disabled_emits_skipped() -> None:
+    speed = 5.0
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.5, "Hello, how are you?", stt_delay=0.2)
+
+    session = create_session(actions, speed_factor=speed)
+    session.output.set_audio_enabled(False)
+    session.output.set_transcription_enabled(False)
+
+    agent = SingleLabelledSegmentAgent()
+    segment_finished_events: list[SpeechSegmentFinishedEvent] = []
+    session.on("speech_segment_finished", segment_finished_events.append)
+
+    await asyncio.wait_for(run_session(session, agent), timeout=SESSION_TIMEOUT)
+
+    assert [(event.segment_id, event.played) for event in segment_finished_events] == [
+        ("acknowledgement", "skipped")
+    ]
