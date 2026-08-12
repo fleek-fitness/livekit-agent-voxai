@@ -1832,6 +1832,41 @@ class DualTicketGatedAgent(FlushMultiSegmentAgent):
         gate_fut.set_result(self.allowed)
 
 
+class EmptyGatedThenTextAgent(FlushMultiSegmentAgent):
+    async def llm_node(
+        self,
+        chat_ctx: ChatContext,
+        tools: list,
+        model_settings: ModelSettings,
+    ) -> AsyncIterable[str | FlushSentinel | SpeechSegmentGate]:
+        gate_fut = asyncio.get_running_loop().create_future()
+        yield SpeechSegmentGate(
+            playout_gate_fut=gate_fut,
+            playout_fut=self._playout_fut(),
+        )
+        yield FlushSentinel()
+        gate_fut.set_result(False)
+        yield "Ordinary response."
+        yield FlushSentinel(playout_fut=self._playout_fut())
+
+
+class PriorTextThenGatedAgent(FlushMultiSegmentAgent):
+    async def llm_node(
+        self,
+        chat_ctx: ChatContext,
+        tools: list,
+        model_settings: ModelSettings,
+    ) -> AsyncIterable[str | FlushSentinel | SpeechSegmentGate]:
+        gate_fut = asyncio.get_running_loop().create_future()
+        yield "Prior segment. "
+        yield SpeechSegmentGate(
+            playout_gate_fut=gate_fut,
+            playout_fut=self._playout_fut(),
+        )
+        yield "Speculative announcement."
+        yield FlushSentinel()
+
+
 class PreemptiveTicketAgent(FlushMultiSegmentAgent):
     def __init__(self) -> None:
         super().__init__()
@@ -2011,6 +2046,35 @@ async def test_pipeline_playout_gate_resolves_gate_and_flush_tickets(allowed: bo
     await asyncio.wait_for(run_session(session, agent), timeout=SESSION_TIMEOUT)
 
     assert [fut.result() for fut in agent.playout_futs] == [allowed, allowed]
+
+
+async def test_empty_gated_segment_does_not_gate_following_text() -> None:
+    speed = 5.0
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.5, "Please continue", stt_delay=0.2)
+    actions.add_tts(1.0, input="Ordinary response.", ttfb=0.1, duration=0.1)
+
+    session = create_session(actions, speed_factor=speed)
+    agent = EmptyGatedThenTextAgent()
+
+    await asyncio.wait_for(run_session(session, agent), timeout=SESSION_TIMEOUT)
+
+    assert [fut.result() for fut in agent.playout_futs] == [False, True]
+
+
+async def test_gate_boundary_does_not_relabel_prior_segment_on_cancel() -> None:
+    speed = 5.0
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.5, "Please continue", stt_delay=0.2)
+    actions.add_tts(15.0, input="Prior segment. ", ttfb=0.1, duration=10.0)
+
+    session = create_session(actions, speed_factor=speed)
+    agent = PriorTextThenGatedAgent()
+    asyncio.get_event_loop().call_later(5 / speed, session.interrupt)
+
+    await asyncio.wait_for(run_session(session, agent, drain_delay=0.5), timeout=SESSION_TIMEOUT)
+
+    assert [fut.result() for fut in agent.playout_futs] == [False]
 
 
 async def test_pipeline_playout_ticket_is_false_when_outputs_are_disabled() -> None:

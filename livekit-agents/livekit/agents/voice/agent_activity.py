@@ -3149,7 +3149,7 @@ class AgentActivity(RecognitionHooks):
                 *,
                 boundary_seen: bool = False,
             ) -> None:
-                nonlocal current, tts_text
+                nonlocal current, tts_text, pending_gate_fut, pending_playout_fut
                 if current is not None:
                     if boundary_seen:
                         current.boundary_seen = True
@@ -3161,6 +3161,9 @@ class AgentActivity(RecognitionHooks):
                     current.text.close()
                 else:
                     _set_playout_result(playout_fut, False)
+                    if boundary_seen and pending_gate_fut is not None:
+                        _set_playout_result(pending_playout_fut, False)
+                        pending_gate_fut = pending_playout_fut = None
                 if tts_text is not None:
                     tts_text.close()  # let this segment's TTS inference finish
                 current, tts_text = None, None
@@ -3168,7 +3171,7 @@ class AgentActivity(RecognitionHooks):
             try:
                 async for chunk in llm_gen_data.text_ch:
                     if isinstance(chunk, SpeechSegmentGate):
-                        _end_segment()
+                        _end_segment(boundary_seen=True)
                         _set_playout_result(pending_playout_fut, False)
                         pending_gate_fut = chunk.playout_gate_fut
                         pending_playout_fut = chunk.playout_fut
