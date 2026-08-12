@@ -7,7 +7,7 @@ import json
 import string
 import time
 from collections.abc import AsyncIterable, Coroutine, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
 from opentelemetry import context as otel_context, trace
@@ -3058,7 +3058,7 @@ class AgentActivity(RecognitionHooks):
             text: utils.aio.Chan[str]  # transcript text for this segment
             tts: _TTSGenerationData | None = None  # audio + timed transcript, when enabled
             playout_gate_fut: asyncio.Future[bool] | None = None
-            playout_fut: asyncio.Future[bool] | None = None
+            playout_futs: list[asyncio.Future[bool]] = field(default_factory=list)
             playout_result: bool | None = None
             output_started: bool = False
             boundary_seen: bool = False
@@ -3077,7 +3077,8 @@ class AgentActivity(RecognitionHooks):
         ) -> None:
             segment.boundary_seen = True
             segment.playout_gate_fut = gate_fut
-            segment.playout_fut = result_fut
+            if result_fut is not None and result_fut not in segment.playout_futs:
+                segment.playout_futs.append(result_fut)
             if segment.playout_result is not None:
                 _set_playout_result(result_fut, segment.playout_result)
 
@@ -3085,7 +3086,8 @@ class AgentActivity(RecognitionHooks):
             if segment.playout_result is not None:
                 return
             segment.playout_result = heard
-            _set_playout_result(segment.playout_fut, heard)
+            for playout_fut in segment.playout_futs:
+                _set_playout_result(playout_fut, heard)
 
         async def _finish_unresolved_segments() -> None:
             for segment in segments:
@@ -3152,7 +3154,8 @@ class AgentActivity(RecognitionHooks):
                     if boundary_seen:
                         current.boundary_seen = True
                         if playout_fut is not None:
-                            current.playout_fut = playout_fut
+                            if playout_fut not in current.playout_futs:
+                                current.playout_futs.append(playout_fut)
                             if current.playout_result is not None:
                                 _set_playout_result(playout_fut, current.playout_result)
                     current.text.close()

@@ -1811,6 +1811,27 @@ class GatedTicketAgent(FlushMultiSegmentAgent):
         gate_fut.set_result(self.allowed)
 
 
+class DualTicketGatedAgent(FlushMultiSegmentAgent):
+    def __init__(self, *, allowed: bool) -> None:
+        super().__init__()
+        self.allowed = allowed
+
+    async def llm_node(
+        self,
+        chat_ctx: ChatContext,
+        tools: list,
+        model_settings: ModelSettings,
+    ) -> AsyncIterable[str | FlushSentinel | SpeechSegmentGate]:
+        gate_fut = asyncio.get_running_loop().create_future()
+        yield SpeechSegmentGate(
+            playout_gate_fut=gate_fut,
+            playout_fut=self._playout_fut(),
+        )
+        yield "Speculative announcement."
+        yield FlushSentinel(playout_fut=self._playout_fut())
+        gate_fut.set_result(self.allowed)
+
+
 class PreemptiveTicketAgent(FlushMultiSegmentAgent):
     def __init__(self) -> None:
         super().__init__()
@@ -1970,6 +1991,26 @@ async def test_pipeline_playout_gate_controls_forwarding(allowed: bool) -> None:
         item for item in agent.chat_ctx.items if item.type == "message" and item.role == "assistant"
     ]
     assert len(assistant_msgs) == int(allowed)
+
+
+@pytest.mark.parametrize("allowed", [False, True])
+async def test_pipeline_playout_gate_resolves_gate_and_flush_tickets(allowed: bool) -> None:
+    speed = 5.0
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.5, "Please do it", stt_delay=0.2)
+    actions.add_tts(
+        1.0,
+        input="Speculative announcement.",
+        ttfb=0.1,
+        duration=0.1,
+    )
+
+    session = create_session(actions, speed_factor=speed)
+    agent = DualTicketGatedAgent(allowed=allowed)
+
+    await asyncio.wait_for(run_session(session, agent), timeout=SESSION_TIMEOUT)
+
+    assert [fut.result() for fut in agent.playout_futs] == [allowed, allowed]
 
 
 async def test_pipeline_playout_ticket_is_false_when_outputs_are_disabled() -> None:
