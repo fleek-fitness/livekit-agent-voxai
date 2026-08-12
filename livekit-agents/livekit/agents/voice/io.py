@@ -10,7 +10,7 @@ from livekit import rtc
 
 from .. import llm, stt
 from ..log import logger
-from ..types import FlushSentinel, TimedString as TimedString
+from ..types import FlushSentinel, SpeechSegmentGate, TimedString as TimedString
 from .agent import ModelSettings
 
 # TODO(theomonnom): can those types be simplified?
@@ -26,11 +26,16 @@ LLMNode = Callable[
         list[llm.Tool],
         ModelSettings,
     ],
-    AsyncIterable[llm.ChatChunk | str | FlushSentinel]
+    AsyncIterable[llm.ChatChunk | str | FlushSentinel | SpeechSegmentGate]
     | str
     | llm.ChatChunk
     | None
-    | Awaitable[AsyncIterable[llm.ChatChunk | str | FlushSentinel] | str | llm.ChatChunk | None],
+    | Awaitable[
+        AsyncIterable[llm.ChatChunk | str | FlushSentinel | SpeechSegmentGate]
+        | str
+        | llm.ChatChunk
+        | None
+    ],
 ]
 TTSNode = Callable[
     [AsyncIterable[str], ModelSettings],

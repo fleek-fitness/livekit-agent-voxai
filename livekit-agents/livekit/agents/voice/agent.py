@@ -13,7 +13,7 @@ from .. import inference, llm, stt, tokenize, tts, utils, vad
 from ..llm import ChatContext, ChatItem, RealtimeModel, ToolError, find_function_tools
 from ..llm.chat_context import Instructions, _ReadOnlyChatContext
 from ..log import logger
-from ..types import NOT_GIVEN, FlushSentinel, NotGivenOr
+from ..types import NOT_GIVEN, FlushSentinel, NotGivenOr, SpeechSegmentGate
 from ..utils import is_given, misc
 from .events import UserTurnExceededEvent
 from .speech_handle import SpeechHandle
@@ -346,8 +346,12 @@ class Agent:
         tools: list[llm.Tool],
         model_settings: ModelSettings,
     ) -> (
-        AsyncIterable[llm.ChatChunk | str | FlushSentinel]
-        | Coroutine[Any, Any, AsyncIterable[llm.ChatChunk | str | FlushSentinel]]
+        AsyncIterable[llm.ChatChunk | str | FlushSentinel | SpeechSegmentGate]
+        | Coroutine[
+            Any,
+            Any,
+            AsyncIterable[llm.ChatChunk | str | FlushSentinel | SpeechSegmentGate],
+        ]
         | Coroutine[Any, Any, str]
         | Coroutine[Any, Any, llm.ChatChunk]
         | Coroutine[Any, Any, None]
@@ -498,7 +502,7 @@ class Agent:
             chat_ctx: llm.ChatContext,
             tools: list[llm.Tool],
             model_settings: ModelSettings,
-        ) -> AsyncGenerator[llm.ChatChunk | str | FlushSentinel, None]:
+        ) -> AsyncGenerator[llm.ChatChunk | str | FlushSentinel | SpeechSegmentGate, None]:
             """Default implementation for `Agent.llm_node`"""
             activity = agent._get_activity_or_raise()
             assert activity.llm is not None, "llm_node called but no LLM node is available"

@@ -52,9 +52,11 @@ _T = TypeVar("_T")
 class FlushSentinel:
     """Close the current speech segment.
 
-    When provided, ``playout_fut`` is completed with whether any output from
-    that segment reached the user. It only observes the existing pipeline and
-    does not change synthesis, playout, or interruption behavior.
+    When provided, ``playout_fut`` is completed with whether that segment
+    reached the user. Audio is authoritative when audio output is configured;
+    text is used only for text-only output. This avoids treating a transcript
+    as heard speech after silent TTS failure. The ticket only observes the
+    existing pipeline and does not change synthesis, playout, or interruption.
     """
 
     playout_fut: asyncio.Future[bool] | None = field(default=None, compare=False, repr=False)
