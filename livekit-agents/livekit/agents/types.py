@@ -1,4 +1,5 @@
-from dataclasses import dataclass
+import asyncio
+from dataclasses import dataclass, field
 from typing import Any, Literal, TypeAlias, TypeVar
 
 from pydantic import GetCoreSchemaHandler
@@ -47,8 +48,16 @@ The key for the timed transcripts in the audio frame userdata.
 _T = TypeVar("_T")
 
 
+@dataclass(frozen=True, eq=False)
 class FlushSentinel:
-    pass
+    """Close the current speech segment.
+
+    When provided, ``playout_fut`` is completed with whether any output from
+    that segment reached the user. It only observes the existing pipeline and
+    does not change synthesis, playout, or interruption behavior.
+    """
+
+    playout_fut: asyncio.Future[bool] | None = field(default=None, compare=False, repr=False)
 
 
 class NotGiven:
