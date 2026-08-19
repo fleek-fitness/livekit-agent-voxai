@@ -951,12 +951,17 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
         close_started_at = time.perf_counter()
 
         async def await_close_step(awaitable: Awaitable[Any], *, stage: str) -> Any:
+            task = asyncio.ensure_future(awaitable)
+
             try:
-                return await awaitable
+                # asyncio.wait does not propagate cancellation from this parent task to the
+                # cleanup task. This lets us distinguish a cancelled cleanup step from a
+                # cancellation request targeting the whole session close.
+                await asyncio.wait({task})
             except asyncio.CancelledError:
                 # Deliberately exclude room, job, agent, and transcript identifiers.
-                task = asyncio.current_task()
-                cancelling = getattr(task, "cancelling", None)
+                current_task = asyncio.current_task()
+                cancelling = getattr(current_task, "cancelling", None)
                 logger.warning(
                     "agent session close cancelled",
                     extra={
@@ -973,7 +978,28 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
                         "has_session_host": getattr(self, "_session_host", None) is not None,
                     },
                 )
+                if not task.done():
+                    task.cancel()
+                    task.add_done_callback(
+                        lambda completed: (
+                            completed.exception() if not completed.cancelled() else None
+                        )
+                    )
                 raise
+
+            try:
+                return task.result()
+            except asyncio.CancelledError:
+                logger.warning(
+                    "agent session close step cancelled",
+                    extra={
+                        "reason": reason.value,
+                        "stage": stage,
+                        "drain": drain,
+                        "elapsed_ms": round((time.perf_counter() - close_started_at) * 1000, 1),
+                    },
+                )
+                return None
 
         if self._root_span_context:
             # make `activity.drain` and `on_exit` under the root span
