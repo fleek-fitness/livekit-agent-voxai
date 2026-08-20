@@ -318,14 +318,22 @@ class _JobProc:
             event_prefix: str,
             awaitable_factory: Callable[[], Awaitable[None]],
         ) -> None:
+            async def invoke_step() -> None:
+                await awaitable_factory()
+
+            step_task: asyncio.Task[None] = asyncio.create_task(
+                invoke_step(),
+                name=event_prefix,
+            )
             try:
                 self._emit_shutdown_trace(f"{event_prefix}_start")
                 await asyncio.wait_for(
-                    awaitable_factory(),
+                    asyncio.shield(step_task),
                     timeout=self._session_end_timeout,
                 )
                 self._emit_shutdown_trace(f"{event_prefix}_done")
             except asyncio.TimeoutError:
+                await aio.cancel_and_wait(step_task)
                 self._emit_shutdown_trace(f"{event_prefix}_timeout")
                 logger.error(
                     "%s timed out after %ds",
@@ -333,15 +341,14 @@ class _JobProc:
                     self._session_end_timeout,
                 )
             except asyncio.CancelledError:
-                current_task = asyncio.current_task()
-                cancelling = getattr(current_task, "cancelling", None)
-                cancelling_count = cancelling() if callable(cancelling) else None
-                self._emit_shutdown_trace(
-                    f"{event_prefix}_cancelled",
-                    task_cancelling_count=cancelling_count,
-                )
-                if cancelling_count:
+                # This distinction works on every supported Python version,
+                # including 3.10 where Task.cancelling() is unavailable. A
+                # cancelled owned task is a child cancellation; otherwise the
+                # task running the finalizer itself was cancelled.
+                if not step_task.done() or not step_task.cancelled():
+                    self._emit_shutdown_trace(f"{event_prefix}_parent_cancelled")
                     raise
+                self._emit_shutdown_trace(f"{event_prefix}_child_cancelled")
                 logger.error("%s returned a child cancellation", event_prefix)
             except Exception:
                 self._emit_shutdown_trace(f"{event_prefix}_error")
@@ -510,14 +517,24 @@ class _JobProc:
                 pass
 
         pending_parent_cancellation: asyncio.CancelledError | None = None
+        session_aclose_task: asyncio.Task[None] | None = None
         try:
             if session := self._job_ctx._primary_agent_session:
                 _log_shutdown_stage("session_aclose_start")
-                await asyncio.wait_for(session.aclose(), timeout=_SESSION_ACLOSE_TIMEOUT)
+                session_aclose_task = asyncio.create_task(
+                    session.aclose(),
+                    name="session_aclose",
+                )
+                await asyncio.wait_for(
+                    asyncio.shield(session_aclose_task),
+                    timeout=_SESSION_ACLOSE_TIMEOUT,
+                )
                 _log_shutdown_stage("session_aclose_done")
             else:
                 _log_shutdown_stage("session_aclose_skipped_no_primary_session")
         except asyncio.TimeoutError:
+            if session_aclose_task is not None:
+                await aio.cancel_and_wait(session_aclose_task)
             _log_shutdown_stage("session_aclose_timeout", timeout=_SESSION_ACLOSE_TIMEOUT)
             logger.error(
                 "AgentSession.aclose() timed out after %.1fs; "
@@ -525,21 +542,17 @@ class _JobProc:
                 _SESSION_ACLOSE_TIMEOUT,
             )
         except asyncio.CancelledError as exc:
-            current_task = asyncio.current_task()
-            cancelling = getattr(current_task, "cancelling", None)
-            cancelling_count = cancelling() if callable(cancelling) else None
-            _log_shutdown_stage(
-                "session_aclose_cancelled",
-                task_cancelling_count=cancelling_count,
-            )
-            if cancelling_count:
-                pending_parent_cancellation = exc
-            else:
+            if session_aclose_task is not None and session_aclose_task.cancelled():
                 _log_shutdown_stage("session_aclose_child_cancelled")
                 logger.error(
                     "AgentSession.aclose() returned a child cancellation; "
                     "proceeding with session finalization"
                 )
+            else:
+                _log_shutdown_stage("session_aclose_parent_cancelled")
+                pending_parent_cancellation = exc
+                if session_aclose_task is not None:
+                    await aio.cancel_and_wait(session_aclose_task)
         finally:
             if self._session_cleanup_done is not None:
                 self._session_cleanup_done.set()
@@ -549,9 +562,6 @@ class _JobProc:
         except asyncio.CancelledError as exc:
             if pending_parent_cancellation is None:
                 pending_parent_cancellation = exc
-
-        if pending_parent_cancellation is not None:
-            raise pending_parent_cancellation
 
         await self._client.send(ShuttingDown())
 
@@ -581,6 +591,9 @@ class _JobProc:
         self._job_ctx._on_cleanup()
         await http_context._close_http_ctx()
         _JobContextVar.reset(job_ctx_token)
+
+        if pending_parent_cancellation is not None:
+            raise pending_parent_cancellation
 
 
 @dataclass

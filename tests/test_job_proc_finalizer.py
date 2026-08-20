@@ -7,6 +7,7 @@ import pytest
 
 from livekit.agents import JobExecutorType
 from livekit.agents.ipc.job_proc_lazy_main import _JobProc
+from livekit.agents.utils import http_context
 
 pytestmark = pytest.mark.unit
 
@@ -83,3 +84,61 @@ async def test_child_cancelled_callback_does_not_skip_internal_finalizer() -> No
 
     session_end_fnc.assert_awaited_once_with(proc._job_ctx)
     proc._job_ctx._on_session_end.assert_awaited_once_with()
+
+
+async def test_parent_cancellation_is_replayed_after_complete_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_close_started = asyncio.Event()
+
+    async def close_session() -> None:
+        session_close_started.set()
+        await asyncio.Event().wait()
+
+    async def entrypoint(job_ctx: object) -> None:
+        return None
+
+    session_end_fnc = AsyncMock()
+    proc = _JobProc(
+        MagicMock(),
+        entrypoint,
+        session_end_fnc,
+        session_end_timeout=1.0,
+        executor_type=JobExecutorType.PROCESS,
+    )
+    proc._client = MagicMock()
+    proc._client.send = AsyncMock()
+    proc._room = MagicMock()
+    proc._room.disconnect = AsyncMock()
+    proc._shutdown_fut = asyncio.Future()
+    proc._shutdown_fut.set_result(MagicMock(reason="test shutdown", user_initiated=False))
+    proc._session_cleanup_done = asyncio.Event()
+
+    shutdown_callback = AsyncMock()
+    proc._job_ctx = MagicMock()
+    proc._job_ctx.job.id = "00000000-0000-0000-0000-000000000001"
+    proc._job_ctx.job.agent_name = "test-agent"
+    proc._job_ctx.job.room.name = "test-room"
+    proc._job_ctx._primary_agent_session.aclose = close_session
+    proc._job_ctx._shutdown_callbacks = [shutdown_callback]
+    proc._job_ctx._pending_tasks = []
+    proc._job_ctx._on_session_end = AsyncMock()
+
+    close_http_ctx = AsyncMock()
+    monkeypatch.setattr(http_context, "_new_session_ctx", MagicMock())
+    monkeypatch.setattr(http_context, "_close_http_ctx", close_http_ctx)
+
+    job_task = asyncio.create_task(proc._run_job_task())
+    await session_close_started.wait()
+    job_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await job_task
+
+    session_end_fnc.assert_awaited_once_with(proc._job_ctx)
+    proc._job_ctx._on_session_end.assert_awaited_once_with()
+    assert proc._client.send.await_count == 2
+    proc._room.disconnect.assert_awaited_once_with()
+    shutdown_callback.assert_awaited_once_with("test shutdown")
+    proc._job_ctx._on_cleanup.assert_called_once_with()
+    close_http_ctx.assert_awaited_once_with()
