@@ -36,6 +36,7 @@ from livekit.agents.llm import (
 from livekit.agents.llm.chat_context import ChatContext, ChatMessage
 from livekit.agents.stt import SpeechData, SpeechEvent, SpeechEventType
 from livekit.agents.utils import aio
+from livekit.agents.voice import agent_session as agent_session_module
 from livekit.agents.voice.agent_activity import AgentActivity
 from livekit.agents.voice.audio_recognition import AudioRecognition, _EndOfTurnInfo
 from livekit.agents.voice.endpointing import BaseEndpointing
@@ -119,6 +120,21 @@ class _BlockingCloseActivity(_CancellingCloseActivity):
         await self.release_drain.wait()
 
 
+class _SlowCancellingCloseActivity(_CancellingCloseActivity):
+    def __init__(self) -> None:
+        self.drain_started = asyncio.Event()
+        self.cancel_received = asyncio.Event()
+        self.release_after_cancel = asyncio.Event()
+
+    async def drain(self) -> None:
+        self.drain_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancel_received.set()
+            await self.release_after_cancel.wait()
+
+
 class _CancellingAgentTask(AgentTask[None]):
     def __init__(self) -> None:
         self._old_agent = None
@@ -161,6 +177,7 @@ def _create_closing_test_session(activity: object) -> AgentSession:
     session = AgentSession.__new__(AgentSession)
     session._root_span_context = None
     session._lock = asyncio.Lock()
+    session._close_step_tasks = set()
     session._started = True
     session._closing = False
     session._cancel_user_away_timer = Mock()
@@ -251,6 +268,7 @@ async def test_aclose_preserves_parent_cancellation(
         record for record in caplog.records if record.message == "agent session close cancelled"
     )
     assert record.stage == "activity_drain"
+    assert session._close_step_tasks == set()
 
 
 async def test_aclose_handles_task_without_cancelling_method(
@@ -273,6 +291,32 @@ async def test_aclose_handles_task_without_cancelling_method(
         record for record in caplog.records if record.message == "agent session close cancelled"
     )
     assert record.task_cancelling_count is None
+
+
+async def test_aclose_tracks_child_that_outlives_parent_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(agent_session_module, "_CLOSE_STEP_CANCEL_TIMEOUT", 0.01)
+    activity = _SlowCancellingCloseActivity()
+    session = _create_closing_test_session(activity)
+    close_task = asyncio.create_task(session._aclose_impl(reason=CloseReason.USER_INITIATED))
+
+    await activity.drain_started.wait()
+    close_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await close_task
+
+    await activity.cancel_received.wait()
+    assert len(session._close_step_tasks) == 1
+
+    activity.release_after_cancel.set()
+    for _ in range(10):
+        if not session._close_step_tasks:
+            break
+        await asyncio.sleep(0)
+
+    assert session._close_step_tasks == set()
 
 
 SESSION_TIMEOUT = 60.0

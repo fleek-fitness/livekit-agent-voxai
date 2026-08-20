@@ -200,6 +200,8 @@ class _JobProc:
         self._session_end_fnc = session_end_fnc
         self._session_end_timeout = session_end_timeout
         self._job_task: asyncio.Task[None] | None = None
+        self._session_cleanup_done: asyncio.Event | None = None
+        self._session_finalizer_task: asyncio.Task[None] | None = None
 
         # used to warn users if both connect and shutdown are not called inside the job_entry
         self._ctx_connect_called = False
@@ -278,6 +280,11 @@ class _JobProc:
             )
             if self._job_task is not None:
                 await aio.cancel_and_wait(self._job_task)
+            if hasattr(self, "_job_ctx"):
+                if self._session_cleanup_done is None:
+                    self._session_cleanup_done = asyncio.Event()
+                self._session_cleanup_done.set()
+                await self._await_session_finalizer()
             await aio.cancel_and_wait(read_task)
 
     def _emit_shutdown_trace(self, event: str, **extra: object) -> None:
@@ -300,7 +307,74 @@ class _JobProc:
         )
         logger.info("job_proc_shutdown_trace %s", field_text)
 
+    async def _run_session_finalizer(self) -> None:
+        cleanup_done = self._session_cleanup_done
+        if cleanup_done is None:
+            raise RuntimeError("session finalizer started before job initialization")
+
+        await cleanup_done.wait()
+
+        async def run_finalizer_step(
+            event_prefix: str,
+            awaitable_factory: Callable[[], Awaitable[None]],
+        ) -> None:
+            try:
+                self._emit_shutdown_trace(f"{event_prefix}_start")
+                await asyncio.wait_for(
+                    awaitable_factory(),
+                    timeout=self._session_end_timeout,
+                )
+                self._emit_shutdown_trace(f"{event_prefix}_done")
+            except asyncio.TimeoutError:
+                self._emit_shutdown_trace(f"{event_prefix}_timeout")
+                logger.error(
+                    "%s timed out after %ds",
+                    event_prefix,
+                    self._session_end_timeout,
+                )
+            except asyncio.CancelledError:
+                current_task = asyncio.current_task()
+                cancelling = getattr(current_task, "cancelling", None)
+                cancelling_count = cancelling() if callable(cancelling) else None
+                self._emit_shutdown_trace(
+                    f"{event_prefix}_cancelled",
+                    task_cancelling_count=cancelling_count,
+                )
+                if cancelling_count:
+                    raise
+                logger.error("%s returned a child cancellation", event_prefix)
+            except Exception:
+                self._emit_shutdown_trace(f"{event_prefix}_error")
+                logger.exception("error while executing %s", event_prefix)
+
+        session_end_fnc = self._session_end_fnc
+        if session_end_fnc:
+            await run_finalizer_step(
+                "session_end_callback",
+                lambda: session_end_fnc(self._job_ctx),
+            )
+
+        await run_finalizer_step(
+            "job_ctx_on_session_end",
+            self._job_ctx._on_session_end,
+        )
+
+    def _ensure_session_finalizer_task(self) -> asyncio.Task[None]:
+        if self._session_finalizer_task is None:
+            self._session_finalizer_task = asyncio.create_task(
+                self._run_session_finalizer(),
+                name="session_finalizer",
+            )
+        return self._session_finalizer_task
+
+    async def _await_session_finalizer(self) -> None:
+        task = self._ensure_session_finalizer_task()
+        await asyncio.shield(task)
+
     def _start_job(self, msg: StartJobRequest) -> None:
+        self._session_cleanup_done = asyncio.Event()
+        self._session_finalizer_task = None
+
         if msg.running_job.fake_job:
             from .mock_room import create_mock_room
 
@@ -421,6 +495,7 @@ class _JobProc:
             reason=shutdown_info.reason,
             user_initiated=shutdown_info.user_initiated,
         )
+        finalizer_task = self._ensure_session_finalizer_task()
 
         # wait for the entrypoint to finish, cancel if it takes too long
         if not job_entry_task.done():
@@ -434,42 +509,49 @@ class _JobProc:
                 # swallow so shutdown callbacks still run.
                 pass
 
-        if session := self._job_ctx._primary_agent_session:
-            _log_shutdown_stage("session_aclose_start")
-            try:
+        pending_parent_cancellation: asyncio.CancelledError | None = None
+        try:
+            if session := self._job_ctx._primary_agent_session:
+                _log_shutdown_stage("session_aclose_start")
                 await asyncio.wait_for(session.aclose(), timeout=_SESSION_ACLOSE_TIMEOUT)
                 _log_shutdown_stage("session_aclose_done")
-            except asyncio.TimeoutError:
-                _log_shutdown_stage("session_aclose_timeout", timeout=_SESSION_ACLOSE_TIMEOUT)
+            else:
+                _log_shutdown_stage("session_aclose_skipped_no_primary_session")
+        except asyncio.TimeoutError:
+            _log_shutdown_stage("session_aclose_timeout", timeout=_SESSION_ACLOSE_TIMEOUT)
+            logger.error(
+                "AgentSession.aclose() timed out after %.1fs; "
+                "proceeding with shutdown so registered callbacks still run.",
+                _SESSION_ACLOSE_TIMEOUT,
+            )
+        except asyncio.CancelledError as exc:
+            current_task = asyncio.current_task()
+            cancelling = getattr(current_task, "cancelling", None)
+            cancelling_count = cancelling() if callable(cancelling) else None
+            _log_shutdown_stage(
+                "session_aclose_cancelled",
+                task_cancelling_count=cancelling_count,
+            )
+            if cancelling_count:
+                pending_parent_cancellation = exc
+            else:
+                _log_shutdown_stage("session_aclose_child_cancelled")
                 logger.error(
-                    "AgentSession.aclose() timed out after %.1fs; "
-                    "proceeding with shutdown so registered callbacks still run.",
-                    _SESSION_ACLOSE_TIMEOUT,
+                    "AgentSession.aclose() returned a child cancellation; "
+                    "proceeding with session finalization"
                 )
-        else:
-            _log_shutdown_stage("session_aclose_skipped_no_primary_session")
+        finally:
+            if self._session_cleanup_done is not None:
+                self._session_cleanup_done.set()
 
-        if self._session_end_fnc:
-            try:
-                _log_shutdown_stage("session_end_callback_start")
-                await asyncio.wait_for(
-                    self._session_end_fnc(self._job_ctx),
-                    timeout=self._session_end_timeout,
-                )
-                _log_shutdown_stage("session_end_callback_done")
-            except asyncio.TimeoutError:
-                _log_shutdown_stage("session_end_callback_timeout")
-                logger.error("on_session_end timed out after %ds", self._session_end_timeout)
-            except Exception:
-                _log_shutdown_stage("session_end_callback_error")
-                logger.exception("error while executing the on_session_end callback")
-
-        _log_shutdown_stage("job_ctx_on_session_end_start")
         try:
-            await self._job_ctx._on_session_end()
-            _log_shutdown_stage("job_ctx_on_session_end_done")
-        except Exception:
-            logger.exception("error in job_ctx._on_session_end")
+            await asyncio.shield(finalizer_task)
+        except asyncio.CancelledError as exc:
+            if pending_parent_cancellation is None:
+                pending_parent_cancellation = exc
+
+        if pending_parent_cancellation is not None:
+            raise pending_parent_cancellation
 
         await self._client.send(ShuttingDown())
 
