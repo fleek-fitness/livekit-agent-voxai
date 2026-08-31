@@ -8,7 +8,7 @@ import multiprocessing as mp
 import socket
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from multiprocessing.context import BaseContext
 from typing import ClassVar
@@ -130,6 +130,7 @@ class _StartArgs:
     initialize_counter: mp.Value
     entrypoint_counter: mp.Value
     shutdown_counter: mp.Value
+    finalizer_counter: mp.Value
     initialize_simulate_work_time: float
     entrypoint_simulate_work_time: float
     shutdown_simulate_work_time: float
@@ -141,6 +142,7 @@ def _new_start_args(mp_ctx: BaseContext) -> _StartArgs:
         initialize_counter=mp_ctx.Value(ctypes.c_uint),
         entrypoint_counter=mp_ctx.Value(ctypes.c_uint),
         shutdown_counter=mp_ctx.Value(ctypes.c_uint),
+        finalizer_counter=mp_ctx.Value(ctypes.c_uint),
         initialize_simulate_work_time=0.0,
         entrypoint_simulate_work_time=0.0,
         shutdown_simulate_work_time=0.0,
@@ -222,6 +224,36 @@ async def _job_entrypoint_session_aclose_hangs(job_ctx: JobContext) -> None:
         start_args.entrypoint_counter.value += 1
 
     job_ctx.shutdown("trigger hang in session.aclose()")
+
+
+async def _job_entrypoint_session_aclose_cancels(job_ctx: JobContext) -> None:
+    start_args: _StartArgs = job_ctx.proc.user_arguments
+
+    class _CancellingSession:
+        async def aclose(self) -> None:
+            raise asyncio.CancelledError
+
+    job_ctx._primary_agent_session = _CancellingSession()  # type: ignore[assignment]
+    job_ctx._on_session_end = AsyncNoop()  # type: ignore[method-assign]
+
+    with start_args.entrypoint_counter.get_lock():
+        start_args.entrypoint_counter.value += 1
+
+    job_ctx.shutdown("trigger child cancellation in session.aclose()")
+
+
+class AsyncNoop:
+    def __call__(self) -> Awaitable[None]:
+        return self._run()
+
+    async def _run(self) -> None:
+        return None
+
+
+async def _session_end_counter(job_ctx: JobContext) -> None:
+    start_args: _StartArgs = job_ctx.proc.user_arguments
+    with start_args.finalizer_counter.get_lock():
+        start_args.finalizer_counter.value += 1
 
 
 async def _job_entrypoint_raises_after_shutdown(job_ctx: JobContext) -> None:
@@ -469,13 +501,14 @@ def _create_proc(
     mp_ctx: BaseContext,
     initialize_timeout: float = 20.0,
     job_entrypoint_fnc: Callable[[JobContext], object] = _job_entrypoint,
+    session_end_fnc: Callable[[JobContext], Awaitable[None]] | None = None,
 ) -> tuple[ipc.job_proc_executor.ProcJobExecutor, _StartArgs]:
     start_args = _new_start_args(mp_ctx)
     loop = asyncio.get_running_loop()
     proc = ipc.job_proc_executor.ProcJobExecutor(
         initialize_process_fnc=_initialize_proc,
         job_entrypoint_fnc=job_entrypoint_fnc,
-        session_end_fnc=None,
+        session_end_fnc=session_end_fnc,
         initialize_timeout=initialize_timeout,
         close_timeout=close_timeout,
         session_end_timeout=300.0,
@@ -503,6 +536,29 @@ async def test_shutdown_no_job():
     assert proc.exitcode == 0
     assert not proc.killed
     assert start_args.shutdown_counter.value == 0, "shutdown_cb isn't called when there is no job"
+
+
+async def test_session_finalizer_runs_once_after_child_aclose_cancellation() -> None:
+    mp_ctx = mp.get_context("spawn")
+    proc, start_args = _create_proc(
+        close_timeout=10.0,
+        mp_ctx=mp_ctx,
+        job_entrypoint_fnc=_job_entrypoint_session_aclose_cancels,
+        session_end_fnc=_session_end_counter,
+    )
+    await proc.start()
+    await proc.initialize()
+
+    try:
+        await proc.launch_job(_generate_fake_job())
+        await _poll_until(lambda: start_args.finalizer_counter.value == 1)
+        await proc.aclose()
+
+        assert proc.exitcode == 0
+        assert start_args.finalizer_counter.value == 1
+    finally:
+        if proc.exitcode is None:
+            await proc.aclose()
 
 
 async def test_job_slow_shutdown():

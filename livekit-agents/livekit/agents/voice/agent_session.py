@@ -205,6 +205,7 @@ class VoiceActivityVideoSampler:
 
 
 DEFAULT_TTS_TEXT_TRANSFORMS: list[TextTransforms] = ["filter_markdown", "filter_emoji"]
+_CLOSE_STEP_CANCEL_TIMEOUT = 1.0
 
 
 class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
@@ -459,6 +460,7 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
         self._update_activity_atask: asyncio.Task[None] | None = None
         self._activity_lock = asyncio.Lock()
         self._lock = asyncio.Lock()
+        self._close_step_tasks: set[asyncio.Future[Any]] = set()
 
         # used to keep a reference to the room io
         self._room_io: room_io.RoomIO | None = None
@@ -951,12 +953,70 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
         close_started_at = time.perf_counter()
 
         async def await_close_step(awaitable: Awaitable[Any], *, stage: str) -> Any:
+            task = asyncio.ensure_future(awaitable)
+
+            def track_late_task() -> None:
+                if task.done() or task in self._close_step_tasks:
+                    return
+
+                self._close_step_tasks.add(task)
+
+                def on_done(completed: asyncio.Future[Any]) -> None:
+                    self._close_step_tasks.discard(completed)
+                    if completed.cancelled():
+                        return
+                    try:
+                        completed.result()
+                    except Exception:
+                        logger.exception(
+                            "agent session close step failed after parent cancellation",
+                            extra={"reason": reason.value, "stage": stage, "drain": drain},
+                        )
+
+                task.add_done_callback(on_done)
+
+            async def cancel_and_reap_task() -> None:
+                if task.done():
+                    return
+
+                task.cancel()
+                done: set[asyncio.Future[Any]] = set()
+                try:
+                    done, _ = await asyncio.wait(
+                        {task},
+                        timeout=_CLOSE_STEP_CANCEL_TIMEOUT,
+                    )
+                finally:
+                    track_late_task()
+
+                if task not in done:
+                    logger.warning(
+                        "agent session close step still running after cancellation",
+                        extra={
+                            "reason": reason.value,
+                            "stage": stage,
+                            "drain": drain,
+                            "timeout": _CLOSE_STEP_CANCEL_TIMEOUT,
+                        },
+                    )
+                elif not task.cancelled():
+                    try:
+                        task.result()
+                    except Exception:
+                        logger.exception(
+                            "agent session close step failed during cancellation",
+                            extra={"reason": reason.value, "stage": stage, "drain": drain},
+                        )
+
             try:
-                return await awaitable
+                # asyncio.wait does not propagate cancellation from this parent task to the
+                # cleanup task. This lets us distinguish a cancelled cleanup step from a
+                # cancellation request targeting the whole session close.
+                await asyncio.wait({task})
             except asyncio.CancelledError:
                 # Deliberately exclude room, job, agent, and transcript identifiers.
-                task = asyncio.current_task()
-                cancelling = getattr(task, "cancelling", None)
+                current_task = asyncio.current_task()
+                cancelling = getattr(current_task, "cancelling", None)
                 logger.warning(
                     "agent session close cancelled",
                     extra={
@@ -973,7 +1033,23 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
                         "has_session_host": getattr(self, "_session_host", None) is not None,
                     },
                 )
+                if not task.done():
+                    await cancel_and_reap_task()
                 raise
+
+            try:
+                return task.result()
+            except asyncio.CancelledError:
+                logger.warning(
+                    "agent session close step cancelled",
+                    extra={
+                        "reason": reason.value,
+                        "stage": stage,
+                        "drain": drain,
+                        "elapsed_ms": round((time.perf_counter() - close_started_at) * 1000, 1),
+                    },
+                )
+                return None
 
         if self._root_span_context:
             # make `activity.drain` and `on_exit` under the root span
