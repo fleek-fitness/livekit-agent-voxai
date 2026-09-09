@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import httpx
 import pytest
+from anthropic.types import RawMessageDeltaEvent, RawMessageStartEvent, RawMessageStopEvent
 
 from livekit.agents import APIConnectOptions, llm
 from livekit.plugins.anthropic.llm import LLMStream
@@ -107,3 +108,76 @@ class TestAnthropicStreamRetry:
 
         assert calls == 2
         assert response.usage is not None
+
+
+class TestCumulativeUsage:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("initial_output", [0, 1])
+    @pytest.mark.parametrize("cumulative_outputs", [(7,), (2, 7)])
+    async def test_final_usage_and_metrics_use_latest_cumulative_count(
+        self, initial_output: int, cumulative_outputs: tuple[int, ...]
+    ) -> None:
+        """Anthropic message_delta usage is a cumulative snapshot, not an increment."""
+        events = [
+            RawMessageStartEvent.model_validate(
+                {
+                    "type": "message_start",
+                    "message": {
+                        "id": "usage-fixture",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": "claude-fixture",
+                        "content": [],
+                        "usage": {"input_tokens": 100, "output_tokens": initial_output},
+                    },
+                }
+            ),
+            *[
+                RawMessageDeltaEvent.model_validate(
+                    {
+                        "type": "message_delta",
+                        "delta": {"stop_reason": "end_turn"},
+                        "usage": {"output_tokens": count},
+                    }
+                )
+                for count in cumulative_outputs
+            ],
+            RawMessageStopEvent(type="message_stop"),
+        ]
+
+        class UsageStream(_EmptyAnthropicStream):
+            def __init__(self) -> None:
+                self.events = iter(events)
+
+            async def __anext__(self):
+                event = next(self.events, None)
+                if event is None:
+                    raise StopAsyncIteration
+                return event
+
+        async def create_stream():
+            return UsageStream()
+
+        model = _make_llm()
+        collected_metrics = []
+        model.on("metrics_collected", collected_metrics.append)
+        stream = LLMStream(
+            model,
+            create_anthropic_stream=create_stream,
+            chat_ctx=llm.ChatContext.empty(),
+            tools=[],
+            conn_options=APIConnectOptions(max_retry=0),
+        )
+        try:
+            response = await stream.collect()
+            await stream.aclose()
+            assert response.usage is not None
+            assert response.usage.completion_tokens == 7
+            assert response.usage.prompt_tokens == 100
+            assert response.usage.total_tokens == 107
+            assert len(collected_metrics) == 1
+            assert collected_metrics[0].completion_tokens == 7
+            assert collected_metrics[0].total_tokens == 107
+        finally:
+            await stream.aclose()
+            await model._client.close()
