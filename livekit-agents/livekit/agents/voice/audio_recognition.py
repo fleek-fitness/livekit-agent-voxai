@@ -56,6 +56,7 @@ _NON_SPECIFIC_LANGUAGE_CODES = frozenset({"auto", "multi"})
 _EOU_MAX_HISTORY_TURNS = 6
 # backoff before recreating the stt stream after an unrecoverable error
 _STT_RECONNECT_INTERVAL = 0.5
+_END_OF_TURN_CLOSE_TIMEOUT = 5.0
 
 
 @dataclass
@@ -73,6 +74,7 @@ class _EndOfTurnInfo:
     new_transcript: str
     transcript_confidence: float
     metrics: _EndOfTurnMetrics
+    transcript_clock_suppressed: bool = False
     backchannel_over_agent: bool = False
     """The turn's speech overlapped agent speech and was classified a backchannel by adaptive interruption."""
 
@@ -123,6 +125,7 @@ class _PreemptiveGenerationInfo:
     new_transcript: str
     transcript_confidence: float
     started_speaking_at: float | None
+    trigger_source: Literal["preflight", "final_transcript"] = "final_transcript"
 
 
 @dataclass
@@ -277,6 +280,7 @@ class AudioRecognition:
         self._user_silence_ev.set()
 
         self._last_final_transcript_time: float | None = None
+        self._final_transcript_clock_suppressed = False
         self._last_speaking_time: float | None = None
         self._speech_start_time: float | None = None
 
@@ -383,6 +387,33 @@ class AudioRecognition:
                     if self._turn_detector_stream is not None:
                         self._turn_detector_stream.cancel_inference()
                     self._turn_detector_prediction_fut = None
+
+    def _adaptive_endpointing_enabled(self) -> bool:
+        return bool(getattr(self._session.options, "enable_adaptive_endpointing", False))
+
+    def _apply_adaptive_endpointing_multiplier(self, endpointing_delay: float) -> float:
+        if not self._adaptive_endpointing_enabled():
+            return endpointing_delay
+
+        dyn_mgr = getattr(self._hooks, "_dynamic_interruption", None)
+        if dyn_mgr is None:
+            return endpointing_delay
+
+        try:
+            multiplier = float(dyn_mgr.get_endpointing_multiplier())
+        except Exception:
+            multiplier = 1.0
+
+        if multiplier <= 1.0:
+            return endpointing_delay
+
+        adjusted_delay = min(max(endpointing_delay, 1.0) * multiplier, self._endpointing.max_delay)
+        logger.debug(
+            "adaptive endpointing: multiplier=%s, delay=%s",
+            round(multiplier, 2),
+            round(adjusted_delay, 2),
+        )
+        return adjusted_delay
 
     def _update_last_language(self, language: LanguageCode, transcript: str) -> None:
         if not language or language.language in _NON_SPECIFIC_LANGUAGE_CODES:
@@ -493,9 +524,11 @@ class AudioRecognition:
         if self._adaptive_interruption_active:
             self._interruption_ch.send_nowait(_AgentSpeechStartedSentinel())  # type: ignore[union-attr]
 
-        if self._speaking:
+        if self._speaking and self._vad_speech_started:
+            vad_started_at = self._active_vad_speech_started_at or started_at
             self._on_start_of_overlap_speech(
-                started_at=started_at,
+                started_at=vad_started_at,
+                speech_duration=max(0.0, started_at - vad_started_at),
                 user_speaking_span=self._session._user_speaking_span,
             )
 
@@ -784,7 +817,16 @@ class AudioRecognition:
                 await aio.cancel_and_wait(self._interruption_atask)
 
             if self._end_of_turn_task is not None:
-                result = (await asyncio.gather(self._end_of_turn_task, return_exceptions=True))[0]
+                try:
+                    result = (
+                        await asyncio.wait_for(
+                            asyncio.gather(self._end_of_turn_task, return_exceptions=True),
+                            timeout=_END_OF_TURN_CLOSE_TIMEOUT,
+                        )
+                    )[0]
+                except asyncio.TimeoutError:
+                    logger.warning("timed out completing the final user turn on close")
+                    result = None
                 if isinstance(result, Exception):
                     logger.warning(
                         "error while completing the final user turn on close: %s",
@@ -990,6 +1032,7 @@ class AudioRecognition:
         self._audio_preflight_transcript = ""
         self._final_transcript_confidence = []
         self._last_final_transcript_time = None
+        self._final_transcript_clock_suppressed = False
         self._speech_start_time = None
         self._last_speaking_time = None
         self._vad_speech_started = False
@@ -1214,7 +1257,7 @@ class AudioRecognition:
                 extra["transcript_delay"] = time.time() - self._last_speaking_time
             logger.debug("received user transcript", extra=extra)
 
-            self._last_final_transcript_time = time.time()
+            self._record_final_transcript_time()
             self._audio_transcript += f" {transcript}"
             self._audio_transcript = self._audio_transcript.lstrip()
             self._final_transcript_confidence.append(confidence)
@@ -1240,6 +1283,7 @@ class AudioRecognition:
                                 else 0
                             ),
                             started_speaking_at=self._speech_start_time,
+                            trigger_source="final_transcript",
                         )
                     )
 
@@ -1272,7 +1316,7 @@ class AudioRecognition:
             )
 
             # still need to increment it as it's used for turn detection,
-            self._last_final_transcript_time = time.time()
+            self._record_final_transcript_time()
             # preflight transcript includes all pre-committed transcripts (including final transcript from the previous STT run)
             self._audio_preflight_transcript = (self._audio_transcript + " " + transcript).lstrip()
             self._audio_interim_transcript = transcript
@@ -1285,6 +1329,7 @@ class AudioRecognition:
                 self._hooks.on_preemptive_generation(
                     _PreemptiveGenerationInfo(
                         new_transcript=self._audio_preflight_transcript,
+                        trigger_source="preflight",
                         transcript_confidence=sum(confidence_vals) / len(confidence_vals),
                         started_speaking_at=self._speech_start_time,
                     )
@@ -1508,6 +1553,7 @@ class AudioRecognition:
             last_speaking_time: float | None = None,
             last_final_transcript_time: float | None = None,
             speech_start_time: float | None = None,
+            transcript_clock_suppressed: bool = False,
         ) -> None:
             endpointing_delay = self._endpointing.min_delay
             user_turn_span = self._ensure_user_turn_span()
@@ -1676,6 +1722,7 @@ class AudioRecognition:
                                 prediction_event.detection_delay,
                             )
 
+            endpointing_delay = self._apply_adaptive_endpointing_multiplier(endpointing_delay)
             extra_sleep = endpointing_delay
             if last_speaking_time:
                 extra_sleep += last_speaking_time - time.time()
@@ -1697,7 +1744,7 @@ class AudioRecognition:
             # the speaking anchor is stale/out-of-order (see issue #6093). in this case,
             # we just ignore the calculation, it's better than providing likely wrong values
             metrics = _compute_end_of_turn_metrics(
-                speech_start_time=speech_start_time,
+                speech_start_time=None if transcript_clock_suppressed else speech_start_time,
                 last_speaking_time=last_speaking_time,
                 last_final_transcript_time=last_final_transcript_time,
                 now=time.time(),
@@ -1708,6 +1755,7 @@ class AudioRecognition:
                     new_transcript=self._audio_transcript,
                     transcript_confidence=confidence_avg,
                     metrics=metrics,
+                    transcript_clock_suppressed=transcript_clock_suppressed,
                     backchannel_over_agent=self._turn_backchannel_over_agent,
                 )
             )
@@ -1761,6 +1809,7 @@ class AudioRecognition:
             # reset turn-scoped barge-in state once per logical turn (commit or drop)
             self._turn_backchannel_over_agent = False
             self._overlap_in_current_turn = False
+            self._final_transcript_clock_suppressed = False
             self._user_turn_committed = False
 
         if self._end_of_turn_task is not None:
@@ -1772,8 +1821,21 @@ class AudioRecognition:
                 self._last_speaking_time,
                 self._last_final_transcript_time,
                 self._user_turn_start,
+                self._final_transcript_clock_suppressed,
             )
         )
+
+    def _should_advance_final_transcript_clock(self) -> bool:
+        if self._last_speaking_time is None:
+            return True
+        if self._speaking:
+            return True
+        return time.time() - self._last_speaking_time <= self._endpointing.max_delay
+
+    def _record_final_transcript_time(self) -> None:
+        if not self._should_advance_final_transcript_clock():
+            self._final_transcript_clock_suppressed = True
+        self._last_final_transcript_time = time.time()
 
     def _check_user_turn_limit(self, transcript: str) -> None:
         """Check if the user turn exceeds configured limits.

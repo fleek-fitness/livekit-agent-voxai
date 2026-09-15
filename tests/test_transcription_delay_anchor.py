@@ -71,6 +71,8 @@ def _make_recognition(
     ar._final_transcript_received = asyncio.Event()
     ar._last_language = None
     ar._last_final_transcript_time = None
+    ar._final_transcript_clock_suppressed = False
+    ar._endpointing = MagicMock(max_delay=3.0)
     ar._turn_tracker = MagicMock()
     ar._last_speaking_time = None
     ar._sample_rate = None

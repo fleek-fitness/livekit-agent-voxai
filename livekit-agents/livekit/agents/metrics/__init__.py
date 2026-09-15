@@ -1,11 +1,14 @@
 from .base import (
+    AgentLLMMetrics,
     AgentMetrics,
     EOTInferenceMetrics,
     EOUMetrics,
     InterruptionMetrics,
     LLMMetrics,
     RealtimeModelMetrics,
+    ResponseLatencyMetrics,
     STTMetrics,
+    ToolExecutionMetrics,
     TTSMetrics,
     VADMetrics,
 )
@@ -32,6 +35,10 @@ __all__ = [
     "TTSMetrics",
     "RealtimeModelMetrics",
     "InterruptionMetrics",
+    # voxai custom extended metrics
+    "AgentLLMMetrics",
+    "ResponseLatencyMetrics",
+    "ToolExecutionMetrics",
     # New model usage classes
     "LLMModelUsage",
     "TTSModelUsage",
