@@ -108,6 +108,7 @@ def _make_full_recognition_for_eou() -> AudioRecognition:
     ar._stt_request_ids = []
     ar._last_speaking_time = None
     ar._last_final_transcript_time = None
+    ar._final_transcript_clock_suppressed = False
     ar._speech_start_time = None
     ar._vad_speech_started = False
     ar._end_of_turn_task = None

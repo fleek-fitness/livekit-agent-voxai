@@ -95,7 +95,13 @@ def test_audio_activity_waits_for_min_words() -> None:
     activity._session._text_only = False
     activity._session._aec_warmup_remaining = 0
     activity._session._aec_warmup_timer = None
-    activity._session.options = SimpleNamespace(interruption={"min_words": 2})
+    activity._session.options = SimpleNamespace(
+        interruption={"min_words": 2},
+        interruption_ignore_words=None,
+        enable_dynamic_interruption=False,
+        enable_adaptive_endpointing=False,
+    )
+    activity._opts = activity._session.options
     activity._session.agent_state = "speaking"
     activity._audio_recognition = MagicMock()
     activity._audio_recognition._current_transcript = "short"
@@ -169,6 +175,9 @@ def test_replayed_start_preserves_confirmed_interruption() -> None:
     activity._interruption_detected = True
     activity._user_silence_event = asyncio.Event()
     activity._stt_eos_received = True
+    activity._current_speech = None
+    activity._opts = SimpleNamespace(enable_dynamic_interruption=False)
+    activity._dynamic_interruption = MagicMock()
     activity._cancel_false_interruption_timer = MagicMock()  # type: ignore[method-assign]
 
     speech_start_time = time.time()
@@ -368,6 +377,7 @@ async def test_backchannel_confirmed_noop_when_barge_in_disabled(
 def _recognition_for_overlap(*, speaking: bool = False) -> AudioRecognition:
     ar = AudioRecognition.__new__(AudioRecognition)
     ar._agent_speaking = False
+    ar._vad_speech_started = False
     ar._transcript_gate_active = False
     ar._backchannel_boundary_timer = None
     ar._overlap_in_current_turn = True
@@ -497,6 +507,7 @@ class _RecordingChan:
 
 def _recognition_with_interruption_ch() -> tuple[AudioRecognition, _RecordingChan]:
     ar = AudioRecognition.__new__(AudioRecognition)
+    ar._vad_speech_started = False
     ch = _RecordingChan()
     ar._interruption_enabled = True
     ar._interruption_ch = ch  # type: ignore[assignment]
