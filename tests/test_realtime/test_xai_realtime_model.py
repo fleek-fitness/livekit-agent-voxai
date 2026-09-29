@@ -155,6 +155,22 @@ def test_default_model_is_grok_voice_latest() -> None:
     assert model._opts.input_audio_transcription.model == "grok-transcribe"
 
 
+def test_xai_ignores_azure_api_version_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OPENAI_API_VERSION", "2025-01-01")
+    model = RealtimeModel(api_key="unit-test-key")
+    session = RealtimeSession.__new__(RealtimeSession)
+    session._realtime_model = model
+    session._opts = model._opts
+
+    url, headers = session._create_ws_url_and_headers()
+
+    assert model._opts.is_azure is False
+    assert model._opts.api_version is None
+    assert headers["Authorization"] == "Bearer unit-test-key"
+    assert "api-key" not in headers
+    assert "api-version" not in url
+
+
 def test_wrap_session_update_lifts_voice_and_turn_detection() -> None:
     turn_detection = ServerVad(type="server_vad", create_response=True, interrupt_response=True)
     req = RealtimeSessionCreateRequest(
