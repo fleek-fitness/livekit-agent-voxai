@@ -41,7 +41,7 @@ def startup_timing(
             "warm_at_request": warm_at_request,
         }
         for key, value in [("startup_job_id", job_id), ("process_id", fields.get("process_id"))]:
-            prefix = "AJ_" if key == "startup_job_id" else "PCEXEC_"
+            prefix = "AJ_" if key == "startup_job_id" else "(?:PCEXEC_|THEXEC_)"
             if isinstance(value, str) and re.fullmatch(prefix + r"[A-Za-z0-9]{1,64}", value):
                 record[key] = value
         if isinstance(fields.get("child_pid"), int):
