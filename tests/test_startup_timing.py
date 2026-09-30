@@ -27,21 +27,21 @@ def test_safe_correlation_and_monotonic_duration(monkeypatch, caplog):
         "pool_acquire", job_id="AJ_test1", attempt=2, warm_at_request=False
     ) as fields:
         fields["process_id"] = "PCEXEC_synthetic"
-        fields["room"] = "01012345678"
+        fields["room"] = "synthetic-room-sensitive-payload"
     r = records(caplog)[0]
     assert r["duration_ms"] == 100.0
     assert r["startup_job_id"] == "AJ_test1"
     assert r["attempt"] == 2
     assert r["warm_at_request"] is False
     assert "room" not in r
-    assert "01012345678" not in caplog.text
+    assert "synthetic-room-sensitive-payload" not in caplog.text
 
 
 @pytest.mark.parametrize("error", [RuntimeError("secret=synthetic"), asyncio.CancelledError()])
 def test_exception_and_cancellation_preserved(error, caplog):
     caplog.set_level(logging.INFO, logger="livekit.agents")
     with pytest.raises(type(error)) as exc:
-        with timing.startup_timing("process_initialize", job_id="invalid_01012345678"):
+        with timing.startup_timing("process_initialize", job_id="invalid/synthetic-sensitive-id"):
             raise error
     assert exc.value is error
     r = records(caplog)[0]
