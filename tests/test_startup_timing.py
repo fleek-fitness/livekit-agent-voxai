@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from livekit.agents.ipc import proc_pool, startup_timing as timing
+from livekit.agents.ipc.job_thread_executor import ThreadJobExecutor
 from livekit.agents.ipc.proc_pool import ProcPool
 
 pytestmark = pytest.mark.unit
@@ -211,3 +212,54 @@ async def test_launch_retry_logs_distinct_attempts_and_preserves_retry_count(cap
         "succeeded",
     ]
     assert pool._jobs_waiting_for_process == 0
+
+
+@pytest.mark.asyncio
+async def test_real_thread_executor_correlation_survives_all_pool_phases(caplog):
+    caplog.set_level(logging.INFO, logger="livekit.agents")
+    executor = ThreadJobExecutor(
+        initialize_process_fnc=lambda _: None,
+        job_entrypoint_fnc=lambda _: None,
+        session_end_fnc=None,
+        simulation_end_fnc=None,
+        inference_executor=None,
+        initialize_timeout=10,
+        close_timeout=10,
+        session_end_timeout=10,
+        ping_interval=2.5,
+        high_ping_threshold=0.5,
+        http_proxy=None,
+        loop=asyncio.get_running_loop(),
+    )
+    assert executor.id.startswith("THEXEC_")
+    phases = [
+        "initialize_slot_wait",
+        "process_start",
+        "process_initialize",
+        "pool_acquire",
+        "job_launch",
+    ]
+    # Construct the real executor without starting a thread or connecting to a service.
+    for phase in phases:
+        if phase == "pool_acquire":
+            with timing.startup_timing(phase, job_id="AJ_thread") as fields:
+                fields["process_id"] = executor.id
+        else:
+            with timing.startup_timing(phase, process_id=executor.id):
+                pass
+    captured = records(caplog)
+    assert [r["phase"] for r in captured] == phases
+    assert all(r["process_id"] == executor.id for r in captured)
+    assert captured[3]["startup_job_id"] == "AJ_thread"
+
+
+@pytest.mark.parametrize(
+    "process_id",
+    ["OTHER_synthetic", "THEXEC_", "THEXEC_sensitive/payload", "THEXEC_" + "x" * 65],
+)
+def test_executor_correlation_allowlist_rejects_invalid_ids(process_id, caplog):
+    caplog.set_level(logging.INFO, logger="livekit.agents")
+    with timing.startup_timing("process_start", process_id=process_id):
+        pass
+    assert "process_id" not in records(caplog)[0]
+    assert process_id not in caplog.text
