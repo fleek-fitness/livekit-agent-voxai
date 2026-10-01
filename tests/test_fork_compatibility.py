@@ -4,10 +4,9 @@ import inspect
 
 import pytest
 
-from livekit.agents import Agent, AgentSession, llm
-from livekit.agents.metrics import AgentLLMMetrics, ResponseLatencyMetrics, ToolExecutionMetrics
+from livekit.agents import Agent, AgentSession, llm, metrics
 from livekit.agents.tts import AudioEmitter
-from livekit.agents.voice.events import MetricsCollectedEvent, PreemptiveGenerationOutcomeEvent
+from livekit.agents.voice.events import PreemptiveGenerationOutcomeEvent
 
 pytestmark = pytest.mark.unit
 
@@ -41,19 +40,15 @@ async def test_session_accepts_and_updates_custom_options():
         await session.aclose()
 
 
-def test_metrics_event_roundtrip_preserves_custom_types():
-    metrics = [
-        AgentLLMMetrics(timestamp=1, agent_ttft=0.1),
-        ResponseLatencyMetrics(
-            timestamp=1, e2e_latency=0.5, eou_timestamp=0, first_audio_timestamp=0.5
-        ),
-        ToolExecutionMetrics(timestamp=1, total_execution_time=0.2, tool_durations={"test": 0.2}),
-    ]
-    for metric in metrics:
-        event = MetricsCollectedEvent(metrics=metric)
-        restored = MetricsCollectedEvent.model_validate_json(event.model_dump_json())
-        assert type(restored.metrics) is type(metric)
-        assert restored.metrics == metric
+def test_native_message_metrics_replace_custom_classes():
+    for name in ("AgentLLMMetrics", "ResponseLatencyMetrics", "ToolExecutionMetrics"):
+        assert not hasattr(metrics, name)
+    message = llm.ChatMessage(
+        role="assistant",
+        content=["test"],
+        metrics={"e2e_latency": 0.5, "llm_node_ttft": 0.1, "tts_node_ttfb": 0.2},
+    )
+    assert llm.ChatMessage.model_validate_json(message.model_dump_json()).metrics == message.metrics
     assert "trigger_source" in PreemptiveGenerationOutcomeEvent.model_fields
 
 
