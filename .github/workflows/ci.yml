@@ -77,3 +77,6 @@ jobs:
 
       - name: Check Types
         run: uv run python scripts/check_types.py
+
+      - name: Test process startup timing
+        run: uv run python -m pytest tests/test_startup_timing.py --unit

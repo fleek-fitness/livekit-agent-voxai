@@ -13,6 +13,7 @@ from ..utils import aio
 from ..utils.hw.cpu import get_cpu_monitor
 from . import inference_executor, job_proc_executor, job_thread_executor
 from .job_executor import JobExecutor
+from .startup_timing import startup_timing
 
 EventTypes = Literal[
     "process_created",
@@ -167,12 +168,22 @@ class ProcPool(utils.EventEmitter[EventTypes]):
         for attempt in range(MAX_LAUNCH_ATTEMPTS):
             self._jobs_waiting_for_process += 1
             try:
-                proc = await self._acquire_proc(info.job.id)
+                with startup_timing(
+                    "pool_acquire",
+                    job_id=info.job.id,
+                    attempt=attempt + 1,
+                    warm_at_request=not self._warmed_proc_queue.empty(),
+                ) as timing:
+                    proc = await self._acquire_proc(info.job.id)
+                    timing["process_id"] = proc.id
             finally:
                 self._jobs_waiting_for_process -= 1
 
             try:
-                await proc.launch_job(info)
+                with startup_timing(
+                    "job_launch", job_id=info.job.id, process_id=proc.id, attempt=attempt + 1
+                ):
+                    await proc.launch_job(info)
                 self.emit("process_job_launched", proc)
                 return
             except Exception:
@@ -245,18 +256,29 @@ class ProcPool(utils.EventEmitter[EventTypes]):
         self._executors.append(proc)
         initialized = False
         try:
-            async with self._init_sem:
+            with startup_timing("initialize_slot_wait", process_id=proc.id):
+                await self._init_sem.acquire()
+            try:
                 if not self._closed:
                     self.emit("process_created", proc)
-                    await proc.start()
+                    with startup_timing("process_start", process_id=proc.id) as timing:
+                        await proc.start()
+                        timing["child_pid"] = getattr(proc, "pid", None)
                     self.emit("process_started", proc)
-                    await proc.initialize()
+                    with startup_timing(
+                        "process_initialize",
+                        process_id=proc.id,
+                        child_pid=getattr(proc, "pid", None),
+                    ):
+                        await proc.initialize()
                     self.emit("process_ready", proc)
                     self._warmed_proc_queue.put_nowait(proc)
                     if self._warmed_proc_queue.qsize() >= self._default_num_idle_processes:
                         self._idle_ready.set()
 
                     initialized = True
+            finally:
+                self._init_sem.release()
         except Exception:
             logger.exception("error initializing process", extra=proc.logging_extra())
         except asyncio.CancelledError:
