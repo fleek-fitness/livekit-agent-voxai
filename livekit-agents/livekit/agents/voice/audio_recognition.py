@@ -248,8 +248,29 @@ class AudioRecognition:
     _agent_overlap_segment_unfinalized: bool = False
     _final_since_agent_overlap_segment: bool = False
     _post_agent_vad_segment_start: float | None = None
-    _late_ack_waiting: bool = False
     _late_ack_wait_timer: asyncio.TimerHandle | None = None
+
+    @property
+    def _late_ack_waiting(self) -> bool:
+        return bool(self.__dict__.get("_late_ack_waiting_value", False))
+
+    @_late_ack_waiting.setter
+    def _late_ack_waiting(self, value: bool) -> None:
+        self.__dict__["_late_ack_waiting_value"] = value
+        # idle checks await this event, so it is set whenever no merged ack waits for its turn
+        event = self.__dict__.get("_late_ack_idle_ev")
+        if event is None:
+            event = self.__dict__["_late_ack_idle_ev"] = asyncio.Event()
+        if value:
+            event.clear()
+        else:
+            event.set()
+
+    async def _wait_for_late_ack_wait(self) -> None:
+        """Return once no merged late ack is waiting for the turn to complete."""
+        if not self._late_ack_waiting:
+            return
+        await self.__dict__["_late_ack_idle_ev"].wait()
 
     def __init__(
         self,

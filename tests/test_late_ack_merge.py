@@ -23,7 +23,11 @@ import pytest
 from livekit.agents import Agent, stt, vad
 from livekit.agents.llm import ChatContext
 from livekit.agents.voice._ignore_words import matches_ignore_words_exactly
-from livekit.agents.voice.agent_activity import AgentActivity, _matches_ignore_words
+from livekit.agents.voice.agent_activity import (
+    ActivityClosedError,
+    AgentActivity,
+    _matches_ignore_words,
+)
 from livekit.agents.voice.audio_recognition import AudioRecognition
 from livekit.agents.voice.events import ConversationItemAddedEvent
 
@@ -736,3 +740,80 @@ async def test_user_segment_open_when_agent_speech_starts_overlaps_that_speech()
     assert ar._vad_segment_overlaps_agent is True
     await _vad_event(ar, vad.VADEventType.END_OF_SPEECH)
     assert ar._agent_overlap_segment_unfinalized is True
+
+
+# wait_for_idle must not return while a merged late ack still waits for its turn
+
+
+def _activity_over(ar: AudioRecognition) -> AgentActivity:
+    activity = object.__new__(AgentActivity)
+    state: dict[str, Any] = {
+        "_audio_recognition": ar,
+        "_closed": False,
+        "_session": SimpleNamespace(_closing=False, _user_turn_claims=0, _idle_holds=0),
+        "_current_speech": None,
+        "_speech_q": [],
+        "_user_turn_completed_atask": None,
+        "_agent": SimpleNamespace(label="test"),
+    }
+    for key, value in state.items():
+        setattr(activity, key, value)
+    return activity
+
+
+async def test_wait_for_idle_holds_until_the_bounded_wait_commits_the_turn() -> None:
+    ar = _driven_recognition()  # a merged ack waits; the newer segment ended without a final
+    ar._arm_late_ack_wait()  # max_delay is 0.2 s
+    waiter = asyncio.create_task(_activity_over(ar).wait_for_idle())
+
+    await asyncio.sleep(0.1)
+    assert not waiter.done()
+    assert _committed_transcripts(ar) == []
+
+    await asyncio.wait_for(waiter, timeout=5.0)
+    assert _committed_transcripts(ar) == [ACK]  # idle only after the turn was committed
+
+
+async def test_wait_for_idle_holds_until_a_real_final_commits_the_turn() -> None:
+    ar = _driven_recognition()
+    ar._arm_late_ack_wait()
+    waiter = asyncio.create_task(_activity_over(ar).wait_for_idle())
+    await asyncio.sleep(0.05)
+    assert not waiter.done()
+
+    ar._process_stt_event(_final(ANSWER))
+    await asyncio.wait_for(waiter, timeout=5.0)
+    assert _committed_transcripts(ar) == [MERGED]
+
+
+async def test_wait_for_idle_without_a_late_ack_is_unchanged() -> None:
+    ar = _driven_recognition()
+    ar._clear_late_ack_wait()
+    ar._audio_transcript = ""
+    await asyncio.wait_for(_activity_over(ar).wait_for_idle(), timeout=1.0)
+    assert _committed_transcripts(ar) == []
+
+
+async def test_close_during_the_wait_releases_wait_for_idle() -> None:
+    ar = _driven_recognition()
+    for key, value in {
+        "_commit_user_turn_atask": None,
+        "_tasks": set(),
+        "_stt_consumer_atask": None,
+        "_vad_atask": None,
+        "_interruption_atask": None,
+        "_turn_detector_stream": None,
+        "_stt_pipeline": None,
+    }.items():
+        setattr(ar, key, value)
+    activity = _activity_over(ar)
+    waiter = asyncio.create_task(activity.wait_for_idle())
+    await asyncio.sleep(0.05)
+    assert not waiter.done()
+
+    activity._session._closing = True
+    await asyncio.wait_for(ar._aclose(), timeout=5.0)
+
+    with pytest.raises(ActivityClosedError):
+        await asyncio.wait_for(waiter, timeout=5.0)
+    assert ar._late_ack_waiting is False

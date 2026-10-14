@@ -2031,6 +2031,14 @@ class AgentActivity(RecognitionHooks):
             # eou is part of the user turn and may spawn a new speech handle,
             # so an in-flight eou keeps both the user and the agent active.
             nonlocal user_active
+            if self._audio_recognition and getattr(
+                self._audio_recognition, "_late_ack_waiting", False
+            ):
+                # a merged late ack still waits for its turn: the user turn is pending even
+                # though no eou task exists yet (released on commit, clear or close)
+                user_active = True
+                await self._audio_recognition._wait_for_late_ack_wait()
+
             if (
                 self._audio_recognition
                 and (eou_task := self._audio_recognition._end_of_turn_task)
