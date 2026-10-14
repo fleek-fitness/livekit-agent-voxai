@@ -20,7 +20,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from livekit.agents import Agent, stt
+from livekit.agents import Agent, stt, vad
 from livekit.agents.llm import ChatContext
 from livekit.agents.voice._ignore_words import matches_ignore_words_exactly
 from livekit.agents.voice.agent_activity import AgentActivity, _matches_ignore_words
@@ -643,3 +643,96 @@ async def test_consecutive_late_acks_without_a_real_final_commit_after_the_bound
 
     await asyncio.sleep(0.5)
     assert _committed_transcripts(ar) == [f"{ACK} 예."]  # committed, never dropped
+
+
+# closing while a commit task is pending, and a stale overlap flag across agent speeches
+
+
+async def test_aclose_with_a_pending_commit_task_leaves_the_whole_turn_to_it() -> None:
+    ar = _driven_recognition()
+    ar._last_agent_speech_interval = (AGENT_START, AGENT_END)
+    ar._post_agent_vad_segment_start = NEWER_START
+    ar._last_final_transcript_time = time.time() - 5.0  # old: the commit waits for a transcript
+    for key, value in {
+        "_commit_user_turn_atask": None,
+        "_tasks": set(),
+        "_stt_consumer_atask": None,
+        "_vad_atask": None,
+        "_interruption_atask": None,
+        "_turn_detector_stream": None,
+        "_stt_pipeline": None,
+        "_sample_rate": None,
+    }.items():
+        setattr(ar, key, value)
+
+    # the ack is already merged and waiting (see `_driven_recognition`); the session then
+    # scheduled the final user turn commit
+    assert ar._late_ack_waiting and ar._audio_transcript == ACK
+    fut = ar._commit_user_turn(audio_detached=False, transcript_timeout=2.0)
+    await asyncio.sleep(0.05)
+    assert _committed_transcripts(ar) == []
+
+    close = asyncio.create_task(ar._aclose())
+    await asyncio.sleep(0.05)
+    assert _committed_transcripts(ar) == []  # no ack-only commit from the close fallback
+
+    ar._process_stt_event(_final(ANSWER))  # the following transcript
+    await asyncio.wait_for(close, timeout=5.0)
+
+    assert _committed_transcripts(ar) == [MERGED]
+    assert fut.done()
+
+
+async def _vad_event(ar: AudioRecognition, type: vad.VADEventType) -> None:
+    await ar._on_vad_event(
+        vad.VADEvent(
+            type=type, samples_index=0, timestamp=0.0, speech_duration=0.0, silence_duration=0.0
+        )
+    )
+
+
+async def test_overlap_flag_from_an_earlier_agent_speech_does_not_leak_into_the_next() -> None:
+    ar = _driven_recognition()
+    ar._last_agent_speech_interval = None
+    ar._post_agent_vad_segment_start = None
+    ar._agent_overlap_segment_unfinalized = False
+    ar._audio_transcript = ""
+    ar._late_ack_waiting = False
+    ar._final_transcript_confidence = []
+    ar._vad_base_turn_detection = True
+    ar._vad = object()
+
+    # agent speech 1: the user speaks over it and no final arrives for that segment
+    ar._agent_speaking = True
+    ar._on_start_of_agent_speech(started_at=time.time())
+    await _vad_event(ar, vad.VADEventType.START_OF_SPEECH)
+    await _vad_event(ar, vad.VADEventType.END_OF_SPEECH)
+    assert ar._agent_overlap_segment_unfinalized is True
+    ar._on_end_of_agent_speech(ended_at=time.time())
+
+    # agent speech 2 starts and ends without any user overlap
+    ar._on_start_of_agent_speech(started_at=time.time())
+    assert ar._agent_overlap_segment_unfinalized is False
+    ar._on_end_of_agent_speech(ended_at=time.time())
+
+    # the user answers "ok" in a new segment; no STT timestamps
+    await asyncio.sleep(0.02)
+    await _vad_event(ar, vad.VADEventType.START_OF_SPEECH)
+    ar._process_stt_event(_final(ACK))
+    assert ar._late_ack_waiting is False
+    ar._hooks.on_preemptive_generation.assert_called_once()  # type: ignore[attr-defined]
+    await _vad_event(ar, vad.VADEventType.END_OF_SPEECH)
+    await asyncio.sleep(0.1)  # shorter than max_delay (0.2): the normal path commits
+    assert _committed_transcripts(ar) == [ACK]
+
+
+async def test_user_segment_open_when_agent_speech_starts_overlaps_that_speech() -> None:
+    ar = _driven_recognition()
+    ar._late_ack_waiting = False
+    ar._audio_transcript = ""
+    ar._last_agent_speech_interval = None
+    await _vad_event(ar, vad.VADEventType.START_OF_SPEECH)  # user speaks first
+    ar._on_start_of_agent_speech(started_at=time.time())  # the agent starts over them
+    assert ar._vad_segment_overlaps_agent is True
+    await _vad_event(ar, vad.VADEventType.END_OF_SPEECH)
+    assert ar._agent_overlap_segment_unfinalized is True

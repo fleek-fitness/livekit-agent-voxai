@@ -243,6 +243,7 @@ class _STTPipeline:
 class AudioRecognition:
     # late-ack merge state; immutable class-level defaults keep instances that skip __init__ valid
     _last_agent_speech_interval: tuple[float, float] | None = None
+    _active_vad_speech_started_at: float | None = None
     _vad_segment_overlaps_agent: bool = False
     _agent_overlap_segment_unfinalized: bool = False
     _final_since_agent_overlap_segment: bool = False
@@ -541,6 +542,11 @@ class AudioRecognition:
         # never commit a merged ack-only turn during agent speech; the wait is re-armed (and the
         # text kept) when the playout ends
         self._cancel_late_ack_timer()
+        # only an overlap with the most recent agent speech counts; a user segment still open
+        # now overlaps this speech
+        self._agent_overlap_segment_unfinalized = False
+        self._vad_segment_overlaps_agent = self._active_vad_speech_started_at is not None
+        self._final_since_agent_overlap_segment = False
         self._endpointing.on_start_of_agent_speech(started_at=started_at)
 
         # reset user turn tracker when agent starts speaking
@@ -834,13 +840,19 @@ class AudioRecognition:
 
     async def _aclose(self) -> None:
         self._closing.set()
+        commit_pending = (
+            self._commit_user_turn_atask is not None and not self._commit_user_turn_atask.done()
+        )
         if (
             self._late_ack_waiting
             and self._audio_transcript
             and not self._speaking
+            and not commit_pending
             and (self._end_of_turn_task is None or self._end_of_turn_task.done())
         ):
-            # closing inside the bounded wait: commit the merged text now, never drop it
+            # closing inside the bounded wait: commit the merged text now, never drop it. A
+            # pending commit task commits the whole transcript itself once the following
+            # transcript arrives, so committing the ack alone here would split the turn
             self._clear_late_ack_wait()
             self._run_eou_detection(self._hooks.retrieve_chat_ctx().copy(), trigger="vad")
         self._clear_late_ack_wait()
