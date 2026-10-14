@@ -161,6 +161,15 @@ def _transcripts_equivalent(first: str, second: str | None) -> bool:
     return bool(first_words) and first_words == second_words
 
 
+# a user utterance that ends this long after the agent finished speaking is treated as real
+# customer audio rather than the tail of the agent's own playout leaking back (echo)
+_DELAYED_ACK_MIN_USER_SPEECH_AFTER_AGENT_END = 0.3
+
+# ChatMessage.extra key set on a user message that a delayed-interruption turn recorded without
+# generating a reply, so consumers (e.g. an inactivity timer) can tell it from a committed turn
+DELAYED_INTERRUPTION_CONSUMED_EXTRA_KEY = "lk.delayed_interruption_consumed"
+
+
 def _matches_ignore_words(text: str, ignore_words: list[str] | None) -> bool:
     """Return True if `text` can be composed entirely of ignore words,
     or is a partial (prefix) match where completed segments are ignore words
@@ -350,6 +359,12 @@ class AgentActivity(RecognitionHooks):
         self._on_enter_task: asyncio.Task | None = None
         self._on_exit_task: asyncio.Task | None = None
         self._user_speech_started_during_interruptible_agent_speech = False
+        # the interruptible speech that was current when the delayed-interruption flag was set
+        self._delayed_interruption_speech: SpeechHandle | None = None
+        # the most recent speech that finished generating/playing out, with its wall-clock end
+        self._last_finished_speech: tuple[SpeechHandle, float] | None = None
+        # end of the user's current/last VAD (or STT) speech segment; None while it is ongoing
+        self._last_user_speech_end_time: float | None = None
         self._dynamic_interruption = DynamicInterruptionManager(self._opts)
 
         # session-scoped truth read by every server-side turn-detection check below
@@ -2019,6 +2034,7 @@ class AgentActivity(RecognitionHooks):
                         continue
                 speech._authorize_generation()
                 await speech._wait_for_generation()
+                self._last_finished_speech = (speech, time.time())
 
                 if self._paused_speech and self._paused_speech.handle is self._current_speech:
                     # clear paused speech after generation done
@@ -2470,6 +2486,10 @@ class AgentActivity(RecognitionHooks):
         self._user_speech_started_during_interruptible_agent_speech = (
             current_speech is not None and current_speech.allow_interruptions
         )
+        self._delayed_interruption_speech = (
+            current_speech if self._user_speech_started_during_interruptible_agent_speech else None
+        )
+        self._last_user_speech_end_time = None
         self._capture_dynamic_continuity_at_speech_start()
 
         # cancel the timer when user starts speaking but leave the paused state unchanged
@@ -2496,6 +2516,12 @@ class AgentActivity(RecognitionHooks):
             speech_end_time = speech_end_time - ev.silence_duration - ev.inference_duration
         else:
             self._stt_eos_received = True
+
+        if ev is not None:
+            # only VAD carries the real end of the user's audio; an STT-only end of speech has
+            # just its arrival time, so it must not unlock `_delayed_ack_is_answer` (and it must
+            # not erase a VAD end that was already recorded for this segment)
+            self._last_user_speech_end_time = speech_end_time
 
         if self._audio_recognition:
             self._audio_recognition._on_end_of_speech(
@@ -2729,6 +2755,66 @@ class AgentActivity(RecognitionHooks):
 
     def _clear_user_speech_interruption_context(self) -> None:
         self._user_speech_started_during_interruptible_agent_speech = False
+        self._delayed_interruption_speech = None
+
+    def _delayed_ack_is_answer(self, info: _EndOfTurnInfo) -> bool:
+        """Whether a delayed-interruption ignore-word final should be answered as a normal turn.
+
+        A short acknowledgement ("네", "예") that started while the agent was speaking an
+        interruptible utterance never interrupts it. If the agent then finished that utterance
+        normally and the customer kept talking afterwards, the acknowledgement is the answer to
+        the agent's last question: reply instead of recording it silently, which leaves dead air.
+
+        Opt-in per agent through `Agent.delayed_ack_answer_allowed()` (default False); the agent
+        owns policy the SDK cannot see (flow nodes that skip the user response, running tools).
+        """
+        try:
+            allowed = self._agent.delayed_ack_answer_allowed()
+        except Exception as e:
+            logger.warning(
+                "delayed_ack_answer_allowed hook failed",
+                extra={"error_type": type(e).__name__},
+            )
+            return False
+        if not allowed:
+            return False
+
+        reasons: list[str] = []
+        speech = self._delayed_interruption_speech
+        finished = self._last_finished_speech
+        if speech is None or not speech.done():
+            reasons.append("agent_speech_not_finished")
+        elif speech.interrupted:
+            reasons.append("agent_speech_interrupted")
+        elif finished is None or finished[0] is not speech:
+            reasons.append("another_speech_finished_since")
+
+        if not self._no_pending_speech or self._background_speeches:
+            reasons.append("speech_pending")
+        if self._session.agent_state != "listening":
+            reasons.append("agent_not_listening")
+        if self._session.user_state != "listening":
+            reasons.append("user_still_speaking")
+
+        transcript_text = info.new_transcript.translate(str.maketrans("", "", string.punctuation))
+        if not transcript_text.strip():
+            reasons.append("empty_transcript")
+
+        user_ended_at = self._last_user_speech_end_time
+        if finished is None or user_ended_at is None:
+            reasons.append("no_user_audio_timing")
+        elif user_ended_at <= finished[1] + _DELAYED_ACK_MIN_USER_SPEECH_AFTER_AGENT_END:
+            reasons.append("user_audio_ended_with_agent")
+
+        decision = not reasons
+        logger.info(
+            "delayed_ack_as_answer",
+            extra={
+                "decision": decision,
+                "reasons": reasons or ["answer_after_completed_agent_speech"],
+            },
+        )
+        return decision
 
     def _consume_delayed_interruption_turn(self, info: _EndOfTurnInfo, *, reason: str) -> bool:
         self._cancel_preemptive_generation(reason=reason)
@@ -2739,6 +2825,7 @@ class AgentActivity(RecognitionHooks):
                 content=[info.new_transcript],
                 transcript_confidence=info.transcript_confidence,
             )
+            user_message.extra[DELAYED_INTERRUPTION_CONSUMED_EXTRA_KEY] = True
             self._agent._chat_ctx.items.append(user_message)
             self._session._conversation_item_added(user_message)
         logger.warning(
@@ -2799,19 +2886,25 @@ class AgentActivity(RecognitionHooks):
         ):
             opts = self._session.options
             min_words = self._get_dynamic_min_interruption_words()
+            # an acknowledgement that answers the agent's finished question is a normal turn:
+            # skip the drop/consume branches below and fall through to the reply path
+            delayed_ack_answer = False
             if (
                 min_words > 0
                 and len(split_words(info.new_transcript, split_character=True)) < min_words
             ):
-                self._cancel_preemptive_generation(reason="min_interruption_words")
-                if delayed_interruption_context:
-                    return self._consume_delayed_interruption_turn(
-                        info,
-                        reason="min_interruption_words",
-                    )
-                return False
+                if delayed_interruption_context and self._delayed_ack_is_answer(info):
+                    delayed_ack_answer = True
+                else:
+                    self._cancel_preemptive_generation(reason="min_interruption_words")
+                    if delayed_interruption_context:
+                        return self._consume_delayed_interruption_turn(
+                            info,
+                            reason="min_interruption_words",
+                        )
+                    return False
 
-            if opts.interruption_ignore_words:
+            if opts.interruption_ignore_words and not delayed_ack_answer:
                 is_empty = info.new_transcript.strip() == ""
                 if is_empty and min_words > 0:
                     self._cancel_preemptive_generation(reason="empty_interruption")
@@ -2824,13 +2917,16 @@ class AgentActivity(RecognitionHooks):
                 if (not is_empty) and _matches_ignore_words(
                     info.new_transcript, opts.interruption_ignore_words
                 ):
-                    self._cancel_preemptive_generation(reason="interruption_ignore_words")
-                    if delayed_interruption_context:
-                        return self._consume_delayed_interruption_turn(
-                            info,
-                            reason="interruption_ignore_words",
-                        )
-                    return False
+                    if delayed_interruption_context and self._delayed_ack_is_answer(info):
+                        pass
+                    else:
+                        self._cancel_preemptive_generation(reason="interruption_ignore_words")
+                        if delayed_interruption_context:
+                            return self._consume_delayed_interruption_turn(
+                                info,
+                                reason="interruption_ignore_words",
+                            )
+                        return False
 
         # avoid interruption if backchannel is detected with realtime model. an unjudged overlap
         # commits: interrupting the agent is recoverable, discarding a real user turn is not
