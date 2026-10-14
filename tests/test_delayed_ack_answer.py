@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -28,8 +29,34 @@ from .fake_session import FakeActions, create_session, run_session
 pytestmark = pytest.mark.unit
 
 SPEED = 5.0
-SESSION_TIMEOUT = 60.0
+SESSION_TIMEOUT = 90.0
 IGNORE_WORDS = ["네", "예", "안녕하세요"]
+
+# The fake session replays a scripted timeline on the wall clock: the customer's audio and
+# transcripts are timed from one origin, while the agent's speech starts and ends whenever its
+# fake LLM/TTS pipeline gets scheduled. On a loaded machine that pipeline lags by a variable
+# amount, so every scenario below keeps real-time slack (SLACK_REAL, seconds) between the events
+# whose order the test depends on, instead of the few tens of milliseconds a quiet machine needs:
+#
+#   - AI_START ... AI_END   the agent's question is audible (a lag only shifts both later)
+#   - the customer's "ack" starts well after AI_START and, depending on the scenario, ends well
+#     after AI_END (answer) or before it (echo-like)
+#   - the final transcript lands well after AI_END
+#
+# Times are in scripted seconds (SPEED scripted seconds pass per real second). The pipeline
+# lag is absorbed by the slack; the tests then wait for the record they expect rather than for a
+# fixed time.
+SLACK_REAL = 1.5
+SLACK = SLACK_REAL * SPEED
+MIN_USER_AUDIO_AFTER_AGENT_END = 0.3 * SPEED  # mirrors _DELAYED_ACK_MIN_USER_SPEECH_AFTER_AGENT_END
+QUESTION_DURATION = 14.0
+AI_START = 3.3  # the question becomes audible about here (user speech ends at 2.5)
+AI_END = AI_START + QUESTION_DURATION
+ACK_START = AI_START + SLACK
+# real seconds, wider than any scripted gap between the ack's audio end and its final
+MAX_ENDPOINTING_DELAY = 10.0
+# real seconds to wait for an expected record before the assertion fails
+WAIT_TIMEOUT = 45.0
 
 
 class _Agent(Agent):
@@ -42,13 +69,23 @@ class _Agent(Agent):
 
 
 async def _run(
-    actions: FakeActions, *, allow_delayed_ack: bool
+    actions: FakeActions,
+    *,
+    allow_delayed_ack: bool,
+    until: Callable[[_Agent, list[ConversationItemAddedEvent], list[Any]], bool] | None = None,
+    settle: float = 1.5,
 ) -> tuple[_Agent, list[ConversationItemAddedEvent], list[Any]]:
+    """Replay `actions`, wait until `until(agent, items, playbacks)` holds, then settle."""
     session = create_session(
         actions,
         speed_factor=SPEED,
         # the consumer's interruption gate: VAD alone never interrupts, words have to
-        turn_handling={"interruption": {"min_words": 1}},
+        # (a late final is only timed against the user's audio end while it arrives within
+        # endpointing.max_delay, so keep that window wider than the scripted lag)
+        turn_handling={
+            "interruption": {"min_words": 1},
+            "endpointing": {"max_delay": MAX_ENDPOINTING_DELAY},
+        },
         extra_kwargs={"interruption_ignore_words": IGNORE_WORDS},
     )
     agent = _Agent(allow_delayed_ack=allow_delayed_ack)
@@ -56,7 +93,16 @@ async def _run(
     playbacks: list[Any] = []
     session.on("conversation_item_added", items.append)
     session.output.audio.on("playback_finished", playbacks.append)
-    await asyncio.wait_for(run_session(session, agent, drain_delay=2.0), timeout=SESSION_TIMEOUT)
+    await asyncio.wait_for(
+        run_session(
+            session,
+            agent,
+            drain_delay=settle,
+            until=(lambda: until(agent, items, playbacks)) if until else None,
+            until_timeout=WAIT_TIMEOUT,
+        ),
+        timeout=SESSION_TIMEOUT,
+    )
     return agent, items, playbacks
 
 
@@ -66,16 +112,54 @@ def _assistant_messages(agent: Agent) -> list[Any]:
     ]
 
 
-def _question_then_ack(*, ack_start: float, ack_end: float, ack_text: str) -> FakeActions:
-    """AI asks a 2 s question (audible roughly 3.5 s - 5.5 s); the customer acks over its end."""
+def _question_then_ack(
+    *, ack_start: float, ack_end: float, ack_text: str, final_at: float
+) -> FakeActions:
+    """The AI asks a long question (audible AI_START - AI_END); the customer acks over it.
+
+    The final transcript of the ack arrives at `final_at` (scripted seconds).
+    """
     actions = FakeActions()
     actions.add_user_speech(0.5, 2.5, "Are both rooms still vacant?")
     actions.add_llm("Are both rooms still vacant?")
-    actions.add_tts(2.0)
-    actions.add_user_speech(ack_start, ack_end, ack_text, stt_delay=0.3)
+    actions.add_tts(QUESTION_DURATION)
+    actions.add_user_speech(ack_start, ack_end, ack_text, stt_delay=final_at - ack_end)
     actions.add_llm("Great, I will register them as they are.")
     actions.add_tts(1.0)
     return actions
+
+
+def _answered_ack() -> FakeActions:
+    """The ack starts over the question, keeps going well past its end; the final follows."""
+    ack_end = AI_END + MIN_USER_AUDIO_AFTER_AGENT_END + SLACK
+    return _question_then_ack(
+        ack_start=ACK_START, ack_end=ack_end, ack_text="예, 예", final_at=ack_end + 0.3
+    )
+
+
+def _echo_like_ack(ack_text: str) -> FakeActions:
+    """The ack's audio ends just before the question does; its final lands after the question."""
+    return _question_then_ack(
+        ack_start=ACK_START, ack_end=AI_END - 1.0, ack_text=ack_text, final_at=AI_END + SLACK
+    )
+
+
+def _has_decision(caplog: pytest.LogCaptureFixture) -> Callable[..., bool]:
+    return lambda *_: bool(_decisions(caplog))
+
+
+def _consumed_user_messages(items: list[ConversationItemAddedEvent]) -> list[Any]:
+    return [
+        ev.item
+        for ev in items
+        if ev.item.type == "message"
+        and ev.item.role == "user"
+        and ev.item.extra.get(DELAYED_INTERRUPTION_CONSUMED_EXTRA_KEY)
+    ]
+
+
+def _has_two_assistant_messages(agent: _Agent, *_: Any) -> bool:
+    return len(_assistant_messages(agent)) >= 2
 
 
 def _decisions(caplog: pytest.LogCaptureFixture) -> list[Any]:
@@ -88,8 +172,12 @@ async def test_delayed_ack_after_finished_question_is_answered(
     caplog.set_level(logging.INFO, logger="livekit.agents")
     # ack starts while the AI still speaks, the AI finishes normally, the customer keeps
     # talking well past the AI's end, and the final arrives afterwards
-    actions = _question_then_ack(ack_start=4.5, ack_end=7.0, ack_text="예, 예")
-    agent, _, _ = await _run(actions, allow_delayed_ack=True)
+    agent, _, _ = await _run(
+        _answered_ack(),
+        allow_delayed_ack=True,
+        until=_has_two_assistant_messages,
+        settle=0.3,
+    )
 
     assert len(_assistant_messages(agent)) == 2
     assert _assistant_messages(agent)[0].interrupted is False
@@ -102,25 +190,25 @@ async def test_delayed_ack_without_opt_in_is_recorded_without_reply(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     caplog.set_level(logging.INFO, logger="livekit.agents")
-    actions = _question_then_ack(ack_start=4.5, ack_end=7.0, ack_text="예, 예")
-    agent, items, _ = await _run(actions, allow_delayed_ack=False)
+    agent, items, _ = await _run(
+        _answered_ack(),
+        allow_delayed_ack=False,
+        until=lambda _agent, items, _playbacks: bool(_consumed_user_messages(items)),
+    )
 
     # old behaviour: no reply, and the user message is recorded with the consumed marker
     assert len(_assistant_messages(agent)) == 1
-    consumed = [
-        ev.item
-        for ev in items
-        if ev.item.type == "message"
-        and ev.item.role == "user"
-        and ev.item.extra.get(DELAYED_INTERRUPTION_CONSUMED_EXTRA_KEY)
-    ]
-    assert len(consumed) == 1
+    assert len(_consumed_user_messages(items)) == 1
     assert not _decisions(caplog)  # the agent never opted in: no predicate evaluation at all
 
 
 async def test_consumed_marker_absent_when_answered() -> None:
-    actions = _question_then_ack(ack_start=4.5, ack_end=7.0, ack_text="예, 예")
-    _, items, _ = await _run(actions, allow_delayed_ack=True)
+    _, items, _ = await _run(
+        _answered_ack(),
+        allow_delayed_ack=True,
+        until=_has_two_assistant_messages,
+        settle=0.3,
+    )
 
     ack_messages = [ev.item for ev in items if ev.item.type == "message" and ev.item.role == "user"]
     assert ack_messages
@@ -134,8 +222,11 @@ async def test_echo_like_ack_ending_with_agent_speech_is_not_answered(
     caplog.set_level(logging.INFO, logger="livekit.agents")
     # the customer's utterance (a backchannel or a greeting said over the AI's greeting) ends
     # before the AI does: it must not trigger a second reply
-    actions = _question_then_ack(ack_start=4.0, ack_end=5.2, ack_text=ack_text)
-    agent, _, _ = await _run(actions, allow_delayed_ack=True)
+    agent, _, _ = await _run(
+        _echo_like_ack(ack_text),
+        allow_delayed_ack=True,
+        until=_has_decision(caplog),
+    )
 
     assert len(_assistant_messages(agent)) == 1
     (decision,) = _decisions(caplog)
@@ -147,10 +238,15 @@ async def test_ignore_word_during_agent_speech_does_not_interrupt() -> None:
     actions = FakeActions()
     actions.add_user_speech(0.5, 2.5, "Tell me a story.")
     actions.add_llm("Here is a long story for you ... the end.")
-    actions.add_tts(6.0)
-    # ack fully inside the AI's playout
-    actions.add_user_speech(4.5, 5.5, "예", stt_delay=0.3)
-    agent, _, playbacks = await _run(actions, allow_delayed_ack=True)
+    actions.add_tts(QUESTION_DURATION)
+    # ack fully inside the AI's playout, with slack on both sides
+    actions.add_user_speech(ACK_START, ACK_START + 1.0, "예", stt_delay=0.3)
+    agent, _, playbacks = await _run(
+        actions,
+        allow_delayed_ack=True,
+        until=lambda _agent, _items, playbacks: bool(playbacks),
+        settle=0.3,
+    )
 
     assert playbacks[-1].interrupted is False
     messages = _assistant_messages(agent)
