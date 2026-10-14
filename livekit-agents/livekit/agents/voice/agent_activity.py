@@ -45,6 +45,7 @@ from ..telemetry import (
 from ..tokenize.basic import split_words
 from ..types import NOT_GIVEN, FlushSentinel, NotGivenOr
 from ..utils.misc import is_given
+from ._ignore_words import matches_ignore_words as _matches_ignore_words
 from ._utils import _set_participant_attributes
 from .agent import (
     Agent,
@@ -168,64 +169,6 @@ _DELAYED_ACK_MIN_USER_SPEECH_AFTER_AGENT_END = 0.3
 # ChatMessage.extra key set on a user message that a delayed-interruption turn recorded without
 # generating a reply, so consumers (e.g. an inactivity timer) can tell it from a committed turn
 DELAYED_INTERRUPTION_CONSUMED_EXTRA_KEY = "lk.delayed_interruption_consumed"
-
-
-def _matches_ignore_words(text: str, ignore_words: list[str] | None) -> bool:
-    """Return True if `text` can be composed entirely of ignore words,
-    or is a partial (prefix) match where completed segments are ignore words
-    and the trailing segment is a prefix of an ignore word."""
-    if not text:
-        return False
-
-    text_cleaned = text.lower().strip().translate(str.maketrans("", "", string.punctuation))
-    if not text_cleaned:
-        return True
-
-    text_cleaned = "".join(text_cleaned.split())
-    if not text_cleaned:
-        return True
-
-    if not ignore_words:
-        return False
-
-    cleaned_ignore_words: list[str] = []
-    for word in ignore_words:
-        if not isinstance(word, str):
-            continue
-        cleaned = word.lower().strip().translate(str.maketrans("", "", string.punctuation))
-        if cleaned:
-            cleaned_ignore_words.append(cleaned)
-
-    if not cleaned_ignore_words:
-        return False
-
-    if len(text_cleaned) == 1:
-        return True
-
-    dp = [False] * (len(text_cleaned) + 1)
-    dp[0] = True
-    for idx in range(1, len(text_cleaned) + 1):
-        for word in cleaned_ignore_words:
-            if (
-                idx >= len(word)
-                and dp[idx - len(word)]
-                and text_cleaned[idx - len(word) : idx] == word
-            ):
-                dp[idx] = True
-                break
-
-    if dp[len(text_cleaned)]:
-        return True
-
-    for idx in range(len(text_cleaned)):
-        if not dp[idx]:
-            continue
-        suffix = text_cleaned[idx:]
-        for word in cleaned_ignore_words:
-            if word.startswith(suffix) and word != suffix:
-                return True
-
-    return False
 
 
 def _truncate_interruption_text(text: str | None, limit: int = 80) -> str | None:
@@ -2083,11 +2026,25 @@ class AgentActivity(RecognitionHooks):
         """
         agent_active = True
         user_active = True
+        late_ack_gave_up = False
 
         async def _wait_for_eou() -> None:
             # eou is part of the user turn and may spawn a new speech handle,
             # so an in-flight eou keeps both the user and the agent active.
-            nonlocal user_active
+            nonlocal user_active, late_ack_gave_up
+            if (
+                not late_ack_gave_up
+                and self._audio_recognition
+                and getattr(self._audio_recognition, "_late_ack_waiting", False)
+            ):
+                # a merged late ack still waits for its turn: the user turn is pending even
+                # though no eou task exists yet (released on commit, clear or close). The
+                # wait is capped; past the cap this call stops waiting for it, once
+                user_active = True
+                if not await self._audio_recognition._wait_for_late_ack_wait():
+                    late_ack_gave_up = True
+                    user_active = False
+
             if (
                 self._audio_recognition
                 and (eou_task := self._audio_recognition._end_of_turn_task)

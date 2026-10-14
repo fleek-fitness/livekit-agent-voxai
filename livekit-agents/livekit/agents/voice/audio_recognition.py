@@ -32,6 +32,7 @@ from ..types import NOT_GIVEN, NotGivenOr
 from ..utils import aio, is_given
 from ..vad import VADStream
 from . import io
+from ._ignore_words import matches_ignore_words_exactly
 from ._utils import _set_participant_attributes
 from .endpointing import BaseEndpointing
 from .events import (
@@ -240,6 +241,54 @@ class _STTPipeline:
 
 
 class AudioRecognition:
+    # late-ack merge state; immutable class-level defaults keep instances that skip __init__ valid
+    _last_agent_speech_interval: tuple[float, float] | None = None
+    _active_vad_speech_started_at: float | None = None
+    _vad_segment_overlaps_agent: bool = False
+    _agent_overlap_segment_unfinalized: bool = False
+    _final_since_agent_overlap_segment: bool = False
+    _post_agent_vad_segment_start: float | None = None
+    _late_ack_wait_timer: asyncio.TimerHandle | None = None
+
+    @property
+    def _late_ack_waiting(self) -> bool:
+        return bool(self.__dict__.get("_late_ack_waiting_value", False))
+
+    @_late_ack_waiting.setter
+    def _late_ack_waiting(self, value: bool) -> None:
+        self.__dict__["_late_ack_waiting_value"] = value
+        # idle checks await this event, so it is set whenever no merged ack waits for its turn
+        event = self.__dict__.get("_late_ack_idle_ev")
+        if event is None:
+            event = self.__dict__["_late_ack_idle_ev"] = asyncio.Event()
+        if value:
+            event.clear()
+        else:
+            event.set()
+
+    async def _wait_for_late_ack_wait(self) -> bool:
+        """Wait until no merged late ack is waiting for its turn, for at most a hard cap.
+
+        Returns False when the cap was hit. The merged ack keeps its state either way: the
+        bounded timer, the re-arm after agent speech and the close fallback still commit it.
+        """
+        if not self._late_ack_waiting:
+            return True
+        # hard cap: the bounded wait plus one re-arm. Idle checks sit on teardown paths (end_call,
+        # handoff), so they must never hang on a wait that nothing releases
+        max_delay = self._endpointing.max_delay
+        cap = 2 * max_delay + 1.0
+        started = time.time()
+        try:
+            await asyncio.wait_for(self.__dict__["_late_ack_idle_ev"].wait(), timeout=cap)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "late_ack_idle_wait_timeout",
+                extra={"cap": cap, "max_delay": max_delay, "waited": time.time() - started},
+            )
+            return False
+        return True
+
     def __init__(
         self,
         session: AgentSession,
@@ -310,6 +359,22 @@ class AudioRecognition:
         self._agent_speaking: bool = False
         self._agent_speech_started_at: float | None = None
         self._active_vad_speech_started_at: float | None = None
+        # region: late acknowledgement merge
+        # (start, end) of the most recent active agent speech interval, kept after it ends
+        self._last_agent_speech_interval: tuple[float, float] | None = None
+        # the current VAD segment started while the agent was speaking, and is still open
+        self._vad_segment_overlaps_agent = False
+        # a VAD segment started during agent speech and ended; no final has arrived since
+        self._agent_overlap_segment_unfinalized = False
+        # a final transcript arrived since the last VAD segment that started during agent speech
+        self._final_since_agent_overlap_segment = False
+        # start of the first VAD segment that began after the agent stopped and whose own
+        # final transcript has not arrived yet
+        self._post_agent_vad_segment_start: float | None = None
+        # a late ack-only final was merged into the turn; commit waits for the segment's own final
+        self._late_ack_waiting = False
+        self._late_ack_wait_timer: asyncio.TimerHandle | None = None
+        # endregion
         # turn-scoped backchannel-over-agent verdict from adaptive interruption, consumed and reset at end of turn
         self._overlap_in_current_turn: bool = False
         self._turn_backchannel_over_agent: bool = False
@@ -510,6 +575,16 @@ class AudioRecognition:
         self._transcript_gate_active = False
         self._agent_speaking = True
         self._agent_speech_started_at = started_at
+        # a user segment that began before this speech is no longer "after the agent stopped"
+        self._post_agent_vad_segment_start = None
+        # never commit a merged ack-only turn during agent speech; the wait is re-armed (and the
+        # text kept) when the playout ends
+        self._cancel_late_ack_timer()
+        # only an overlap with the most recent agent speech counts; a user segment still open
+        # now overlaps this speech
+        self._agent_overlap_segment_unfinalized = False
+        self._vad_segment_overlaps_agent = self._active_vad_speech_started_at is not None
+        self._final_since_agent_overlap_segment = False
         self._endpointing.on_start_of_agent_speech(started_at=started_at)
 
         # reset user turn tracker when agent starts speaking
@@ -537,11 +612,24 @@ class AudioRecognition:
 
         This can occur while the generation remains active, such as when playout is paused.
         """
+        agent_was_speaking = self._agent_speaking
+        self._end_of_agent_speech(ended_at=ended_at)
+        if (
+            agent_was_speaking
+            and self._late_ack_waiting
+            and self._audio_transcript
+            and not self._speaking
+        ):
+            self._arm_late_ack_wait()
+
+    def _end_of_agent_speech(self, *, ended_at: float) -> None:
         self._cancel_backchannel_boundary()
         agent_was_speaking = self._agent_speaking
 
         if agent_was_speaking:
             self._endpointing.on_end_of_agent_speech(ended_at=ended_at)
+        if agent_was_speaking and self._agent_speech_started_at is not None:
+            self._last_agent_speech_interval = (self._agent_speech_started_at, ended_at)
         # Replayed STT events must observe the post-playout state.
         self._agent_speaking = False
 
@@ -790,6 +878,22 @@ class AudioRecognition:
 
     async def _aclose(self) -> None:
         self._closing.set()
+        commit_pending = (
+            self._commit_user_turn_atask is not None and not self._commit_user_turn_atask.done()
+        )
+        if (
+            self._late_ack_waiting
+            and self._audio_transcript
+            and not self._speaking
+            and not commit_pending
+            and (self._end_of_turn_task is None or self._end_of_turn_task.done())
+        ):
+            # closing inside the bounded wait: commit the merged text now, never drop it. A
+            # pending commit task commits the whole transcript itself once the following
+            # transcript arrives, so committing the ack alone here would split the turn
+            self._clear_late_ack_wait()
+            self._run_eou_detection(self._hooks.retrieve_chat_ctx().copy(), trigger="vad")
+        self._clear_late_ack_wait()
         try:
             if self._commit_user_turn_atask is not None:
                 result = (
@@ -1027,6 +1131,9 @@ class AudioRecognition:
         return stream
 
     def _clear_user_turn(self) -> None:
+        self._clear_late_ack_wait()
+        self._agent_overlap_segment_unfinalized = False
+        self._post_agent_vad_segment_start = None
         self._audio_transcript = ""
         self._audio_interim_transcript = ""
         self._audio_preflight_transcript = ""
@@ -1257,6 +1364,7 @@ class AudioRecognition:
                 extra["transcript_delay"] = time.time() - self._last_speaking_time
             logger.debug("received user transcript", extra=extra)
 
+            late_ack = self._is_late_ack_final(ev, transcript)
             self._record_final_transcript_time()
             self._audio_transcript += f" {transcript}"
             self._audio_transcript = self._audio_transcript.lstrip()
@@ -1270,6 +1378,18 @@ class AudioRecognition:
 
             # check user turn limit after accumulating transcript
             self._check_user_turn_limit(transcript)
+
+            self._final_since_agent_overlap_segment = True
+            self._agent_overlap_segment_unfinalized = False
+            if late_ack:
+                # merged into the turn in progress: it neither starts a generation nor commits
+                # a turn by itself; the segment that is running owns the turn
+                self._late_ack_waiting = True
+                if not self._speaking:
+                    self._arm_late_ack_wait()
+                return
+            self._clear_late_ack_wait()
+            self._post_agent_vad_segment_start = None
 
             if self._vad_base_turn_detection or self._user_turn_committed:
                 if transcript_changed:
@@ -1413,6 +1533,7 @@ class AudioRecognition:
                 self._speech_start_time = speech_start_time
                 self._vad_speech_started = True
 
+            self._on_vad_segment_started(speech_start_time)
             self._cancel_transcription_timeout()
 
             with tracer.use_span(self._ensure_user_turn_span(start_time=speech_start_time)):
@@ -1457,6 +1578,10 @@ class AudioRecognition:
             with tracer.use_span(self._ensure_user_turn_span()):
                 self._hooks.on_end_of_speech(ev)
 
+            if self._vad_segment_overlaps_agent:
+                self._vad_segment_overlaps_agent = False
+                if not self._final_since_agent_overlap_segment:
+                    self._agent_overlap_segment_unfinalized = True
             self._active_vad_speech_started_at = None
             self._vad_speech_started = False
             self._speaking = False
@@ -1522,6 +1647,96 @@ class AudioRecognition:
         else:
             logger.debug("no eot inference request in flight, skipping eot prediction")
 
+    # region: late acknowledgement merge
+
+    def _on_vad_segment_started(self, started_at: float) -> None:
+        interval = self._last_agent_speech_interval
+        during_agent = self._agent_speaking or (
+            interval is not None and interval[0] <= started_at <= interval[1]
+        )
+        # a new segment: the previous bounded wait no longer applies, VAD EOS re-arms it
+        self._cancel_late_ack_timer()
+        if during_agent:
+            self._vad_segment_overlaps_agent = True
+            self._final_since_agent_overlap_segment = False
+        elif self._post_agent_vad_segment_start is None:
+            self._post_agent_vad_segment_start = started_at
+
+    def _is_late_ack_final(self, ev: stt.SpeechEvent, transcript: str) -> bool:
+        """Whether a final is an ack-only transcript of audio from the agent's last speech that
+        reached us only after the agent stopped and the user began a newer VAD segment."""
+        if not self._vad_base_turn_detection or self._vad is None or self._agent_speaking:
+            return False
+        interval = self._last_agent_speech_interval
+        newer_start = self._post_agent_vad_segment_start
+        if interval is None or newer_start is None or newer_start < interval[1]:
+            return False
+        if self._audio_transcript and not self._late_ack_waiting:
+            # real text is already in the turn: the ack just appends to it
+            return False
+
+        ignore_words = self._session.options.interruption_ignore_words
+        if not ignore_words or not matches_ignore_words_exactly(transcript, ignore_words):
+            return False
+
+        alt = ev.alternatives[0]
+        timestamped = alt.start_time > 0 and self._input_started_at is not None
+        stt_timestamp = "absent"
+        audio_start = 0.0
+        if timestamped and self._input_started_at is not None:
+            audio_start = self._input_started_at + alt.start_time
+            # a provider clock that restarted (e.g. an internal reconnect without advancing the
+            # time offset) maps the audio to an implausible wall-clock time
+            implausible = audio_start > time.time() or audio_start < interval[0] - 10.0
+            stt_timestamp = "unreliable" if implausible else "reliable"
+        # the VAD bookkeeping must always agree; a plausible STT timestamp only narrows the
+        # decision, so a wrong time base can turn the merge off (the old behavior), never on
+        # a further ack while one is already merged is part of the same overlap segment, whose
+        # first final cleared the unfinalized flag
+        late = self._agent_overlap_segment_unfinalized or self._late_ack_waiting
+        if late and stt_timestamp == "reliable":
+            late = interval[0] <= audio_start <= interval[1] and audio_start < newer_start
+
+        if late:
+            logger.info(
+                "late_ack_merged_into_turn",
+                extra={
+                    "user_speaking": self._speaking,
+                    "stt_timestamp": stt_timestamp,
+                    "since_agent_speech_end": time.time() - interval[1],
+                    "max_wait": self._endpointing.max_delay,
+                },
+            )
+        return late
+
+    def _arm_late_ack_wait(self) -> None:
+        """Bound the wait for the running segment's own final: after `max_delay` the turn is
+        evaluated anyway and the merged ack text is committed, never dropped."""
+        self._cancel_late_ack_timer()
+        if self._agent_speaking:
+            return  # re-armed when the agent's speech ends
+        self._late_ack_wait_timer = asyncio.get_running_loop().call_later(
+            self._endpointing.max_delay, self._on_late_ack_wait_expired
+        )
+
+    def _on_late_ack_wait_expired(self) -> None:
+        self._late_ack_wait_timer = None
+        if not self._late_ack_waiting or self._speaking or self._agent_speaking:
+            return
+        self._late_ack_waiting = False
+        self._run_eou_detection(self._hooks.retrieve_chat_ctx().copy(), trigger="vad")
+
+    def _cancel_late_ack_timer(self) -> None:
+        if self._late_ack_wait_timer is not None:
+            self._late_ack_wait_timer.cancel()
+            self._late_ack_wait_timer = None
+
+    def _clear_late_ack_wait(self) -> None:
+        self._late_ack_waiting = False
+        self._cancel_late_ack_timer()
+
+    # endregion
+
     def _run_eou_detection(
         self,
         chat_ctx: llm.ChatContext,
@@ -1531,6 +1746,12 @@ class AudioRecognition:
     ) -> None:
         if self._stt and not self._audio_transcript and self._turn_detection_mode != "manual":
             # stt enabled but no transcript yet
+            return
+
+        if trigger == "vad" and self._late_ack_waiting and self._audio_transcript:
+            # only a late ack is in the turn so far: the segment that just ended has not
+            # delivered its own final yet, committing now would answer the ack alone
+            self._arm_late_ack_wait()
             return
 
         chat_ctx = chat_ctx.copy()
@@ -1794,12 +2015,15 @@ class AudioRecognition:
                 self._audio_transcript = ""
                 self._final_transcript_confidence = []
                 self._last_final_transcript_time = None
+                self._clear_late_ack_wait()
+                self._agent_overlap_segment_unfinalized = False
                 # concurrent user speech might have changed it
                 # only reset if there is no new speech
                 if self._last_speaking_time == last_speaking_time:
                     self._speech_start_time = None
                     self._vad_speech_started = False
                     self._last_speaking_time = None
+                    self._post_agent_vad_segment_start = None
 
                 if self._turn_detector_stream is not None:
                     self._turn_detector_stream.flush(reason="turn committed")
@@ -1811,6 +2035,8 @@ class AudioRecognition:
             self._overlap_in_current_turn = False
             self._final_transcript_clock_suppressed = False
             self._user_turn_committed = False
+            # the end-of-turn evaluation is over, committed or dropped: nothing waits any more
+            self._clear_late_ack_wait()
 
         if self._end_of_turn_task is not None:
             # TODO(theomonnom): disallow cancel if the extra sleep is done
@@ -1923,6 +2149,9 @@ class AudioRecognition:
                     self._hooks.on_end_of_speech(None)
                 self._speaking = False
                 self._vad_speech_started = False
+                if self._late_ack_waiting and not self._closing.is_set():
+                    # no VAD end of speech will arrive for the interrupted segment
+                    self._arm_late_ack_wait()
             self._active_vad_speech_started_at = None
 
     @utils.log_exceptions(logger=logger)
