@@ -1,20 +1,14 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import time
 from types import SimpleNamespace
 
 import pytest
 
 from livekit.agents.metrics import (
-    AgentLLMMetrics,
-    AgentSessionUsage,
-    ResponseLatencyMetrics,
-    ToolExecutionMetrics,
     TTSMetrics,
 )
-from livekit.agents.metrics.utils import log_metrics
 from livekit.agents.voice.agent_activity import AgentActivity
 from livekit.agents.voice.audio_recognition import (
     AudioRecognition,
@@ -106,9 +100,6 @@ def _activity_for_end_of_turn(
     activity._scheduling_paused = False
     activity._new_turns_blocked = False
     activity._preemptive_generation = None
-    activity._last_eou_timestamp = None
-    activity._response_latency_anchors_by_speech = {}
-    activity._agent_ttft_by_speech = {}
     activity._user_turn_completed_atask = None
     activity._user_speech_started_during_interruptible_agent_speech = True
     activity._dynamic_interruption = SimpleNamespace(
@@ -158,11 +149,9 @@ def test_vad_end_does_not_create_response_latency_anchor() -> None:
     activity._paused_speech = None
     activity._stt_eos_received = False
     activity._interruption_detection_enabled = False
-    activity._last_eou_timestamp = None
 
     activity.on_end_of_speech(None)
 
-    assert activity._last_eou_timestamp is None
     assert updates[-1][0] == "listening"
     assert isinstance(updates[-1][1]["last_speaking_time"], float)
 
@@ -199,7 +188,6 @@ def test_suppressed_transcript_commits_without_latency_anchor() -> None:
 
     assert committed is True
     assert activity._user_turn_completed_atask is task
-    assert activity._last_eou_timestamp is None
     assert activity._user_speech_started_during_interruptible_agent_speech is False
 
 
@@ -211,7 +199,6 @@ def test_suppressed_transcript_bypasses_interruption_filters() -> None:
 
     assert committed is True
     assert activity._user_turn_completed_atask is task
-    assert activity._last_eou_timestamp is None
     assert activity._user_speech_started_during_interruptible_agent_speech is False
     assert chat_items == []
 
@@ -224,8 +211,6 @@ def test_committed_turn_waits_for_reply_before_setting_response_latency_anchor()
 
     assert committed is True
     assert activity._user_turn_completed_atask is task
-    assert activity._last_eou_timestamp is None
-    assert activity._response_latency_anchors_by_speech == {}
 
 
 def test_skip_reply_turn_does_not_set_response_latency_anchor() -> None:
@@ -236,8 +221,6 @@ def test_skip_reply_turn_does_not_set_response_latency_anchor() -> None:
 
     assert committed is True
     assert activity._user_turn_completed_atask is task
-    assert activity._last_eou_timestamp is None
-    assert activity._response_latency_anchors_by_speech == {}
 
 
 def test_non_interruptible_no_reply_turn_does_not_set_response_latency_anchor() -> None:
@@ -249,8 +232,6 @@ def test_non_interruptible_no_reply_turn_does_not_set_response_latency_anchor() 
 
     assert committed is True
     assert activity._user_turn_completed_atask is task
-    assert activity._last_eou_timestamp is None
-    assert activity._response_latency_anchors_by_speech == {}
 
 
 def test_non_suppressed_delayed_ignored_backchannel_is_consumed_without_reply_or_anchor() -> None:
@@ -260,7 +241,6 @@ def test_non_suppressed_delayed_ignored_backchannel_is_consumed_without_reply_or
 
     assert committed is True
     assert activity._user_turn_completed_atask is None
-    assert activity._last_eou_timestamp is None
     assert activity._user_speech_started_during_interruptible_agent_speech is False
     assert len(chat_items) == 1
     assert chat_items[0].role == "user"
@@ -274,7 +254,6 @@ def test_delayed_short_transcript_consumed_via_min_interruption_words_branch() -
 
     assert committed is True
     assert activity._user_turn_completed_atask is None
-    assert activity._last_eou_timestamp is None
     assert activity._user_speech_started_during_interruptible_agent_speech is False
     assert len(chat_items) == 1
     assert chat_items[0].text_content == "아"
@@ -288,7 +267,6 @@ def test_delayed_empty_transcript_consumed_via_empty_interruption_branch() -> No
 
     assert committed is True
     assert activity._user_turn_completed_atask is None
-    assert activity._last_eou_timestamp is None
     assert activity._user_speech_started_during_interruptible_agent_speech is False
     assert chat_items == []
 
@@ -334,9 +312,6 @@ def _build_user_turn_completed_activity(
     activity._new_turns_blocked = False
     activity._preemptive_generation = None
     activity._turn_detection = "vad"
-    activity._last_eou_timestamp = None
-    activity._response_latency_anchors_by_speech = {}
-    activity._agent_ttft_by_speech = {}
     activity._dynamic_interruption = SimpleNamespace(reset_collisions=lambda: None)
     speech_handle = _TestSpeechHandle()
     activity._generate_reply = lambda **kwargs: speech_handle
@@ -355,8 +330,6 @@ def test_metrics_collected_emitted_when_clock_not_suppressed() -> None:
     asyncio.run(run())
 
     assert any(evt == "metrics_collected" for evt, _ in emitted), emitted
-    assert activity._last_eou_timestamp == 456.0
-    assert activity._response_latency_anchors_by_speech == {speech_handle.id: 456.0}
 
 
 def test_metrics_collected_suppressed_when_clock_suppressed() -> None:
@@ -370,8 +343,6 @@ def test_metrics_collected_suppressed_when_clock_suppressed() -> None:
     asyncio.run(run())
 
     assert not any(evt == "metrics_collected" for evt, _ in emitted), emitted
-    assert activity._last_eou_timestamp is None
-    assert activity._response_latency_anchors_by_speech == {}
 
 
 class _UsageCollector:
@@ -392,80 +363,3 @@ def _tts_metrics(*, speech_id: str, timestamp: float = 10.0) -> TTSMetrics:
         streamed=True,
         speech_id=speech_id,
     )
-
-
-def test_response_latency_waits_for_matching_reply_tts_metrics() -> None:
-    emitted: list[tuple[str, object]] = []
-    activity, speech_handle = _build_user_turn_completed_activity(emitted)
-    activity._session._usage_collector = _UsageCollector()
-    activity._session.usage = AgentSessionUsage(model_usage=[])
-    activity._response_latency_anchors_by_speech[speech_handle.id] = 456.0
-    activity._sync_latest_response_latency_anchor()
-
-    activity._on_metrics_collected(_tts_metrics(speech_id="unrelated-speech"))
-
-    assert not any(
-        hasattr(payload, "metrics") and isinstance(payload.metrics, ResponseLatencyMetrics)
-        for _, payload in emitted
-    )
-    assert activity._response_latency_anchors_by_speech == {speech_handle.id: 456.0}
-
-    activity._on_metrics_collected(_tts_metrics(speech_id=speech_handle.id))
-
-    response_latency = [
-        payload.metrics
-        for _, payload in emitted
-        if hasattr(payload, "metrics") and isinstance(payload.metrics, ResponseLatencyMetrics)
-    ]
-    assert len(response_latency) == 1
-    assert response_latency[0].speech_id == speech_handle.id
-    assert response_latency[0].eou_timestamp == 456.0
-    assert activity._last_eou_timestamp is None
-    assert activity._response_latency_anchors_by_speech == {}
-
-
-class _ListHandler(logging.Handler):
-    def __init__(self) -> None:
-        super().__init__()
-        self.records: list[logging.LogRecord] = []
-
-    def emit(self, record: logging.LogRecord) -> None:
-        self.records.append(record)
-
-
-def test_log_metrics_handles_custom_metric_types() -> None:
-    handler = _ListHandler()
-    logger = logging.getLogger("test_backchannel_custom_metrics")
-    logger.handlers = [handler]
-    logger.propagate = False
-    logger.setLevel(logging.INFO)
-
-    log_metrics(
-        ResponseLatencyMetrics(
-            timestamp=1.0,
-            speech_id="speech-1",
-            e2e_latency=0.5,
-            eou_timestamp=10.0,
-            first_audio_timestamp=10.5,
-        ),
-        logger=logger,
-    )
-    log_metrics(
-        AgentLLMMetrics(timestamp=1.0, speech_id="speech-1", agent_ttft=0.2),
-        logger=logger,
-    )
-    log_metrics(
-        ToolExecutionMetrics(
-            timestamp=1.0,
-            speech_id="speech-1",
-            total_execution_time=0.3,
-            tool_durations={"lookup": 0.3},
-        ),
-        logger=logger,
-    )
-
-    assert [record.getMessage() for record in handler.records] == [
-        "Response latency metrics",
-        "Agent LLM metrics",
-        "Tool execution metrics",
-    ]

@@ -28,13 +28,10 @@ from ..llm.tool_context import (
 )
 from ..log import logger
 from ..metrics import (
-    AgentLLMMetrics,
     EOUMetrics,
     LLMMetrics,
     RealtimeModelMetrics,
-    ResponseLatencyMetrics,
     STTMetrics,
-    ToolExecutionMetrics,
     TTSMetrics,
     VADMetrics,
 )
@@ -352,9 +349,6 @@ class AgentActivity(RecognitionHooks):
 
         self._on_enter_task: asyncio.Task | None = None
         self._on_exit_task: asyncio.Task | None = None
-        self._response_latency_anchors_by_speech: dict[str, float] = {}
-        self._last_eou_timestamp: float | None = None
-        self._agent_ttft_by_speech: dict[str, float] = {}
         self._user_speech_started_during_interruptible_agent_speech = False
         self._dynamic_interruption = DynamicInterruptionManager(self._opts)
 
@@ -1447,33 +1441,6 @@ class AgentActivity(RecognitionHooks):
     def _wake_up_scheduling_task(self) -> None:
         self._q_updated.set()
 
-    def _response_latency_anchors(self) -> dict[str, float]:
-        anchors = getattr(self, "_response_latency_anchors_by_speech", None)
-        if anchors is None:
-            anchors = {}
-            self._response_latency_anchors_by_speech = anchors
-        return anchors
-
-    def _sync_latest_response_latency_anchor(self) -> None:
-        anchors = self._response_latency_anchors()
-        self._last_eou_timestamp = next(reversed(anchors.values()), None) if anchors else None
-
-    def _register_response_latency_anchor(
-        self, speech_handle: SpeechHandle, info: _EndOfTurnInfo
-    ) -> None:
-        if info.transcript_clock_suppressed or info.metrics.stopped_speaking_at is None:
-            return
-        if speech_handle.interrupted:
-            return
-
-        self._response_latency_anchors()[speech_handle.id] = info.metrics.stopped_speaking_at
-        self._sync_latest_response_latency_anchor()
-        speech_handle.add_done_callback(self._discard_response_latency_anchor)
-
-    def _discard_response_latency_anchor(self, speech_handle: SpeechHandle) -> None:
-        self._response_latency_anchors().pop(speech_handle.id, None)
-        self._sync_latest_response_latency_anchor()
-
     async def pause(
         self,
         *,
@@ -1865,13 +1832,6 @@ class AgentActivity(RecognitionHooks):
                 tool_choice_match=tool_choice_match,
             ),
         )
-        if outcome == "discarded":
-            # discarded preempts never reach the success-path ttft pop (which fires
-            # only when the reply's TTS metrics arrive); clear here to avoid leaking
-            # one _agent_ttft_by_speech entry per discarded preemptive generation.
-            discarded_speech_id = getattr(preemptive.speech_handle, "id", None)
-            if discarded_speech_id:
-                self._agent_ttft_by_speech.pop(discarded_speech_id, None)
 
     def _preemptive_generation_mismatch_reason(
         self,
@@ -2167,19 +2127,11 @@ class AgentActivity(RecognitionHooks):
 
     def _on_metrics_collected(
         self,
-        ev: (
-            STTMetrics
-            | TTSMetrics
-            | VADMetrics
-            | LLMMetrics
-            | RealtimeModelMetrics
-            | AgentLLMMetrics
-            | ToolExecutionMetrics
-        ),
+        ev: (STTMetrics | TTSMetrics | VADMetrics | LLMMetrics | RealtimeModelMetrics),
     ) -> None:
-        # Attach speech_id when possible (for LLM/TTS/AgentLLM)
+        # Attach speech_id to provider metrics.
         if speech_handle := _SpeechHandleContextVar.get(None):
-            if isinstance(ev, (LLMMetrics, TTSMetrics, AgentLLMMetrics)):
+            if isinstance(ev, (LLMMetrics, TTSMetrics)):
                 ev.speech_id = speech_handle.id
         if (
             isinstance(ev, RealtimeModelMetrics)
@@ -2188,54 +2140,10 @@ class AgentActivity(RecognitionHooks):
         ):
             trace_utils.record_realtime_metrics(realtime_span, ev)
 
-        # Track agent TTFT per speech
-        if isinstance(ev, AgentLLMMetrics) and ev.speech_id and ev.agent_ttft is not None:
-            self._agent_ttft_by_speech[ev.speech_id] = ev.agent_ttft
-
-        # Compute and emit ResponseLatencyMetrics when the matching reply TTS metrics arrive.
+        # The custom interruption policy still clears collision history once a
+        # reply produces audio. Latency and usage are owned by native telemetry.
         if isinstance(ev, TTSMetrics) and ev.ttfb > 0:
-            first_audio_timestamp = ev.timestamp - ev.duration + ev.ttfb
-            speech_handle = _SpeechHandleContextVar.get(None)
-            speech_id = ev.speech_id or (speech_handle.id if speech_handle else None)
-            eou_timestamp = (
-                self._response_latency_anchors().pop(speech_id, None) if speech_id else None
-            )
-            self._sync_latest_response_latency_anchor()
-            if eou_timestamp is not None:
-                agent_ttft = self._agent_ttft_by_speech.get(speech_id) if speech_id else None
-                e2e_latency = first_audio_timestamp - eou_timestamp
-                self._session.emit(
-                    "metrics_collected",
-                    MetricsCollectedEvent(
-                        metrics=ResponseLatencyMetrics(
-                            timestamp=time.time(),
-                            speech_id=speech_id,
-                            e2e_latency=e2e_latency,
-                            eou_timestamp=eou_timestamp,
-                            first_audio_timestamp=first_audio_timestamp,
-                        )
-                    ),
-                )
-                logger.debug(
-                    "response latency computed",
-                    extra={
-                        "speech_id": speech_id,
-                        "e2e_latency": round(e2e_latency, 3),
-                        "agent_ttft": round(agent_ttft or 0.0, 3),
-                    },
-                )
-
-                if speech_id:
-                    self._agent_ttft_by_speech.pop(speech_id, None)
-                try:
-                    self._dynamic_interruption.reset_collisions()
-                except Exception:
-                    pass
-
-        # For AgentLLMMetrics and ToolExecutionMetrics: emit but skip usage collector
-        if isinstance(ev, (AgentLLMMetrics, ToolExecutionMetrics)):
-            self._session.emit("metrics_collected", MetricsCollectedEvent(metrics=ev))
-            return
+            self._dynamic_interruption.reset_collisions()
 
         self._session._usage_collector.collect(ev)
         otel_metrics.collect_usage(ev)
@@ -3127,9 +3035,6 @@ class AgentActivity(RecognitionHooks):
             # lose data like the beginning of a user speech).
             # await the interrupt to make sure user message is added to the chat context before the new task starts
             await speech_handle.interrupt()
-        else:
-            self._register_response_latency_anchor(speech_handle, info)
-
         metadata: Metadata | None = None
         if isinstance(self._turn_detection, str):
             metadata = Metadata(model_name="unknown", model_provider=self._turn_detection)
