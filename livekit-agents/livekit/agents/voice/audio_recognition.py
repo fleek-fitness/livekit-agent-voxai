@@ -266,11 +266,28 @@ class AudioRecognition:
         else:
             event.set()
 
-    async def _wait_for_late_ack_wait(self) -> None:
-        """Return once no merged late ack is waiting for the turn to complete."""
+    async def _wait_for_late_ack_wait(self) -> bool:
+        """Wait until no merged late ack is waiting for its turn, for at most a hard cap.
+
+        Returns False when the cap was hit. The merged ack keeps its state either way: the
+        bounded timer, the re-arm after agent speech and the close fallback still commit it.
+        """
         if not self._late_ack_waiting:
-            return
-        await self.__dict__["_late_ack_idle_ev"].wait()
+            return True
+        # hard cap: the bounded wait plus one re-arm. Idle checks sit on teardown paths (end_call,
+        # handoff), so they must never hang on a wait that nothing releases
+        max_delay = self._endpointing.max_delay
+        cap = 2 * max_delay + 1.0
+        started = time.time()
+        try:
+            await asyncio.wait_for(self.__dict__["_late_ack_idle_ev"].wait(), timeout=cap)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "late_ack_idle_wait_timeout",
+                extra={"cap": cap, "max_delay": max_delay, "waited": time.time() - started},
+            )
+            return False
+        return True
 
     def __init__(
         self,
@@ -2018,6 +2035,8 @@ class AudioRecognition:
             self._overlap_in_current_turn = False
             self._final_transcript_clock_suppressed = False
             self._user_turn_committed = False
+            # the end-of-turn evaluation is over, committed or dropped: nothing waits any more
+            self._clear_late_ack_wait()
 
         if self._end_of_turn_task is not None:
             # TODO(theomonnom): disallow cancel if the extra sleep is done
@@ -2130,6 +2149,9 @@ class AudioRecognition:
                     self._hooks.on_end_of_speech(None)
                 self._speaking = False
                 self._vad_speech_started = False
+                if self._late_ack_waiting and not self._closing.is_set():
+                    # no VAD end of speech will arrive for the interrupted segment
+                    self._arm_late_ack_wait()
             self._active_vad_speech_started_at = None
 
     @utils.log_exceptions(logger=logger)

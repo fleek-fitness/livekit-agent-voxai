@@ -817,3 +817,116 @@ async def test_close_during_the_wait_releases_wait_for_idle() -> None:
     with pytest.raises(ActivityClosedError):
         await asyncio.wait_for(waiter, timeout=5.0)
     assert ar._late_ack_waiting is False
+
+
+# hard bound on the idle wait
+
+
+async def test_close_during_the_wait_releases_wait_for_idle_promptly() -> None:
+    ar = _driven_recognition()
+    for key, value in {
+        "_commit_user_turn_atask": None,
+        "_tasks": set(),
+        "_stt_consumer_atask": None,
+        "_vad_atask": None,
+        "_interruption_atask": None,
+        "_turn_detector_stream": None,
+        "_stt_pipeline": None,
+    }.items():
+        setattr(ar, key, value)
+    ar._arm_late_ack_wait()  # max_delay is 0.2 s
+    activity = _activity_over(ar)
+    waiter = asyncio.create_task(activity.wait_for_idle())
+    await asyncio.sleep(0.03)
+
+    activity._session._closing = True
+    started = time.perf_counter()
+    await asyncio.wait_for(ar._aclose(), timeout=5.0)
+    with pytest.raises(ActivityClosedError):
+        await asyncio.wait_for(waiter, timeout=5.0)
+    assert time.perf_counter() - started < 0.1  # well under max_delay
+
+
+async def test_wait_for_idle_returns_about_max_delay_after_an_intervening_agent_speech() -> None:
+    ar = _driven_recognition()
+    ar._arm_late_ack_wait()
+    waiter = asyncio.create_task(_activity_over(ar).wait_for_idle())
+    await asyncio.sleep(0.03)
+
+    ar._on_start_of_agent_speech(started_at=time.time())  # e.g. an end_call farewell
+    await asyncio.sleep(0.35)  # longer than max_delay (0.2 s): nothing may commit meanwhile
+    assert not waiter.done()
+    assert _committed_transcripts(ar) == []
+
+    ended = time.perf_counter()
+    ar._on_end_of_agent_speech(ended_at=time.time())
+    await asyncio.wait_for(waiter, timeout=5.0)
+    elapsed = time.perf_counter() - ended
+    assert 0.15 <= elapsed <= 0.2 + 0.3  # the bounded wait restarted, then the turn committed
+    assert _committed_transcripts(ar) == [ACK]
+
+
+def _closable(ar: AudioRecognition) -> AudioRecognition:
+    for key, value in {
+        "_commit_user_turn_atask": None,
+        "_tasks": set(),
+        "_stt_consumer_atask": None,
+        "_vad_atask": None,
+        "_interruption_atask": None,
+        "_turn_detector_stream": None,
+        "_stt_pipeline": None,
+    }.items():
+        setattr(ar, key, value)
+    return ar
+
+
+async def test_wait_for_idle_never_blocks_beyond_the_cap(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.WARNING, logger="livekit.agents")
+    ar = _closable(_driven_recognition())
+    ar._endpointing = MagicMock(min_delay=0.01, max_delay=0.05)  # cap = 2 * 0.05 + 1.0 s
+    assert ar._late_ack_waiting  # and nothing is armed: a missing re-arm
+
+    started = time.perf_counter()
+    await asyncio.wait_for(_activity_over(ar).wait_for_idle(), timeout=5.0)
+    elapsed = time.perf_counter() - started
+
+    assert 1.0 <= elapsed < 1.6  # a single cap, not one per internal check
+    (record,) = [r for r in caplog.records if r.message == "late_ack_idle_wait_timeout"]
+    assert record.cap == pytest.approx(1.1)
+    # the merged ack keeps its state: still waiting, text kept, nothing committed yet
+    assert ar._late_ack_waiting is True
+    assert ar._audio_transcript == ACK
+    assert _committed_transcripts(ar) == []
+
+    # and the close fallback still commits it, exactly once
+    await asyncio.wait_for(ar._aclose(), timeout=5.0)
+    assert _committed_transcripts(ar) == [ACK]
+
+
+async def test_agent_speech_longer_than_the_cap_does_not_hold_idle_or_lose_the_ack() -> None:
+    ar = _driven_recognition()
+    ar._endpointing = MagicMock(min_delay=0.01, max_delay=0.05)  # cap = 1.1 s
+    ar._arm_late_ack_wait()
+    waiter = asyncio.create_task(_activity_over(ar).wait_for_idle())
+    await asyncio.sleep(0.02)
+    ar._on_start_of_agent_speech(started_at=time.time())  # a long speech
+
+    started = time.perf_counter()
+    await asyncio.wait_for(waiter, timeout=5.0)
+    assert 1.0 <= time.perf_counter() - started < 1.6  # returned at the cap, mid-speech
+    assert _committed_transcripts(ar) == []
+    assert ar._late_ack_waiting is True
+
+    ar._on_end_of_agent_speech(ended_at=time.time())
+    await asyncio.sleep(0.3)  # max_delay (0.05 s) after the speech ended
+    assert _committed_transcripts(ar) == [ACK]
+    assert ar._late_ack_waiting is False
+
+
+async def test_a_dropped_end_of_turn_still_releases_the_wait() -> None:
+    ar = _driven_recognition()
+    ar._hooks.on_end_of_turn.return_value = False  # the turn is not committed
+    ar._run_eou_detection(ar._hooks.retrieve_chat_ctx(), trigger="manual")
+    await asyncio.sleep(0.2)
+    assert _committed_transcripts(ar) == [ACK]
+    assert ar._late_ack_waiting is False

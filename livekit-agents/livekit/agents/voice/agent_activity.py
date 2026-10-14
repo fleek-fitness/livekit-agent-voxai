@@ -2026,18 +2026,24 @@ class AgentActivity(RecognitionHooks):
         """
         agent_active = True
         user_active = True
+        late_ack_gave_up = False
 
         async def _wait_for_eou() -> None:
             # eou is part of the user turn and may spawn a new speech handle,
             # so an in-flight eou keeps both the user and the agent active.
-            nonlocal user_active
-            if self._audio_recognition and getattr(
-                self._audio_recognition, "_late_ack_waiting", False
+            nonlocal user_active, late_ack_gave_up
+            if (
+                not late_ack_gave_up
+                and self._audio_recognition
+                and getattr(self._audio_recognition, "_late_ack_waiting", False)
             ):
                 # a merged late ack still waits for its turn: the user turn is pending even
-                # though no eou task exists yet (released on commit, clear or close)
+                # though no eou task exists yet (released on commit, clear or close). The
+                # wait is capped; past the cap this call stops waiting for it, once
                 user_active = True
-                await self._audio_recognition._wait_for_late_ack_wait()
+                if not await self._audio_recognition._wait_for_late_ack_wait():
+                    late_ack_gave_up = True
+                    user_active = False
 
             if (
                 self._audio_recognition
