@@ -379,6 +379,16 @@ class Agent:
         """
         pass
 
+    def delayed_ack_answer_allowed(self) -> bool:
+        """Whether a delayed acknowledgement may be answered as a normal user turn.
+
+        Called synchronously from the end-of-turn path when a short ignore-word final ("yes")
+        arrives after the agent finished an interruptible utterance that the user started talking
+        over. Return True to let the SDK reply to it (subject to its own timing checks); the
+        default False keeps the transcript recorded without a reply.
+        """
+        return False
+
     async def on_user_turn_exceeded(self, ev: UserTurnExceededEvent) -> None:
         """Called when the user turn has exceeded the configured limit.
 

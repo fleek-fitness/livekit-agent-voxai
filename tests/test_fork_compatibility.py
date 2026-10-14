@@ -70,3 +70,10 @@ def test_reply_callbacks_can_be_removed():
 
 def test_tts_frame_size_remains_50ms():
     assert inspect.signature(AudioEmitter.initialize).parameters["frame_size_ms"].default == 50
+
+
+def test_agent_exposes_delayed_ack_hook_defaulting_to_no_reply():
+    from livekit.agents.voice.agent_activity import DELAYED_INTERRUPTION_CONSUMED_EXTRA_KEY
+
+    assert Agent(instructions="test").delayed_ack_answer_allowed() is False
+    assert DELAYED_INTERRUPTION_CONSUMED_EXTRA_KEY == "lk.delayed_interruption_consumed"
