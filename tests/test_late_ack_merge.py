@@ -22,6 +22,7 @@ import pytest
 
 from livekit.agents import Agent, stt
 from livekit.agents.llm import ChatContext
+from livekit.agents.voice._ignore_words import matches_ignore_words_exactly
 from livekit.agents.voice.agent_activity import AgentActivity, _matches_ignore_words
 from livekit.agents.voice.audio_recognition import AudioRecognition
 from livekit.agents.voice.events import ConversationItemAddedEvent
@@ -553,3 +554,92 @@ async def test_real_final_while_waiting_commits_one_merged_turn_via_the_normal_p
     await asyncio.sleep(0.5)  # well past the bounded wait and the endpointing delay
     assert _committed_transcripts(ar) == [MERGED]  # exactly one commit, ack first
     assert ar._audio_transcript == ""
+
+
+# exact matching of final transcripts
+
+
+@pytest.mark.parametrize("text", ["2", "왜", "ㄴ", "", "  ", "...", "네 왜"])
+def test_exact_matcher_rejects_wildcards_and_non_acks(text: str) -> None:
+    assert matches_ignore_words_exactly(text, IGNORE_WORDS) is False
+    ar = _recognition()
+    assert ar._is_late_ack_final(_final(text or "."), text) is False
+
+
+def test_exact_matcher_rejects_a_prefix_of_an_ignore_word() -> None:
+    assert matches_ignore_words_exactly("네에", ["네에요"]) is False
+    assert matches_ignore_words_exactly("네에요", ["네에요"]) is True
+    session = SimpleNamespace(options=SimpleNamespace(interruption_ignore_words=["네에요"]))
+    assert _recognition(_session=session)._is_late_ack_final(_final("네에"), "네에") is False
+
+
+@pytest.mark.parametrize("text", ["네.", "네 네", "예, 예", "OK", "ok. ok"])
+def test_exact_matcher_accepts_ack_only_text(text: str) -> None:
+    assert matches_ignore_words_exactly(text, IGNORE_WORDS) is True
+    assert _recognition()._is_late_ack_final(_final(text), text) is True
+
+
+def test_exact_matcher_needs_ignore_words() -> None:
+    assert matches_ignore_words_exactly("네", None) is False
+    assert matches_ignore_words_exactly("네", []) is False
+    assert matches_ignore_words_exactly("네", ["", "..."]) is False
+
+
+# consecutive late acks of one overlap segment
+
+
+@pytest.mark.parametrize(
+    "start_time, expected",
+    [
+        (0.0, True),  # no timestamp
+        (AGENT_START + 1.0 - INPUT_STARTED, True),  # reliable, inside the agent interval
+        (AGENT_END + 0.5 - INPUT_STARTED, False),  # reliable, outside: narrowing still applies
+        (_FAR_PAST, True),  # unreliable
+    ],
+)
+def test_predicate_further_ack_while_waiting(start_time: float, expected: bool) -> None:
+    ar = _timestamped(
+        _agent_overlap_segment_unfinalized=False, _audio_transcript=ACK, _late_ack_waiting=True
+    )
+    assert ar._is_late_ack_final(_final("예.", start_time=start_time), "예.") is expected
+
+
+def _two_acks_recognition() -> AudioRecognition:
+    ar = _driven_recognition()
+    ar._audio_transcript = ""
+    ar._late_ack_waiting = False
+    ar._last_agent_speech_interval = (AGENT_START, AGENT_END)
+    ar._post_agent_vad_segment_start = NEWER_START
+    ar._agent_overlap_segment_unfinalized = True
+    ar._final_transcript_confidence = []
+    ar._user_silence_ev.set()  # the newer segment already ended without its own final
+    return ar
+
+
+async def test_consecutive_late_acks_then_the_real_final_commit_one_turn() -> None:
+    ar = _two_acks_recognition()
+
+    ar._process_stt_event(_final(ACK))
+    ar._process_stt_event(_final("예."))
+    assert ar._late_ack_waiting is True
+    ar._hooks.on_preemptive_generation.assert_not_called()  # type: ignore[attr-defined]
+    await asyncio.sleep(0.1)
+    assert _committed_transcripts(ar) == []
+
+    ar._process_stt_event(_final(ANSWER))
+    assert ar._late_ack_waiting is False
+    await asyncio.sleep(0.5)
+    assert _committed_transcripts(ar) == [f"{ACK} 예. {ANSWER}"]
+
+
+async def test_consecutive_late_acks_without_a_real_final_commit_after_the_bounded_wait() -> None:
+    ar = _two_acks_recognition()
+
+    ar._process_stt_event(_final(ACK))
+    ar._process_stt_event(_final("예."))
+    ar._hooks.on_preemptive_generation.assert_not_called()  # type: ignore[attr-defined]
+    await asyncio.sleep(0.1)
+    assert _committed_transcripts(ar) == []  # still inside max_delay
+
+    await asyncio.sleep(0.5)
+    assert _committed_transcripts(ar) == [f"{ACK} 예."]  # committed, never dropped

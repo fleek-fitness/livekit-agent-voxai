@@ -32,7 +32,7 @@ from ..types import NOT_GIVEN, NotGivenOr
 from ..utils import aio, is_given
 from ..vad import VADStream
 from . import io
-from ._ignore_words import matches_ignore_words
+from ._ignore_words import matches_ignore_words_exactly
 from ._utils import _set_participant_attributes
 from .endpointing import BaseEndpointing
 from .events import (
@@ -1626,7 +1626,7 @@ class AudioRecognition:
             return False
 
         ignore_words = self._session.options.interruption_ignore_words
-        if not ignore_words or not matches_ignore_words(transcript, ignore_words):
+        if not ignore_words or not matches_ignore_words_exactly(transcript, ignore_words):
             return False
 
         alt = ev.alternatives[0]
@@ -1641,7 +1641,9 @@ class AudioRecognition:
             stt_timestamp = "unreliable" if implausible else "reliable"
         # the VAD bookkeeping must always agree; a plausible STT timestamp only narrows the
         # decision, so a wrong time base can turn the merge off (the old behavior), never on
-        late = self._agent_overlap_segment_unfinalized
+        # a further ack while one is already merged is part of the same overlap segment, whose
+        # first final cleared the unfinalized flag
+        late = self._agent_overlap_segment_unfinalized or self._late_ack_waiting
         if late and stt_timestamp == "reliable":
             late = interval[0] <= audio_start <= interval[1] and audio_start < newer_start
 

@@ -61,3 +61,37 @@ def matches_ignore_words(text: str, ignore_words: list[str] | None) -> bool:
                 return True
 
     return False
+
+
+def _clean_for_exact_match(text: str) -> str:
+    stripped = text.lower().translate(str.maketrans("", "", string.punctuation))
+    return "".join(stripped.split())
+
+
+def matches_ignore_words_exactly(text: str, ignore_words: list[str] | None) -> bool:
+    """Return True only if the whole of `text` is made of ignore words.
+
+    Unlike `matches_ignore_words`, which is tuned for interim transcripts, this accepts no
+    single-character wildcard and no prefix of an ignore word, and empty text is not a match.
+    Use it for final transcripts.
+    """
+    text_cleaned = _clean_for_exact_match(text)
+    if not text_cleaned or not ignore_words:
+        return False
+
+    cleaned_ignore_words = [
+        cleaned
+        for word in ignore_words
+        if isinstance(word, str) and (cleaned := _clean_for_exact_match(word))
+    ]
+    if not cleaned_ignore_words:
+        return False
+
+    reachable = [False] * (len(text_cleaned) + 1)
+    reachable[0] = True
+    for idx in range(1, len(text_cleaned) + 1):
+        reachable[idx] = any(
+            idx >= len(word) and reachable[idx - len(word)] and text_cleaned.endswith(word, 0, idx)
+            for word in cleaned_ignore_words
+        )
+    return reachable[len(text_cleaned)]
