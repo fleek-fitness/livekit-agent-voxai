@@ -154,12 +154,15 @@ def perform_llm_inference(
     model_settings: ModelSettings,
     model: str | None = None,
     provider: str | None = None,
+    session: AgentSession | None = None,
 ) -> tuple[asyncio.Task[bool], _LLMGenerationData]:
     text_ch = aio.Chan[str | FlushSentinel]()
     function_ch = aio.Chan[llm.FunctionCall]()
     data = _LLMGenerationData(text_ch=text_ch, function_ch=function_ch)
     llm_task = asyncio.create_task(
-        _llm_inference_task(node, chat_ctx, tool_ctx, model_settings, data, model, provider)
+        _llm_inference_task(
+            node, chat_ctx, tool_ctx, model_settings, data, model, provider, session
+        )
     )
     llm_task.add_done_callback(lambda _: text_ch.close())
     llm_task.add_done_callback(lambda _: function_ch.close())
@@ -183,9 +186,11 @@ async def _llm_inference_task(
     data: _LLMGenerationData,
     model: str | None = None,
     provider: str | None = None,
+    session: AgentSession | None = None,
 ) -> bool:
     start_time = time.perf_counter()
     data.started_at = start_time
+
     current_span = trace.get_current_span()
     data.started_fut.set_result(None)
 
@@ -227,7 +232,6 @@ async def _llm_inference_task(
     # (e.g. tool_ctx.toolsets stays intact for executor routing on handoff).
     tool_ctx._sync_flattened(tools)
     tools_snapshot = tools.copy()
-
     if isinstance(llm_node, str):
         data.generated_text = llm_node
         text_ch.send_nowait(llm_node)
@@ -1057,6 +1061,7 @@ async def _execute_tools_task(
                     ),
                     name=f"func_exec_{fnc_call.name}",  # task name is used for logging when the task is cancelled
                 )
+
                 _set_activity_task_info(
                     task, speech_handle=speech_handle, function_call=fnc_call, inline_task=True
                 )
