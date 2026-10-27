@@ -223,3 +223,40 @@ async def test_ignore_word_alone_never_interrupts_or_replies() -> None:
     ]
     assert messages[1].interrupted is False
     assert messages[2].extra.get(DELAYED_INTERRUPTION_CONSUMED_EXTRA_KEY) is True
+
+
+SINGLE_CHARACTER = "3"
+SINGLE_THEN_ANSWER = f"{SINGLE_CHARACTER} {ANSWER}"
+REPLY_TO_SINGLE_THEN_ANSWER = "Three, noted."
+
+
+def _single_character_during_question_then_answer() -> FakeActions:
+    actions = _question_with_greeting()
+    actions.add_user_speech(ACK_START, ACK_END, SINGLE_CHARACTER)
+    actions.add_user_speech(ANSWER_START, ANSWER_END, ANSWER)
+    actions.add_llm(REPLY_TO_SINGLE_THEN_ANSWER, input=SINGLE_THEN_ANSWER)
+    actions.add_tts(1.0, input=REPLY_TO_SINGLE_THEN_ANSWER)
+    actions.add_llm(REPLY_TO_ANSWER, input=ANSWER)
+    actions.add_tts(1.0, input=REPLY_TO_ANSWER)
+    return actions
+
+
+async def test_single_character_over_agent_speech_is_not_consumed() -> None:
+    # a single character only loosely matches the ignore words: it may be a real answer, so
+    # it keeps accumulating into the next turn instead of being recorded without a reply
+    agent, items = await _run(
+        _single_character_during_question_then_answer(), until=_has_two_assistant_messages
+    )
+
+    messages = _messages(agent)
+    assert [(m.role, m.text_content) for m in messages] == [
+        ("user", GREETING),
+        ("assistant", QUESTION),
+        ("user", SINGLE_THEN_ANSWER),
+        ("assistant", REPLY_TO_SINGLE_THEN_ANSWER),
+    ]
+    assert not any(
+        ev.item.extra.get(DELAYED_INTERRUPTION_CONSUMED_EXTRA_KEY)
+        for ev in items
+        if ev.item.type == "message"
+    )

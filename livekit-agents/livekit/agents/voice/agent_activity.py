@@ -45,7 +45,10 @@ from ..telemetry import (
 from ..tokenize.basic import split_words
 from ..types import NOT_GIVEN, FlushSentinel, NotGivenOr
 from ..utils.misc import is_given
-from ._ignore_words import matches_ignore_words as _matches_ignore_words
+from ._ignore_words import (
+    matches_ignore_words as _matches_ignore_words,
+    matches_ignore_words_exactly,
+)
 from ._utils import _set_participant_attributes
 from .agent import (
     Agent,
@@ -2931,12 +2934,19 @@ class AgentActivity(RecognitionHooks):
                 ):
                     if delayed_interruption_context and self._delayed_ack_is_answer(info):
                         pass
-                    else:
+                    elif delayed_interruption_context or matches_ignore_words_exactly(
+                        info.new_transcript, opts.interruption_ignore_words
+                    ):
                         return self._consume_delayed_interruption_turn(
                             info,
                             reason="interruption_ignore_words",
                             during_agent_speech=current_speech_interruptible,
                         )
+                    else:
+                        # a loose match (a single character, or the prefix of an ignore word)
+                        # keeps accumulating like a turn below the word threshold
+                        self._cancel_preemptive_generation(reason="interruption_ignore_words")
+                        return False
 
         # avoid interruption if backchannel is detected with realtime model. an unjudged overlap
         # commits: interrupting the agent is recoverable, discarding a real user turn is not
