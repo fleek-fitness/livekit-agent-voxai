@@ -361,6 +361,7 @@ class AudioRecognition:
         self._interruption_ch: aio.Chan[inference.InterruptionDataFrameType] | None = None
         self._transcript_buffer: deque[SpeechEvent] = deque()
         self._transcript_gate_active: bool = False
+        self._transcript_gate_speech_start: float | None = None
         self._interruption_enabled: bool = interruption_detection is not None and vad is not None
         # Tracks active audio playout, independently of the generation lifecycle.
         self._agent_speaking: bool = False
@@ -713,6 +714,11 @@ class AudioRecognition:
         # overlap over agent speech started this turn; gates verdict acceptance below
         self._overlap_in_current_turn = True
         self._overlap_open = True
+        if not self._transcript_gate_active:
+            self._transcript_gate_speech_start = started_at
+        elif self._transcript_gate_speech_start != started_at:
+            # Untimed finals cannot be assigned to one of multiple held segments.
+            self._transcript_gate_speech_start = None
         self._transcript_gate_active = True
         self._interruption_ch.send_nowait(  # type: ignore[union-attr]
             _OverlapSpeechStartedSentinel(
@@ -847,6 +853,18 @@ class AudioRecognition:
         self._hooks.on_held_ignore_word_discarded(
             ev, started_speaking_at=started_at, stopped_speaking_at=stopped_at
         )
+        # This path bypasses turn commit. Retire only the consumed segment's clock;
+        # a newer segment or an accumulated real turn still owns its own timing.
+        if (
+            not self._speaking
+            and not self._audio_transcript
+            and self._speech_start_time == started_at
+            and self._last_speaking_time is not None
+            and self._last_speaking_time <= stopped_at
+        ):
+            self._speech_start_time = None
+            self._last_speaking_time = None
+            self._vad_speech_started = False
 
     def _flush_held_transcripts(
         self,
@@ -1348,6 +1366,33 @@ class AudioRecognition:
                 self._hooks.interruption_by_audio_activity_enabled = True
 
         if ev.type != stt.SpeechEventType.RECOGNITION_USAGE and self._transcript_gate_active:
+            # Unaligned providers may omit wall-clock timestamps. Snapshot the completed
+            # VAD segment now, before another segment can replace these mutable anchors.
+            if (
+                ev.type == stt.SpeechEventType.FINAL_TRANSCRIPT
+                and ev.alternatives
+                and matches_ignore_words_exactly(
+                    ev.alternatives[0].text, self._session.options.interruption_ignore_words
+                )
+                and ev.speech_start_time is None
+                and ev.speech_end_time is None
+                and not self._stt_aligned_transcript
+                and not self._speaking
+                and not self._audio_transcript
+                and self._speech_start_time is not None
+                and self._speech_start_time == self._transcript_gate_speech_start
+                and self._last_speaking_time is not None
+                and self._agent_speech_started_at is not None
+                and self._agent_speech_started_at
+                <= self._speech_start_time
+                <= self._last_speaking_time
+                <= ev.created_at
+            ):
+                ev = replace(
+                    ev,
+                    speech_start_time=self._speech_start_time,
+                    speech_end_time=self._last_speaking_time,
+                )
             logger.trace("holding STT event during agent speech", extra={"event": ev.type})
             self._transcript_buffer.append(ev)
             return

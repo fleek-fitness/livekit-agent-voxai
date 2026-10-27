@@ -65,11 +65,15 @@ def _recognition() -> AudioRecognition:
     ar._turn_transcript_received = False
     ar._transcription_timeout_handle = None
     ar._vad_speech_started = False
+    ar._speech_start_time = None
+    ar._last_speaking_time = None
+    ar._audio_transcript = ""
     ar._interruption_enabled = True
     ar._interruption_ch = _RecordingChan()  # type: ignore[assignment]
     ar._agent_speaking = False
     ar._agent_speech_started_at = None
     ar._transcript_gate_active = False
+    ar._transcript_gate_speech_start = None
     ar._active_vad_speech_started_at = None
     ar._endpointing = MagicMock()
     ar._backchannel_boundary = None
@@ -293,3 +297,80 @@ async def test_unaligned_word_times_are_not_taken_as_session_times() -> None:
     ar._on_end_of_agent_speech(ended_at=AGENT_END)
 
     assert _recorded(ar) == [("네.", ACK_END, ACK_END)]
+
+
+async def test_untimed_ack_retires_its_clock_before_the_next_stt_turn() -> None:
+    ar = _recognition()
+    ar._stt_aligned_transcript = False
+    _open_overlap(ar)
+    _backchannel_verdict(ar)
+    ar._speech_start_time = OVERLAP_START
+    ar._last_speaking_time = OVERLAP_START + 0.3
+    await ar._on_stt_event(
+        SpeechEvent(
+            type=SpeechEventType.FINAL_TRANSCRIPT,
+            alternatives=[SpeechData(language="ko", text="네.")],
+            created_at=ACK_ARRIVED,
+        )
+    )
+
+    ar._on_end_of_agent_speech(ended_at=AGENT_END)
+
+    assert _recorded(ar) == [("네.", OVERLAP_START, OVERLAP_START + 0.3)]
+    assert ar._speech_start_time is None
+    assert ar._last_speaking_time is None
+    # Exercise the actual STT onset branch: it only sets an unset turn clock.
+    ar._turn_detection_mode = "stt"
+    ar._vad = None
+    ar._ensure_user_turn_span = MagicMock()  # type: ignore[method-assign]
+    answer_start = AGENT_END + 8
+    AudioRecognition._process_stt_event(
+        ar, SpeechEvent(type=SpeechEventType.START_OF_SPEECH, speech_start_time=answer_start)
+    )
+    assert ar._speech_start_time == answer_start
+
+
+@pytest.mark.parametrize("new_speech,buffered_text", [(True, ""), (False, "실제 답")])
+async def test_recording_ack_preserves_newer_or_accumulated_turn(
+    new_speech: bool, buffered_text: str
+) -> None:
+    ar = _recognition()
+    _open_overlap(ar)
+    _backchannel_verdict(ar)
+    await ar._on_stt_event(_final("네.", start=ACK_START, end=ACK_END, created_at=ACK_ARRIVED))
+    ar._speech_start_time = AGENT_END - 1 if new_speech else ACK_START
+    ar._last_speaking_time = AGENT_END + 1 if new_speech else ACK_END
+    ar._audio_transcript = buffered_text
+    original_start = ar._speech_start_time
+    original_end = ar._last_speaking_time
+
+    ar._on_end_of_agent_speech(ended_at=AGENT_END)
+
+    assert _recorded(ar) == [("네.", ACK_START, ACK_END)]
+    assert ar._speech_start_time == original_start
+    assert ar._last_speaking_time == original_end
+    assert ar._audio_transcript == buffered_text
+
+
+async def test_late_untimed_final_cannot_claim_a_second_completed_vad_segment() -> None:
+    ar = _recognition()
+    ar._stt_aligned_transcript = False
+    _open_overlap(ar)
+    _backchannel_verdict(ar)
+    next_start, next_end = 153.0, 154.0
+    ar._on_start_of_speech(started_at=next_start)
+    ar._speech_start_time = next_start
+    ar._last_speaking_time = next_end
+    ar._active_vad_speech_started_at = None
+    delayed_final = SpeechEvent(
+        type=SpeechEventType.FINAL_TRANSCRIPT,
+        alternatives=[SpeechData(language="ko", text="네.")],
+        created_at=155.0,
+    )
+    await ar._on_stt_event(delayed_final)
+
+    ar._on_end_of_agent_speech(ended_at=AGENT_END)
+
+    assert _recorded(ar) == [("네.", 155.0, 155.0)]
+    assert ar._speech_start_time == next_start
+    assert ar._last_speaking_time == next_end
