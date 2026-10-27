@@ -68,6 +68,11 @@ def _recognition() -> AudioRecognition:
     ar._speech_start_time = None
     ar._last_speaking_time = None
     ar._audio_transcript = ""
+    ar._user_turn_start = None
+    ar._user_turn_span = None
+    ar._stt_model = None
+    ar._stt_provider = None
+    ar._session._room_io = None
     ar._interruption_enabled = True
     ar._interruption_ch = _RecordingChan()  # type: ignore[assignment]
     ar._agent_speaking = False
@@ -299,13 +304,19 @@ async def test_unaligned_word_times_are_not_taken_as_session_times() -> None:
     assert _recorded(ar) == [("네.", ACK_END, ACK_END)]
 
 
-async def test_untimed_ack_retires_its_clock_before_the_next_stt_turn() -> None:
+@pytest.mark.parametrize("advance_speaking_clock", [False, True])
+async def test_untimed_ack_retires_its_clock_before_the_next_stt_turn(
+    advance_speaking_clock: bool,
+) -> None:
     ar = _recognition()
     ar._stt_aligned_transcript = False
     _open_overlap(ar)
     _backchannel_verdict(ar)
     ar._speech_start_time = OVERLAP_START
     ar._last_speaking_time = OVERLAP_START + 0.3
+    ar._user_turn_start = OVERLAP_START
+    old_span = MagicMock()
+    ar._user_turn_span = old_span
     await ar._on_stt_event(
         SpeechEvent(
             type=SpeechEventType.FINAL_TRANSCRIPT,
@@ -314,20 +325,28 @@ async def test_untimed_ack_retires_its_clock_before_the_next_stt_turn() -> None:
         )
     )
 
+    # The shared speaking clock can advance after the final was held. It is not an
+    # utterance identity: the gate still owns this single, completed segment.
+    if advance_speaking_clock:
+        ar._last_speaking_time = ACK_ARRIVED
+
     ar._on_end_of_agent_speech(ended_at=AGENT_END)
 
     assert _recorded(ar) == [("네.", OVERLAP_START, OVERLAP_START + 0.3)]
     assert ar._speech_start_time is None
     assert ar._last_speaking_time is None
+    assert ar._user_turn_start is None
+    old_span.end.assert_called_once()
     # Exercise the actual STT onset branch: it only sets an unset turn clock.
     ar._turn_detection_mode = "stt"
     ar._vad = None
-    ar._ensure_user_turn_span = MagicMock()  # type: ignore[method-assign]
     answer_start = AGENT_END + 8
     AudioRecognition._process_stt_event(
         ar, SpeechEvent(type=SpeechEventType.START_OF_SPEECH, speech_start_time=answer_start)
     )
     assert ar._speech_start_time == answer_start
+    # This is the anchor _run_eou_detection passes to _compute_end_of_turn_metrics.
+    assert ar._user_turn_start == answer_start
 
 
 @pytest.mark.parametrize("new_speech,buffered_text", [(True, ""), (False, "실제 답")])
@@ -374,3 +393,24 @@ async def test_late_untimed_final_cannot_claim_a_second_completed_vad_segment() 
     assert _recorded(ar) == [("네.", 155.0, 155.0)]
     assert ar._speech_start_time == next_start
     assert ar._last_speaking_time == next_end
+
+
+async def test_aligned_ack_timing_does_not_have_to_equal_its_vad_owner() -> None:
+    ar = _recognition()
+    _open_overlap(ar)
+    _backchannel_verdict(ar)
+    ar._speech_start_time = OVERLAP_START
+    ar._user_turn_start = OVERLAP_START
+    ar._user_turn_span = MagicMock()
+    ar._last_speaking_time = OVERLAP_START + 0.4
+    stt_start, stt_end = OVERLAP_START - 0.1, OVERLAP_START + 0.3
+    await ar._on_stt_event(_final("네.", start=stt_start, end=stt_end, created_at=ACK_ARRIVED))
+
+    ar._on_end_of_agent_speech(ended_at=AGENT_END)
+
+    assert _recorded(ar) == [("네.", stt_start, stt_end)]
+    assert ar._speech_start_time is None
+    assert ar._user_turn_start is None
+    answer_start = AGENT_END + 8
+    ar._ensure_user_turn_span(start_time=answer_start)
+    assert ar._user_turn_start == answer_start

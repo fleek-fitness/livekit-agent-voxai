@@ -855,16 +855,32 @@ class AudioRecognition:
         )
         # This path bypasses turn commit. Retire only the consumed segment's clock;
         # a newer segment or an accumulated real turn still owns its own timing.
+        gate_start = self._transcript_gate_speech_start
         if (
             not self._speaking
             and not self._audio_transcript
-            and self._speech_start_time == started_at
-            and self._last_speaking_time is not None
-            and self._last_speaking_time <= stopped_at
+            and gate_start is not None
+            and self._speech_start_time == gate_start
+            and stopped_at >= gate_start
         ):
             self._speech_start_time = None
             self._last_speaking_time = None
             self._vad_speech_started = False
+            if self._user_turn_start == gate_start:
+                # EOU metrics read the span's start, not _speech_start_time.
+                self._end_user_turn_span()
+                self._stt_request_ids = []
+                self._reset_transcription_timeout()
+        logger.debug(
+            "recorded held ignore-word clock",
+            extra={
+                "turn_clock_cleared": self._speech_start_time is None,
+                "turn_span_cleared": self._user_turn_start is None,
+                "has_unique_gate_start": gate_start is not None,
+                "speaking": self._speaking,
+                "has_buffered_transcript": bool(self._audio_transcript),
+            },
+        )
 
     def _flush_held_transcripts(
         self,
