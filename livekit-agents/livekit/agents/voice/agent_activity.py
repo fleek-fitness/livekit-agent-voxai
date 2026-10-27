@@ -2808,6 +2808,42 @@ class AgentActivity(RecognitionHooks):
             )
         return True
 
+    def on_held_ignore_word_discarded(
+        self,
+        ev: stt.SpeechEvent,
+        *,
+        started_speaking_at: float,
+        stopped_speaking_at: float,
+    ) -> None:
+        """Record an ignore word that the transcript gate trimmed as a backchannel.
+
+        It never reaches on_end_of_turn, so it is recorded here the way
+        _consume_delayed_interruption_turn records one: a user message without a reply,
+        placed in the chat context at the time it was spoken.
+        """
+        alt = ev.alternatives[0]
+        transcript = alt.text.strip()
+        metrics: llm.MetricsReport = {
+            "started_speaking_at": started_speaking_at,
+            "stopped_speaking_at": stopped_speaking_at,
+        }
+        if self.stt:
+            metrics["stt_metadata"] = self.stt.metrics_metadata
+        user_message = llm.ChatMessage(
+            role="user",
+            content=[transcript],
+            transcript_confidence=alt.confidence,
+            created_at=started_speaking_at,
+            metrics=metrics,
+        )
+        user_message.extra[DELAYED_INTERRUPTION_CONSUMED_EXTRA_KEY] = True
+        self._agent._chat_ctx.insert(user_message)
+        self._session._conversation_item_added(user_message)
+        logger.info(
+            "consuming ignored interruption transcript",
+            extra={"user_input": transcript, "reason": "transcript_gate_trimmed"},
+        )
+
     def on_end_of_turn(self, info: _EndOfTurnInfo) -> bool:
         # IMPORTANT: This method is sync to avoid it being cancelled by the AudioRecognition
         # We explicitly create a new task here

@@ -24,6 +24,8 @@ def _make_recognition(
     end_boundary: float = 1.0,
 ) -> AudioRecognition:
     recognition = AudioRecognition.__new__(AudioRecognition)
+    recognition._session = MagicMock()
+    recognition._session.options.interruption_ignore_words = []
     recognition._agent_speech_started_at = agent_sos
     recognition._active_vad_speech_started_at = vad_sos
     recognition._backchannel_boundary = (0.0, end_boundary)

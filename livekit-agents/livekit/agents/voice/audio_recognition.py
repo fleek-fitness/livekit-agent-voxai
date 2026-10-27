@@ -150,6 +150,13 @@ class RecognitionHooks(Protocol):
     def on_end_of_speech(self, ev: vad.VADEvent | None) -> None: ...
     def on_interim_transcript(self, ev: stt.SpeechEvent, *, speaking: bool | None) -> None: ...
     def on_final_transcript(self, ev: stt.SpeechEvent, *, speaking: bool | None = None) -> None: ...
+    def on_held_ignore_word_discarded(
+        self,
+        ev: stt.SpeechEvent,
+        *,
+        started_speaking_at: float,
+        stopped_speaking_at: float,
+    ) -> None: ...
     def on_transcription_timeout(self, *, speech_duration: float, turn_start: float) -> None: ...
     def on_end_of_turn(self, info: _EndOfTurnInfo) -> bool: ...
     def on_eot_prediction(self, ev: EotPredictionEvent) -> None: ...
@@ -807,6 +814,39 @@ class AudioRecognition:
                 # so filtering later events can separate SOS, transcripts, and EOS.
                 break
             self._transcript_buffer.popleft()
+            self._record_discarded_ignore_word(event)
+
+    def _record_discarded_ignore_word(self, ev: stt.SpeechEvent) -> None:
+        """Hand a trimmed ignore-word final to the hooks so it is still recorded.
+
+        Trimming drops a backchannel's transcript so it never becomes a user turn. An ignore
+        word ("네") over the agent is often the customer's answer, so it is recorded where it
+        was spoken, without a turn or a reply. Other trimmed events are dropped as before.
+        """
+        if ev.type != stt.SpeechEventType.FINAL_TRANSCRIPT or not ev.alternatives:
+            return
+        alt = ev.alternatives[0]
+        if not matches_ignore_words_exactly(
+            alt.text, self._session.options.interruption_ignore_words
+        ):
+            return
+
+        # Known speech timing takes precedence; arrival time is the fallback. Word times are
+        # relative to the STT input only for aligned transcripts (_on_stt_event).
+        stopped_at = ev.speech_end_time if ev.speech_end_time is not None else ev.created_at
+        started_at = ev.speech_start_time
+        input_started_at = self._input_started_at
+        if (
+            started_at is None
+            and self._stt_aligned_transcript
+            and alt.start_time > 0
+            and input_started_at is not None
+        ):
+            started_at = input_started_at + alt.start_time
+        started_at = stopped_at if started_at is None else min(started_at, stopped_at)
+        self._hooks.on_held_ignore_word_discarded(
+            ev, started_speaking_at=started_at, stopped_speaking_at=stopped_at
+        )
 
     def _flush_held_transcripts(
         self,
