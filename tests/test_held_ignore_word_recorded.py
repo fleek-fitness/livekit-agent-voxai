@@ -414,3 +414,37 @@ async def test_aligned_ack_timing_does_not_have_to_equal_its_vad_owner() -> None
     answer_start = AGENT_END + 8
     ar._ensure_user_turn_span(start_time=answer_start)
     assert ar._user_turn_start == answer_start
+
+
+@pytest.mark.parametrize(
+    "retained_type", [SpeechEventType.FINAL_TRANSCRIPT, SpeechEventType.INTERIM_TRANSCRIPT]
+)
+async def test_same_segment_retained_answer_keeps_its_span(retained_type: SpeechEventType) -> None:
+    ar = _recognition()
+    _open_overlap(ar)
+    _backchannel_verdict(ar)
+    ar._speech_start_time = OVERLAP_START
+    ar._user_turn_start = OVERLAP_START
+    span = MagicMock()
+    ar._user_turn_span = span
+    ar._last_speaking_time = AGENT_END - 0.5
+    ar._backchannel_boundary = (0.0, 1.0)
+    await ar._on_stt_event(
+        _final("네.", start=OVERLAP_START, end=OVERLAP_START + 0.3, created_at=ACK_ARRIVED)
+    )
+    retained = SpeechEvent(
+        type=retained_type,
+        alternatives=[SpeechData(language="ko", text="그런데 두 개 필요해요.")],
+        speech_start_time=OVERLAP_START,
+        speech_end_time=AGENT_END - 0.5,
+        created_at=AGENT_END,
+    )
+    ar._transcript_buffer.append(retained)
+
+    ar._on_end_of_agent_speech(ended_at=AGENT_END)
+
+    assert _recorded(ar) == [("네.", OVERLAP_START, OVERLAP_START + 0.3)]
+    ar._process_stt_event.assert_called_once_with(retained)  # type: ignore[attr-defined]
+    assert ar._speech_start_time == OVERLAP_START
+    assert ar._user_turn_start == OVERLAP_START
+    span.end.assert_not_called()

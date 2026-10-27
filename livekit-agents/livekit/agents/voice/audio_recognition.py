@@ -804,6 +804,7 @@ class AudioRecognition:
         if self._agent_speech_started_at is not None:
             trim_start = max(trim_start, self._agent_speech_started_at)
 
+        recorded_end: float | None = None
         while self._transcript_buffer:
             event = self._transcript_buffer[0]
             # Known speech timing takes precedence; arrival time is the fallback.
@@ -820,39 +821,11 @@ class AudioRecognition:
                 # so filtering later events can separate SOS, transcripts, and EOS.
                 break
             self._transcript_buffer.popleft()
-            self._record_discarded_ignore_word(event)
-
-    def _record_discarded_ignore_word(self, ev: stt.SpeechEvent) -> None:
-        """Hand a trimmed ignore-word final to the hooks so it is still recorded.
-
-        Trimming drops a backchannel's transcript so it never becomes a user turn. An ignore
-        word ("네") over the agent is often the customer's answer, so it is recorded where it
-        was spoken, without a turn or a reply. Other trimmed events are dropped as before.
-        """
-        if ev.type != stt.SpeechEventType.FINAL_TRANSCRIPT or not ev.alternatives:
+            stopped_at = self._record_discarded_ignore_word(event)
+            if stopped_at is not None:
+                recorded_end = max(recorded_end or stopped_at, stopped_at)
+        if recorded_end is None:
             return
-        alt = ev.alternatives[0]
-        if not matches_ignore_words_exactly(
-            alt.text, self._session.options.interruption_ignore_words
-        ):
-            return
-
-        # Known speech timing takes precedence; arrival time is the fallback. Word times are
-        # relative to the STT input only for aligned transcripts (_on_stt_event).
-        stopped_at = ev.speech_end_time if ev.speech_end_time is not None else ev.created_at
-        started_at = ev.speech_start_time
-        input_started_at = self._input_started_at
-        if (
-            started_at is None
-            and self._stt_aligned_transcript
-            and alt.start_time > 0
-            and input_started_at is not None
-        ):
-            started_at = input_started_at + alt.start_time
-        started_at = stopped_at if started_at is None else min(started_at, stopped_at)
-        self._hooks.on_held_ignore_word_discarded(
-            ev, started_speaking_at=started_at, stopped_speaking_at=stopped_at
-        )
         # This path bypasses turn commit. Retire only the consumed segment's clock;
         # a newer segment or an accumulated real turn still owns its own timing.
         gate_start = self._transcript_gate_speech_start
@@ -861,7 +834,16 @@ class AudioRecognition:
             and not self._audio_transcript
             and gate_start is not None
             and self._speech_start_time == gate_start
-            and stopped_at >= gate_start
+            and recorded_end >= gate_start
+            and not any(
+                event.type
+                in (
+                    stt.SpeechEventType.FINAL_TRANSCRIPT,
+                    stt.SpeechEventType.INTERIM_TRANSCRIPT,
+                    stt.SpeechEventType.PREFLIGHT_TRANSCRIPT,
+                )
+                for event in self._transcript_buffer
+            )
         ):
             self._speech_start_time = None
             self._last_speaking_time = None
@@ -881,6 +863,39 @@ class AudioRecognition:
                 "has_buffered_transcript": bool(self._audio_transcript),
             },
         )
+
+    def _record_discarded_ignore_word(self, ev: stt.SpeechEvent) -> float | None:
+        """Hand a trimmed ignore-word final to the hooks so it is still recorded.
+
+        Trimming drops a backchannel's transcript so it never becomes a user turn. An ignore
+        word ("네") over the agent is often the customer's answer, so it is recorded where it
+        was spoken, without a turn or a reply. Other trimmed events are dropped as before.
+        """
+        if ev.type != stt.SpeechEventType.FINAL_TRANSCRIPT or not ev.alternatives:
+            return None
+        alt = ev.alternatives[0]
+        if not matches_ignore_words_exactly(
+            alt.text, self._session.options.interruption_ignore_words
+        ):
+            return None
+
+        # Known speech timing takes precedence; arrival time is the fallback. Word times are
+        # relative to the STT input only for aligned transcripts (_on_stt_event).
+        stopped_at = ev.speech_end_time if ev.speech_end_time is not None else ev.created_at
+        started_at = ev.speech_start_time
+        input_started_at = self._input_started_at
+        if (
+            started_at is None
+            and self._stt_aligned_transcript
+            and alt.start_time > 0
+            and input_started_at is not None
+        ):
+            started_at = input_started_at + alt.start_time
+        started_at = stopped_at if started_at is None else min(started_at, stopped_at)
+        self._hooks.on_held_ignore_word_discarded(
+            ev, started_speaking_at=started_at, stopped_speaking_at=stopped_at
+        )
+        return stopped_at
 
     def _flush_held_transcripts(
         self,
