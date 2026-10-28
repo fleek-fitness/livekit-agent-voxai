@@ -28,7 +28,7 @@ from livekit.agents.voice.agent_activity import (
     AgentActivity,
     _matches_ignore_words,
 )
-from livekit.agents.voice.audio_recognition import AudioRecognition
+from livekit.agents.voice.audio_recognition import AudioRecognition, _HeldSegments
 from livekit.agents.voice.events import ConversationItemAddedEvent
 
 from .fake_session import FakeActions, create_session, run_session
@@ -291,6 +291,7 @@ INPUT_STARTED = 50.0
 
 def _recognition(**overrides: Any) -> AudioRecognition:
     ar = AudioRecognition.__new__(AudioRecognition)
+    ar._held_segments = _HeldSegments()
     state: dict[str, Any] = {
         "_vad_base_turn_detection": True,
         "_vad": object(),
@@ -447,6 +448,7 @@ def test_vad_segments_are_classified_against_the_agent_speech() -> None:
 
 def test_start_of_agent_speech_drops_the_stale_newer_segment() -> None:
     ar = AudioRecognition.__new__(AudioRecognition)
+    ar._held_segments = _HeldSegments()
     ar._post_agent_vad_segment_start = NEWER_SEGMENT_START
     ar._interruption_enabled = False
     ar._interruption_ch = None

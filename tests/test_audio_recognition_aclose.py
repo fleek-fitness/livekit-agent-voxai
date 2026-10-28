@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from livekit.agents.voice.audio_recognition import AudioRecognition
+from livekit.agents.voice.audio_recognition import AudioRecognition, _HeldSegments
 
 pytestmark = [pytest.mark.unit, pytest.mark.virtual_time, pytest.mark.no_concurrent]
 
@@ -14,6 +14,7 @@ class TestAudioRecognitionAclose:
         """Create an AudioRecognition instance with mocked dependencies."""
         with patch.object(AudioRecognition, "__init__", lambda self, *args, **kwargs: None):
             audio_recognition = AudioRecognition.__new__(AudioRecognition)
+            audio_recognition._held_segments = _HeldSegments()
 
         # Initialize required attributes manually
         audio_recognition._session = MagicMock()

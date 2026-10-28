@@ -16,6 +16,7 @@ from livekit.agents.voice.audio_recognition import (
     AudioRecognition,
     _EndOfTurnInfo,
     _EndOfTurnMetrics,
+    _HeldSegments,
 )
 
 from .fake_llm import FakeLLM
@@ -376,6 +377,7 @@ async def test_backchannel_confirmed_noop_when_barge_in_disabled(
 
 def _recognition_for_overlap(*, speaking: bool = False) -> AudioRecognition:
     ar = AudioRecognition.__new__(AudioRecognition)
+    ar._held_segments = _HeldSegments()
     ar._agent_speaking = False
     ar._vad_speech_started = False
     ar._transcript_gate_active = False
@@ -507,7 +509,13 @@ class _RecordingChan:
 
 def _recognition_with_interruption_ch() -> tuple[AudioRecognition, _RecordingChan]:
     ar = AudioRecognition.__new__(AudioRecognition)
+    ar._held_segments = _HeldSegments()
     ar._vad_speech_started = False
+    ar._audio_transcript = ""
+    ar._audio_interim_transcript = ""
+    ar._audio_preflight_transcript = ""
+    ar._speech_start_time = None
+    ar._user_turn_start = None
     ch = _RecordingChan()
     ar._interruption_enabled = True
     ar._interruption_ch = ch  # type: ignore[assignment]

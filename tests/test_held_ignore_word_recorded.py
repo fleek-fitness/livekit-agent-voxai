@@ -25,7 +25,7 @@ from livekit.agents.voice.agent_activity import (
     DELAYED_INTERRUPTION_CONSUMED_EXTRA_KEY,
     AgentActivity,
 )
-from livekit.agents.voice.audio_recognition import AudioRecognition
+from livekit.agents.voice.audio_recognition import AudioRecognition, _HeldSegments
 
 pytestmark = pytest.mark.unit
 
@@ -68,6 +68,8 @@ def _recognition() -> AudioRecognition:
     ar._speech_start_time = None
     ar._last_speaking_time = None
     ar._audio_transcript = ""
+    ar._audio_interim_transcript = ""
+    ar._audio_preflight_transcript = ""
     ar._user_turn_start = None
     ar._user_turn_span = None
     ar._stt_model = None
@@ -78,12 +80,7 @@ def _recognition() -> AudioRecognition:
     ar._agent_speaking = False
     ar._agent_speech_started_at = None
     ar._transcript_gate_active = False
-    ar._transcript_gate_speech_start = None
-    ar._transcript_gate_segment_retired = False
-    ar._transcript_gate_segment_backchannel = False
-    ar._transcript_gate_segment_finalized = False
-    ar._transcript_gate_prior_finals_pending = 0
-    ar._transcript_gate_prior_finals_held = 0
+    ar._held_segments = _HeldSegments()
     ar._active_vad_speech_started_at = None
     ar._endpointing = MagicMock()
     ar._backchannel_boundary = None
@@ -450,9 +447,11 @@ async def test_same_segment_retained_answer_keeps_its_span(retained_type: Speech
 
     assert _recorded(ar) == [("네.", OVERLAP_START, OVERLAP_START + 0.3)]
     ar._process_stt_event.assert_called_once_with(retained)  # type: ignore[attr-defined]
+    # the ack's final alone settled the segment; its retained answer makes it a turn candidate
+    # again, so the replayed answer starts its turn where the segment started
     assert ar._speech_start_time == OVERLAP_START
     assert ar._user_turn_start == OVERLAP_START
-    span.end.assert_not_called()
+    assert ar._user_turn_span is not None
 
 
 def _user_speech_starts(ar: AudioRecognition, at: float) -> None:
@@ -545,7 +544,6 @@ async def test_second_ack_retires_its_clock_before_the_answer_in_the_same_agent_
     assert ar._user_turn_start == answer_start
     assert retired_clock == (None, None, None)
     assert retired_request_ids == []
-    assert ar._transcript_gate_speech_start == answer_start
     assert ar._hooks.interruption_by_audio_activity_enabled is False
     ar._process_stt_event.assert_not_called()  # type: ignore[attr-defined]
 
@@ -580,9 +578,8 @@ async def test_ack_consumed_while_the_answer_is_held_keeps_the_answer_clock() ->
         created_at=answer_start + 0.5,
     )
     await ar._on_stt_event(held_answer)
-    held_span = ar._user_turn_span
-    held_start = ar._user_turn_start
-    held_request_ids = list(ar._stt_request_ids)
+    # the second ack still owns the turn clock while its verdict is pending
+    assert ar._user_turn_start == second_ack
     _verdict(ar, is_interruption=False, at=answer_start + 0.6, started=second_ack)
 
     assert _recorded(ar)[-1] == ("네.", second_ack, second_ack + 0.3)
@@ -591,9 +588,9 @@ async def test_ack_consumed_while_the_answer_is_held_keeps_the_answer_clock() ->
     assert ar._speaking
     assert ar._speech_start_time == answer_start
     assert ar._last_speaking_time == answer_start
-    assert ar._user_turn_span is held_span
-    assert ar._user_turn_start == held_start
-    assert ar._stt_request_ids == held_request_ids
+    # the consumed ack hands the turn clock to the answer instead of lending its own start
+    assert ar._user_turn_span is not None
+    assert ar._user_turn_start == answer_start
     ar._process_stt_event.assert_not_called()  # type: ignore[attr-defined]
 
 
@@ -741,8 +738,6 @@ async def test_pending_interim_after_the_ack_final_keeps_the_held_answer() -> No
 
     # the held segment is not settled: nothing is retired and the pending answer stays held
     assert held_answer in ar._transcript_buffer
-    assert ar._transcript_gate_speech_start is None
-    assert not ar._transcript_gate_segment_retired
     assert ar._speech_start_time is not None
     assert ar._user_turn_span is held_span
     assert ar._user_turn_start == first_ack
@@ -871,5 +866,3 @@ async def test_ack_final_after_an_interrupting_answer_started_keeps_the_answer_s
         assert _recorded(ar) == []
         assert [ev.alternatives[0].text for ev in replayed] == ["네."]
     assert ar._user_turn_start == answer_start
-    assert ar._transcript_gate_prior_finals_pending == 0
-    assert ar._transcript_gate_prior_finals_held == 0
