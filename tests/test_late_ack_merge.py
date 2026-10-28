@@ -669,6 +669,15 @@ def test_unicode_punctuation_does_not_make_other_text_an_ack() -> None:
     assert matches_ignore_words_exactly("ＯＫ", IGNORE_WORDS) is True  # NFKC folds full-width
 
 
+@pytest.mark.parametrize("text", ["넵", "넵."])
+def test_word_missing_from_the_list_is_not_an_exact_ack(text: str) -> None:
+    # "넵" is not in this list: the exact matcher used by the gate and the end-of-turn path
+    # rejects it, while the loose matcher accepts it as a one-syllable filler
+    assert matches_ignore_words_exactly(text, IGNORE_WORDS) is False
+    assert matches_ignore_words(text, IGNORE_WORDS) is True
+    assert matches_ignore_words_exactly(text, [*IGNORE_WORDS, "넵"]) is True
+
+
 def test_exact_matcher_needs_ignore_words() -> None:
     assert matches_ignore_words_exactly("네", None) is False
     assert matches_ignore_words_exactly("네", []) is False

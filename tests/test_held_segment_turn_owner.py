@@ -194,6 +194,8 @@ class Case:
     untimed_recorded: list[tuple[str, float, float]] | None = None
     replayed: tuple[str, ...] = ()
     untimed_replayed: tuple[str, ...] | None = None
+    # the VAD clock, when it differs from the turn start
+    speech_start: float | None = None
 
 
 A1, A2 = 155.24, 156.00
@@ -392,6 +394,20 @@ CASES: dict[str, Case] = {
         156.40,
         [("네.", A1, A1 + 0.39)],
     ),
+    # the backchannel verdict lands only after the agent stopped and the answer began
+    "verdict_after_agent_end_while_answering": Case(
+        [Sos(A1), Eos(A1 + 0.39), AgentEnd(), Sos(ANSWER), Verdict(ANSWER + 0.1, A1)],
+        ANSWER,
+        [],
+    ),
+    # no verdict ever arrives for a segment that ended before the agent stopped: like any VAD
+    # segment without a transcript, it keeps the first onset as the turn start
+    "no_verdict_segment_keeps_the_first_onset": Case(
+        [Sos(A1), Eos(A1 + 0.39), AgentEnd(), Sos(ANSWER)],
+        A1,
+        [],
+        speech_start=ANSWER,
+    ),
     # AI speech ends while the customer is still speaking: inconclusive, the segment keeps
     # its start and its final becomes the turn
     "agent_ends_mid_segment": Case(
@@ -416,7 +432,7 @@ async def test_turn_owner(name: str, aligned: bool) -> None:
     assert _recorded(ar) == [(t, pytest.approx(s), pytest.approx(e)) for t, s, e in recorded]
     assert ar._user_turn_start == case.turn_start
     if case.turn_start is not None:
-        assert ar._speech_start_time == case.turn_start
+        assert ar._speech_start_time == (case.speech_start or case.turn_start)
     replayed = case.replayed
     if not aligned and case.untimed_replayed is not None:
         replayed = case.untimed_replayed

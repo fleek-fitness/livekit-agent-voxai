@@ -907,7 +907,8 @@ class AudioRecognition:
             if owner is not None:
                 self._speech_start_time = owner.start
                 held.cleared_clock = False
-            elif not self._speaking:
+            elif not self._speaking or self._active_vad_speech_started_at in retired:
+                # (the VAD end of a retired segment is handled before _speaking is cleared)
                 self._speech_start_time = None
                 self._last_speaking_time = None
                 self._vad_speech_started = False
@@ -915,6 +916,11 @@ class AudioRecognition:
         elif self._speech_start_time is not None:
             held.cleared_clock = False
 
+        # without a held candidate, a newer onset outside the held segments (speech after the
+        # agent stopped) owns the turn
+        start = owner.start if owner is not None else self._speech_start_time
+        if start in retired:
+            start = None
         if self._user_turn_start in retired or (
             self._user_turn_start is None and held.cleared_span
         ):
@@ -925,11 +931,11 @@ class AudioRecognition:
                 self._reset_transcription_timeout()
                 logger.debug(
                     "retired held backchannel clock",
-                    extra={"retired_segments": len(retired), "has_owner": owner is not None},
+                    extra={"retired_segments": len(retired), "has_owner": start is not None},
                 )
-            if owner is not None:
-                self._ensure_user_turn_span(start_time=owner.start)
-            held.cleared_span = owner is None
+            if start is not None:
+                self._ensure_user_turn_span(start_time=start)
+            held.cleared_span = start is None
         elif self._user_turn_start is not None:
             held.cleared_span = False
 
