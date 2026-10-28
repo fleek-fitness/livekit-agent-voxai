@@ -79,6 +79,7 @@ def _recognition() -> AudioRecognition:
     ar._agent_speech_started_at = None
     ar._transcript_gate_active = False
     ar._transcript_gate_speech_start = None
+    ar._transcript_gate_segment_retired = False
     ar._active_vad_speech_started_at = None
     ar._endpointing = MagicMock()
     ar._backchannel_boundary = None
@@ -448,3 +449,145 @@ async def test_same_segment_retained_answer_keeps_its_span(retained_type: Speech
     assert ar._speech_start_time == OVERLAP_START
     assert ar._user_turn_start == OVERLAP_START
     span.end.assert_not_called()
+
+
+def _user_speech_starts(ar: AudioRecognition, at: float) -> None:
+    # the VAD start-of-speech handler, then the hooks forwarding it to _on_start_of_speech
+    if not ar._vad_speech_started:
+        ar._speech_start_time = at
+        ar._vad_speech_started = True
+    ar._active_vad_speech_started_at = at
+    ar._ensure_user_turn_span(start_time=at)
+    ar._on_start_of_speech(started_at=at)
+    ar._speaking = True
+    ar._last_speaking_time = at
+
+
+def _user_speech_ends(ar: AudioRecognition, at: float) -> None:
+    # the VAD end-of-speech handler
+    ar._on_end_of_speech(ended_at=at)
+    ar._active_vad_speech_started_at = None
+    ar._vad_speech_started = False
+    ar._speaking = False
+    ar._last_speaking_time = at
+
+
+def _verdict(ar: AudioRecognition, *, is_interruption: bool, at: float, started: float) -> None:
+    ar._on_overlap_speech_event(
+        OverlappingSpeechEvent(
+            is_interruption=is_interruption,
+            agent_ended=False,
+            detected_at=at,
+            overlap_started_at=started,
+        )
+    )
+
+
+async def _consumed_ack(ar: AudioRecognition, start: float) -> None:
+    # "네." over the agent: the final is held, the verdict calls it a backchannel and trims it
+    _user_speech_starts(ar, start)
+    _user_speech_ends(ar, start + 0.3)
+    if ar._stt_aligned_transcript:
+        ack = _final("네.", start=start, end=start + 0.3, created_at=start + 0.4)
+    else:
+        # no speech timing: held with the completed VAD segment's clock
+        ack = SpeechEvent(
+            type=SpeechEventType.FINAL_TRANSCRIPT,
+            alternatives=[SpeechData(language="ko", text="네.")],
+            created_at=start + 0.4,
+        )
+    ack.request_id = f"ack-{start}"
+    await ar._on_stt_event(ack)
+    _verdict(ar, is_interruption=False, at=start + 0.5, started=start)
+
+
+@pytest.mark.parametrize("aligned", [True, False])
+async def test_second_ack_retires_its_clock_before_the_answer_in_the_same_agent_speech(
+    aligned: bool,
+) -> None:
+    first_ack, second_ack, answer_start = 148.91, 153.00, 169.05
+    answer_text = "두 개 필요해요."
+    ar = _recognition()
+    ar._stt_aligned_transcript = aligned
+    activity, added = _activity(llm.ChatContext.empty())
+    activity._create_speech_task = MagicMock()  # type: ignore[method-assign]
+    ar._hooks.on_held_ignore_word_discarded.side_effect = activity.on_held_ignore_word_discarded
+    ar._on_start_of_agent_speech(started_at=AGENT_START)
+
+    await _consumed_ack(ar, first_ack)
+    await _consumed_ack(ar, second_ack)
+
+    assert _recorded(ar) == [
+        ("네.", first_ack, first_ack + 0.3),
+        ("네.", second_ack, second_ack + 0.3),
+    ]
+    retired_clock = (ar._speech_start_time, ar._last_speaking_time, ar._user_turn_span)
+    retired_request_ids = list(ar._stt_request_ids)
+    assert [item.text_content for item in added] == ["네.", "네."]
+    activity._create_speech_task.assert_not_called()  # type: ignore[attr-defined]
+    # Neither acknowledgement interrupted the agent or requested a turn/reply.
+    assert ar._agent_speaking
+    assert ar._hooks.interruption_by_audio_activity_enabled is False
+    ar._process_stt_event.assert_not_called()  # type: ignore[attr-defined]
+    ar._hooks.on_end_of_turn.assert_not_called()  # type: ignore[attr-defined]
+
+    # The real answer also starts during the same agent utterance and remains held.
+    _user_speech_starts(ar, answer_start)
+    answer = _final(
+        answer_text, start=answer_start, end=answer_start + 1.2, created_at=answer_start + 1.4
+    )
+    await ar._on_stt_event(answer)
+    # This is the anchor used by end-of-turn metrics, not just the VAD clock.
+    assert ar._user_turn_start == answer_start
+    assert retired_clock == (None, None, None)
+    assert retired_request_ids == []
+    assert ar._transcript_gate_speech_start == answer_start
+    assert ar._hooks.interruption_by_audio_activity_enabled is False
+    ar._process_stt_event.assert_not_called()  # type: ignore[attr-defined]
+
+    # Playout completion releases only the answer; the acknowledgements never replay.
+    ar._on_end_of_agent_speech(ended_at=answer_start + 1.5)
+    ar._process_stt_event.assert_called_once()  # type: ignore[attr-defined]
+    (replayed,) = ar._process_stt_event.call_args.args  # type: ignore[attr-defined]
+    assert replayed.alternatives[0].text == answer_text
+    assert len(_recorded(ar)) == 2
+    assert ar._speech_start_time == answer_start
+    assert ar._user_turn_start == answer_start
+    assert ar._hooks.interruption_by_audio_activity_enabled is False
+    ar._hooks.on_end_of_turn.assert_not_called()  # type: ignore[attr-defined]
+
+
+async def test_ack_consumed_while_the_answer_is_held_keeps_the_answer_clock() -> None:
+    first_ack, second_ack, answer_start = 148.91, 153.00, 153.60
+    ar = _recognition()
+    ar._on_start_of_agent_speech(started_at=AGENT_START)
+    await _consumed_ack(ar, first_ack)
+
+    # the second ack's verdict lands only after the answer started and its interim is held
+    _user_speech_starts(ar, second_ack)
+    _user_speech_ends(ar, second_ack + 0.3)
+    await ar._on_stt_event(
+        _final("네.", start=second_ack, end=second_ack + 0.3, created_at=second_ack + 0.4)
+    )
+    _user_speech_starts(ar, answer_start)
+    held_answer = SpeechEvent(
+        type=SpeechEventType.INTERIM_TRANSCRIPT,
+        alternatives=[SpeechData(language="ko", text="그런데 두 개")],
+        created_at=answer_start + 0.5,
+    )
+    await ar._on_stt_event(held_answer)
+    held_span = ar._user_turn_span
+    held_start = ar._user_turn_start
+    held_request_ids = list(ar._stt_request_ids)
+    _verdict(ar, is_interruption=False, at=answer_start + 0.6, started=second_ack)
+
+    assert _recorded(ar)[-1] == ("네.", second_ack, second_ack + 0.3)
+    # the held answer is untouched: still buffered, still speaking, clock not cleared
+    assert list(ar._transcript_buffer) == [held_answer]
+    assert ar._speaking
+    assert ar._speech_start_time == answer_start
+    assert ar._last_speaking_time == answer_start
+    assert ar._user_turn_span is held_span
+    assert ar._user_turn_start == held_start
+    assert ar._stt_request_ids == held_request_ids
+    ar._process_stt_event.assert_not_called()  # type: ignore[attr-defined]

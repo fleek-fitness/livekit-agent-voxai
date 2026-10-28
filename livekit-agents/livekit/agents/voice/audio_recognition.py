@@ -362,6 +362,9 @@ class AudioRecognition:
         self._transcript_buffer: deque[SpeechEvent] = deque()
         self._transcript_gate_active: bool = False
         self._transcript_gate_speech_start: float | None = None
+        # the gate's held segment was consumed and its clock retired: the next overlap opens
+        # a new segment instead of making the gate's owner ambiguous
+        self._transcript_gate_segment_retired: bool = False
         self._interruption_enabled: bool = interruption_detection is not None and vad is not None
         # Tracks active audio playout, independently of the generation lifecycle.
         self._agent_speaking: bool = False
@@ -714,8 +717,9 @@ class AudioRecognition:
         # overlap over agent speech started this turn; gates verdict acceptance below
         self._overlap_in_current_turn = True
         self._overlap_open = True
-        if not self._transcript_gate_active:
+        if not self._transcript_gate_active or self._transcript_gate_segment_retired:
             self._transcript_gate_speech_start = started_at
+            self._transcript_gate_segment_retired = False
         elif self._transcript_gate_speech_start != started_at:
             # Untimed finals cannot be assigned to one of multiple held segments.
             self._transcript_gate_speech_start = None
@@ -848,6 +852,7 @@ class AudioRecognition:
             self._speech_start_time = None
             self._last_speaking_time = None
             self._vad_speech_started = False
+            self._transcript_gate_segment_retired = True
             if self._user_turn_start == gate_start:
                 # EOU metrics read the span's start, not _speech_start_time.
                 self._end_user_turn_span()
@@ -859,6 +864,7 @@ class AudioRecognition:
                 "turn_clock_cleared": self._speech_start_time is None,
                 "turn_span_cleared": self._user_turn_start is None,
                 "has_unique_gate_start": gate_start is not None,
+                "gate_segment_retired": self._transcript_gate_segment_retired,
                 "speaking": self._speaking,
                 "has_buffered_transcript": bool(self._audio_transcript),
             },
