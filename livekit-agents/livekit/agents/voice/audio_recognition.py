@@ -759,19 +759,29 @@ class AudioRecognition:
         ):
             return False
         ignore_words = self._session.options.interruption_ignore_words
-        # a held transcript that is not an exact ignore word may be a real answer
-        return all(
-            not event.alternatives
-            or not event.alternatives[0].text
-            or matches_ignore_words_exactly(event.alternatives[0].text, ignore_words)
-            for event in self._transcript_buffer
-            if event.type
-            in (
-                stt.SpeechEventType.FINAL_TRANSCRIPT,
-                stt.SpeechEventType.INTERIM_TRANSCRIPT,
-                stt.SpeechEventType.PREFLIGHT_TRANSCRIPT,
-            )
-        )
+        # A held transcript that is not an exact ignore word may be a real answer. An interim
+        # or preflight followed by a final was superseded by that final ("내" corrected to
+        # "네"); only the ones after the last final are still pending.
+        superseded = False
+        for event in reversed(self._transcript_buffer):
+            if event.type == stt.SpeechEventType.FINAL_TRANSCRIPT:
+                superseded = True
+            elif (
+                event.type
+                not in (
+                    stt.SpeechEventType.INTERIM_TRANSCRIPT,
+                    stt.SpeechEventType.PREFLIGHT_TRANSCRIPT,
+                )
+                or superseded
+            ):
+                continue
+            if (
+                event.alternatives
+                and event.alternatives[0].text
+                and not matches_ignore_words_exactly(event.alternatives[0].text, ignore_words)
+            ):
+                return False
+        return True
 
     def _retire_settled_gate_segment(self, gate_start: float, *, started_at: float) -> None:
         # The held final is still recorded at its own time when it is trimmed.

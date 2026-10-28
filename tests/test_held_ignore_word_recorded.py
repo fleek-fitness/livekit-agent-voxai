@@ -595,9 +595,27 @@ async def test_ack_consumed_while_the_answer_is_held_keeps_the_answer_clock() ->
     ar._process_stt_event.assert_not_called()  # type: ignore[attr-defined]
 
 
-async def _ack_judged_before_its_final(ar: AudioRecognition, start: float) -> None:
+async def _ack_judged_before_its_final(
+    ar: AudioRecognition, start: float, *, interim: str | None = None
+) -> None:
     # "네." over the agent: the verdict lands while it is still spoken, its final only after
     _user_speech_starts(ar, start)
+    if interim is not None:
+        # the STT first hears another word and its final corrects it to "네."
+        await ar._on_stt_event(
+            SpeechEvent(
+                type=SpeechEventType.INTERIM_TRANSCRIPT,
+                alternatives=[
+                    SpeechData(
+                        language="ko",
+                        text=interim,
+                        start_time=start - INPUT_START if ar._stt_aligned_transcript else 0.0,
+                        end_time=start + 0.2 - INPUT_START if ar._stt_aligned_transcript else 0.0,
+                    )
+                ],
+                created_at=start + 0.3,
+            )
+        )
     _verdict(ar, is_interruption=False, at=start + 0.6, started=start)
     _user_speech_ends(ar, start + 0.39)
     if ar._stt_aligned_transcript:
@@ -616,6 +634,21 @@ async def _ack_judged_before_its_final(ar: AudioRecognition, start: float) -> No
 async def test_ack_judged_before_its_final_does_not_lend_its_turn_start_to_the_answer(
     aligned: bool, answer_held: bool
 ) -> None:
+    await _ack_ack_answer(aligned=aligned, answer_held=answer_held)
+
+
+@pytest.mark.parametrize("aligned", [True, False])
+@pytest.mark.parametrize("answer_held", [True, False])
+async def test_ack_corrected_from_an_interim_does_not_lend_its_turn_start_to_the_answer(
+    aligned: bool, answer_held: bool
+) -> None:
+    # the held interim "내" is superseded by its own final "네.", so it is not a pending answer
+    await _ack_ack_answer(aligned=aligned, answer_held=answer_held, first_interim="내")
+
+
+async def _ack_ack_answer(
+    *, aligned: bool, answer_held: bool, first_interim: str | None = None
+) -> None:
     first_ack, second_ack = 155.24, 163.30
     agent_end = 171.05 if answer_held else 166.00
     answer_start = 169.05 if answer_held else 172.40
@@ -627,7 +660,7 @@ async def test_ack_judged_before_its_final_does_not_lend_its_turn_start_to_the_a
     ar._hooks.on_held_ignore_word_discarded.side_effect = activity.on_held_ignore_word_discarded
     ar._on_start_of_agent_speech(started_at=AGENT_START)
 
-    await _ack_judged_before_its_final(ar, first_ack)
+    await _ack_judged_before_its_final(ar, first_ack, interim=first_interim)
     # the second "네." starts while the first one's final is still held
     _user_speech_starts(ar, second_ack)
     assert ar._user_turn_start == second_ack
@@ -685,3 +718,33 @@ async def test_ack_judged_before_its_final_does_not_lend_its_turn_start_to_the_a
     assert ar._hooks.interruption_by_audio_activity_enabled is False
     ar._hooks.on_end_of_turn.assert_not_called()  # type: ignore[attr-defined]
     activity._create_speech_task.assert_not_called()  # type: ignore[attr-defined]
+
+
+async def test_pending_interim_after_the_ack_final_keeps_the_held_answer() -> None:
+    first_ack, next_start = 155.24, 156.40
+    ar = _recognition()
+    ar._on_start_of_agent_speech(started_at=AGENT_START)
+    await _ack_judged_before_its_final(ar, first_ack)
+    # the customer goes on after "네.": this interim follows the final, so it is still pending
+    held_answer = SpeechEvent(
+        type=SpeechEventType.INTERIM_TRANSCRIPT,
+        alternatives=[SpeechData(language="ko", text="그런데 두 개")],
+        created_at=first_ack + 1.0,
+    )
+    await ar._on_stt_event(held_answer)
+    held_span = ar._user_turn_span
+    held_request_ids = list(ar._stt_request_ids)
+
+    _user_speech_starts(ar, next_start)
+
+    # the held segment is not settled: nothing is retired and the pending answer stays held
+    assert held_answer in ar._transcript_buffer
+    assert ar._transcript_gate_speech_start is None
+    assert not ar._transcript_gate_segment_retired
+    assert ar._speech_start_time is not None
+    assert ar._user_turn_span is held_span
+    assert ar._user_turn_start == first_ack
+    assert ar._stt_request_ids == held_request_ids
+    assert _recorded(ar) == []
+    ar._process_stt_event.assert_not_called()  # type: ignore[attr-defined]
+    ar._hooks.on_end_of_turn.assert_not_called()  # type: ignore[attr-defined]
