@@ -201,25 +201,27 @@ async def test_ack_continued_by_more_words_stays_one_turn() -> None:
     )
 
 
-def _ack_only_during_question() -> FakeActions:
+def _ack_only_during_question(ack: str = ACK) -> FakeActions:
     actions = _question_with_greeting()
-    actions.add_user_speech(ACK_START, ACK_END, ACK)
-    actions.add_llm(REPLY_TO_MERGED, input=ACK)
+    actions.add_user_speech(ACK_START, ACK_END, ack)
+    actions.add_llm(REPLY_TO_MERGED, input=ack)
     actions.add_tts(1.0, input=REPLY_TO_MERGED)
     return actions
 
 
-async def test_ignore_word_alone_never_interrupts_or_replies() -> None:
+# full-width "～" and "…" are punctuation like the ASCII "." in ACK
+@pytest.mark.parametrize("ack", [ACK, "네～", "네…"])
+async def test_ignore_word_alone_never_interrupts_or_replies(ack: str) -> None:
     def _question_finished(agent: Agent, _items: list[ConversationItemAddedEvent]) -> bool:
         return bool(_assistant_messages(agent))
 
-    agent, _ = await _run(_ack_only_during_question(), until=_question_finished, settle=3.0)
+    agent, _ = await _run(_ack_only_during_question(ack), until=_question_finished, settle=3.0)
 
     messages = _messages(agent)
     assert [(m.role, m.text_content) for m in messages] == [
         ("user", GREETING),
         ("assistant", QUESTION),
-        ("user", ACK),
+        ("user", ack),
     ]
     assert messages[1].interrupted is False
     assert messages[2].extra.get(DELAYED_INTERRUPTION_CONSUMED_EXTRA_KEY) is True

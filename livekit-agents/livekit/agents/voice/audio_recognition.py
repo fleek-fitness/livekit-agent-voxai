@@ -368,6 +368,10 @@ class AudioRecognition:
         # the gate's segment was judged a backchannel / its final is already held
         self._transcript_gate_segment_backchannel: bool = False
         self._transcript_gate_segment_finalized: bool = False
+        # finals of retired segments that had not arrived yet when the next overlap started:
+        # they belong to the retired segment, not to the gate's current one
+        self._transcript_gate_prior_finals_pending: int = 0
+        self._transcript_gate_prior_finals_held: int = 0
         self._interruption_enabled: bool = interruption_detection is not None and vad is not None
         # Tracks active audio playout, independently of the generation lifecycle.
         self._agent_speaking: bool = False
@@ -720,15 +724,22 @@ class AudioRecognition:
         # overlap over agent speech started this turn; gates verdict acceptance below
         self._overlap_in_current_turn = True
         self._overlap_open = True
-        if not self._transcript_gate_active or self._transcript_gate_segment_retired:
+        if not self._transcript_gate_active:
+            self._transcript_gate_prior_finals_pending = 0
+            self._transcript_gate_prior_finals_held = 0
+            self._open_transcript_gate_segment(started_at)
+        elif self._transcript_gate_segment_retired:
             self._open_transcript_gate_segment(started_at)
         elif (gate_start := self._transcript_gate_speech_start) != started_at:
             if gate_start is not None and self._held_backchannel_segment_settled():
-                # The held segment was judged a backchannel and its final is already held,
-                # so later finals belong to this overlap. Its turn span must not become
-                # the start of the next real turn.
+                # The held segment was judged a backchannel, so its turn span must not become
+                # the start of the next real turn. Later finals belong to this overlap, except
+                # the retired segment's own final when it has not arrived yet.
+                final_pending = not self._transcript_gate_segment_finalized
                 self._retire_settled_gate_segment(gate_start, started_at=started_at)
                 self._open_transcript_gate_segment(started_at)
+                if final_pending:
+                    self._transcript_gate_prior_finals_pending += 1
             else:
                 # Untimed finals cannot be assigned to one of multiple held segments.
                 self._transcript_gate_speech_start = None
@@ -750,10 +761,13 @@ class AudioRecognition:
         self._transcript_gate_segment_finalized = False
 
     def _held_backchannel_segment_settled(self) -> bool:
-        """Whether the gate's ended segment is a backchannel whose ignore-word final is held."""
+        """Whether the gate's ended segment is a backchannel with no pending real answer.
+
+        Its final may still be on its way: once the segment is judged a backchannel and has
+        ended, that final is trimmed when the gate resolves, recorded if it is an ignore word.
+        """
         if (
             not self._transcript_gate_segment_backchannel
-            or not self._transcript_gate_segment_finalized
             or self._speaking
             or self._audio_transcript
         ):
@@ -874,7 +888,7 @@ class AudioRecognition:
         if self._agent_speech_started_at is not None:
             trim_start = max(trim_start, self._agent_speech_started_at)
 
-        recorded_end: float | None = None
+        consumed_end: float | None = None
         while self._transcript_buffer:
             event = self._transcript_buffer[0]
             # Known speech timing takes precedence; arrival time is the fallback.
@@ -891,10 +905,25 @@ class AudioRecognition:
                 # so filtering later events can separate SOS, transcripts, and EOS.
                 break
             self._transcript_buffer.popleft()
-            stopped_at = self._record_discarded_ignore_word(event)
-            if stopped_at is not None:
-                recorded_end = max(recorded_end or stopped_at, stopped_at)
-        if recorded_end is None:
+            self._record_discarded_ignore_word(event)
+            if event.type != stt.SpeechEventType.FINAL_TRANSCRIPT:
+                continue
+            prior_final = self._transcript_gate_prior_finals_held > 0
+            if prior_final:
+                self._transcript_gate_prior_finals_held -= 1
+            if not event.alternatives or not event.alternatives[0].text:
+                continue
+            if prior_final and event.speech_end_time is None:
+                # a retired segment's final arriving late: its arrival time says nothing
+                # about the current segment
+                continue
+            # Recorded or dropped, a trimmed final consumed its segment: the segment's clock
+            # must not become the start of the next turn.
+            ended_at = (
+                event.speech_end_time if event.speech_end_time is not None else event.created_at
+            )
+            consumed_end = ended_at if consumed_end is None else max(consumed_end, ended_at)
+        if consumed_end is None:
             return
         # This path bypasses turn commit. Retire only the consumed segment's clock;
         # a newer segment or an accumulated real turn still owns its own timing.
@@ -904,7 +933,7 @@ class AudioRecognition:
             and not self._audio_transcript
             and gate_start is not None
             and self._speech_start_time == gate_start
-            and recorded_end >= gate_start
+            and consumed_end >= gate_start
             and not any(
                 event.type
                 in (
@@ -925,7 +954,7 @@ class AudioRecognition:
                 self._stt_request_ids = []
                 self._reset_transcription_timeout()
         logger.debug(
-            "recorded held ignore-word clock",
+            "retired consumed backchannel clock",
             extra={
                 "turn_clock_cleared": self._speech_start_time is None,
                 "turn_span_cleared": self._user_turn_start is None,
@@ -936,7 +965,7 @@ class AudioRecognition:
             },
         )
 
-    def _record_discarded_ignore_word(self, ev: stt.SpeechEvent) -> float | None:
+    def _record_discarded_ignore_word(self, ev: stt.SpeechEvent) -> None:
         """Hand a trimmed ignore-word final to the hooks so it is still recorded.
 
         Trimming drops a backchannel's transcript so it never becomes a user turn. An ignore
@@ -944,12 +973,12 @@ class AudioRecognition:
         was spoken, without a turn or a reply. Other trimmed events are dropped as before.
         """
         if ev.type != stt.SpeechEventType.FINAL_TRANSCRIPT or not ev.alternatives:
-            return None
+            return
         alt = ev.alternatives[0]
         if not matches_ignore_words_exactly(
             alt.text, self._session.options.interruption_ignore_words
         ):
-            return None
+            return
 
         # Known speech timing takes precedence; arrival time is the fallback. Word times are
         # relative to the STT input only for aligned transcripts (_on_stt_event).
@@ -967,7 +996,6 @@ class AudioRecognition:
         self._hooks.on_held_ignore_word_discarded(
             ev, started_speaking_at=started_at, stopped_speaking_at=stopped_at
         )
-        return stopped_at
 
     def _flush_held_transcripts(
         self,
@@ -994,6 +1022,9 @@ class AudioRecognition:
                 resolved_at=resolved_at,
                 vad_speech_started_at=vad_speech_started_at,
             )
+        # the gate is released: no held final is attributed to a segment any more
+        self._transcript_gate_prior_finals_pending = 0
+        self._transcript_gate_prior_finals_held = 0
 
         if not self._transcript_buffer:
             return
@@ -1153,6 +1184,8 @@ class AudioRecognition:
             self._stt_pipeline = pipeline
             # reset interruption handling related state
             self._transcript_buffer.clear()
+            self._transcript_gate_prior_finals_pending = 0
+            self._transcript_gate_prior_finals_held = 0
         else:
             self._cancel_transcription_timeout()
 
@@ -1469,10 +1502,20 @@ class AudioRecognition:
                 self._hooks.interruption_by_audio_activity_enabled = True
 
         if ev.type != stt.SpeechEventType.RECOGNITION_USAGE and self._transcript_gate_active:
+            # Providers emit finals in order: the next final after a segment retired without
+            # one is that segment's, so it neither takes this segment's clock nor finalizes it.
+            prior_final = (
+                ev.type == stt.SpeechEventType.FINAL_TRANSCRIPT
+                and self._transcript_gate_prior_finals_pending > 0
+            )
+            if prior_final:
+                self._transcript_gate_prior_finals_pending -= 1
+                self._transcript_gate_prior_finals_held += 1
             # Unaligned providers may omit wall-clock timestamps. Snapshot the completed
             # VAD segment now, before another segment can replace these mutable anchors.
             if (
-                ev.type == stt.SpeechEventType.FINAL_TRANSCRIPT
+                not prior_final
+                and ev.type == stt.SpeechEventType.FINAL_TRANSCRIPT
                 and ev.alternatives
                 and matches_ignore_words_exactly(
                     ev.alternatives[0].text, self._session.options.interruption_ignore_words
@@ -1496,7 +1539,7 @@ class AudioRecognition:
                     speech_start_time=self._speech_start_time,
                     speech_end_time=self._last_speaking_time,
                 )
-            if ev.type == stt.SpeechEventType.FINAL_TRANSCRIPT:
+            if ev.type == stt.SpeechEventType.FINAL_TRANSCRIPT and not prior_final:
                 self._transcript_gate_segment_finalized = True
             logger.trace("holding STT event during agent speech", extra={"event": ev.type})
             self._transcript_buffer.append(ev)

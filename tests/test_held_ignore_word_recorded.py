@@ -82,6 +82,8 @@ def _recognition() -> AudioRecognition:
     ar._transcript_gate_segment_retired = False
     ar._transcript_gate_segment_backchannel = False
     ar._transcript_gate_segment_finalized = False
+    ar._transcript_gate_prior_finals_pending = 0
+    ar._transcript_gate_prior_finals_held = 0
     ar._active_vad_speech_started_at = None
     ar._endpointing = MagicMock()
     ar._backchannel_boundary = None
@@ -748,3 +750,126 @@ async def test_pending_interim_after_the_ack_final_keeps_the_held_answer() -> No
     assert _recorded(ar) == []
     ar._process_stt_event.assert_not_called()  # type: ignore[attr-defined]
     ar._hooks.on_end_of_turn.assert_not_called()  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("text", ["네～", "네…", "네〜", "네。"])
+async def test_ack_with_unicode_punctuation_is_recorded_when_agent_stops(text: str) -> None:
+    ar = _recognition()
+    _open_overlap(ar)
+    _backchannel_verdict(ar)
+    await ar._on_stt_event(_final(text, start=ACK_START, end=ACK_END, created_at=ACK_ARRIVED))
+
+    ar._on_end_of_agent_speech(ended_at=AGENT_END)
+
+    assert _recorded(ar) == [(text, ACK_START, ACK_END)]
+    ar._process_stt_event.assert_not_called()  # type: ignore[attr-defined]
+
+
+async def test_dropped_backchannel_does_not_lend_its_turn_start_to_the_answer() -> None:
+    backchannel_start, answer_start = 155.24, 165.00
+    ar = _recognition()
+    ar._on_start_of_agent_speech(started_at=AGENT_START)
+    _user_speech_starts(ar, backchannel_start)
+    _user_speech_ends(ar, backchannel_start + 0.6)
+    await ar._on_stt_event(
+        _final(
+            "아 그렇구나",
+            start=backchannel_start,
+            end=backchannel_start + 0.6,
+            created_at=backchannel_start + 0.8,
+        )
+    )
+    _verdict(ar, is_interruption=False, at=backchannel_start + 0.9, started=backchannel_start)
+
+    # not an ignore word: dropped as before, but its clock is retired with it
+    assert _recorded(ar) == []
+    assert ar._speech_start_time is None
+    assert ar._user_turn_start is None
+
+    ar._on_end_of_agent_speech(ended_at=AGENT_END + 0.5)
+    _user_speech_starts(ar, answer_start)
+    assert ar._user_turn_start == answer_start
+    ar._process_stt_event.assert_not_called()  # type: ignore[attr-defined]
+
+
+def _ack_final(aligned: bool, *, start: float, end: float, created_at: float) -> SpeechEvent:
+    if aligned:
+        return _final("네.", start=start, end=end, created_at=created_at)
+    return SpeechEvent(
+        type=SpeechEventType.FINAL_TRANSCRIPT,
+        alternatives=[SpeechData(language="ko", text="네.")],
+        created_at=created_at,
+    )
+
+
+async def _ack_judged_without_its_final(ar: AudioRecognition, start: float) -> None:
+    # "네." over the agent, judged a backchannel; its final has not arrived yet
+    _user_speech_starts(ar, start)
+    _verdict(ar, is_interruption=False, at=start + 0.6, started=start)
+    _user_speech_ends(ar, start + 0.39)
+
+
+@pytest.mark.parametrize("aligned", [True, False])
+async def test_ack_final_after_the_next_overlap_does_not_lend_its_turn_start(
+    aligned: bool,
+) -> None:
+    first_ack, second_ack, answer_start = 155.24, 156.00, 165.00
+    first_arrived, second_arrived = 156.20, 156.50
+    ar = _recognition()
+    ar._stt_aligned_transcript = aligned
+    ar._on_start_of_agent_speech(started_at=AGENT_START)
+    await _ack_judged_without_its_final(ar, first_ack)
+
+    # the second "네." starts before the first one's final arrives
+    _user_speech_starts(ar, second_ack)
+    assert ar._user_turn_start == second_ack
+    await ar._on_stt_event(
+        _ack_final(aligned, start=first_ack, end=first_ack + 0.39, created_at=first_arrived)
+    )
+    _user_speech_ends(ar, second_ack + 0.3)
+    await ar._on_stt_event(
+        _ack_final(aligned, start=second_ack, end=second_ack + 0.3, created_at=second_arrived)
+    )
+    _verdict(ar, is_interruption=False, at=156.60, started=second_ack)
+
+    # an untimed first final keeps its arrival time: it never takes the second ack's clock
+    first_timing = (first_ack, first_ack + 0.39) if aligned else (first_arrived,) * 2
+    assert _recorded(ar) == [("네.", *first_timing), ("네.", second_ack, second_ack + 0.3)]
+    assert ar._speech_start_time is None
+    assert ar._user_turn_start is None
+
+    ar._on_end_of_agent_speech(ended_at=AGENT_END)
+    _user_speech_starts(ar, answer_start)
+    assert ar._user_turn_start == answer_start
+    ar._process_stt_event.assert_not_called()  # type: ignore[attr-defined]
+    ar._hooks.on_end_of_turn.assert_not_called()  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("aligned", [True, False])
+async def test_ack_final_after_an_interrupting_answer_started_keeps_the_answer_start(
+    aligned: bool,
+) -> None:
+    ack_start, answer_start = 155.24, 156.00
+    ar = _recognition()
+    ar._stt_aligned_transcript = aligned
+    ar._on_start_of_agent_speech(started_at=AGENT_START)
+    await _ack_judged_without_its_final(ar, ack_start)
+    _user_speech_starts(ar, answer_start)
+    await ar._on_stt_event(
+        _ack_final(aligned, start=ack_start, end=ack_start + 0.39, created_at=156.20)
+    )
+
+    _verdict(ar, is_interruption=True, at=156.50, started=answer_start)
+
+    replayed = [call.args[0] for call in ar._process_stt_event.call_args_list]  # type: ignore[attr-defined]
+    if aligned:
+        # timed: it ended before the answer, so it is trimmed and recorded
+        assert _recorded(ar) == [("네.", ack_start, ack_start + 0.39)]
+        assert replayed == []
+    else:
+        # untimed: it arrived after the answer started, so it stays in the answer's turn
+        assert _recorded(ar) == []
+        assert [ev.alternatives[0].text for ev in replayed] == ["네."]
+    assert ar._user_turn_start == answer_start
+    assert ar._transcript_gate_prior_finals_pending == 0
+    assert ar._transcript_gate_prior_finals_held == 0

@@ -22,7 +22,7 @@ import pytest
 
 from livekit.agents import Agent, stt, vad
 from livekit.agents.llm import ChatContext
-from livekit.agents.voice._ignore_words import matches_ignore_words_exactly
+from livekit.agents.voice._ignore_words import matches_ignore_words, matches_ignore_words_exactly
 from livekit.agents.voice.agent_activity import (
     ActivityClosedError,
     AgentActivity,
@@ -651,6 +651,20 @@ def test_exact_matcher_rejects_a_prefix_of_an_ignore_word() -> None:
 def test_exact_matcher_accepts_ack_only_text(text: str) -> None:
     assert matches_ignore_words_exactly(text, IGNORE_WORDS) is True
     assert _recognition()._is_late_ack_final(_final(text), text) is True
+
+
+# full-width and other Unicode punctuation is stripped like ASCII punctuation
+@pytest.mark.parametrize("text", ["네～", "네…", "네〜", "네。", "네！", "네？", "「네」", "네·"])
+def test_matchers_strip_unicode_punctuation(text: str) -> None:
+    assert matches_ignore_words_exactly(text, IGNORE_WORDS) is True
+    assert matches_ignore_words(text, IGNORE_WORDS) is True
+    assert _recognition()._is_late_ack_final(_final(text), text) is True
+
+
+def test_unicode_punctuation_does_not_make_other_text_an_ack() -> None:
+    assert matches_ignore_words_exactly("네… 왜", IGNORE_WORDS) is False
+    assert matches_ignore_words_exactly("…", IGNORE_WORDS) is False
+    assert matches_ignore_words_exactly("ＯＫ", IGNORE_WORDS) is True  # NFKC folds full-width
 
 
 def test_exact_matcher_needs_ignore_words() -> None:

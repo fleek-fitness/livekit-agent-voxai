@@ -32,6 +32,15 @@ def _make_recognition(
     recognition._backchannel_boundary_timer = None
     recognition._transcript_buffer = deque()
     recognition._transcript_gate_active = True
+    recognition._transcript_gate_speech_start = None
+    recognition._transcript_gate_segment_retired = False
+    recognition._transcript_gate_prior_finals_pending = 0
+    recognition._transcript_gate_prior_finals_held = 0
+    recognition._audio_transcript = ""
+    recognition._speech_start_time = None
+    recognition._user_turn_start = None
+    recognition._user_silence_ev = asyncio.Event()
+    recognition._user_silence_ev.set()
     recognition._stt_aligned_transcript = False
     recognition._hooks = MagicMock()
     recognition._hooks.interruption_by_audio_activity_enabled = False
