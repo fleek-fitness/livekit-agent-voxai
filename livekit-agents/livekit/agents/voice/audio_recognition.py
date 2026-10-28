@@ -365,6 +365,9 @@ class AudioRecognition:
         # the gate's held segment was consumed and its clock retired: the next overlap opens
         # a new segment instead of making the gate's owner ambiguous
         self._transcript_gate_segment_retired: bool = False
+        # the gate's segment was judged a backchannel / its final is already held
+        self._transcript_gate_segment_backchannel: bool = False
+        self._transcript_gate_segment_finalized: bool = False
         self._interruption_enabled: bool = interruption_detection is not None and vad is not None
         # Tracks active audio playout, independently of the generation lifecycle.
         self._agent_speaking: bool = False
@@ -718,11 +721,19 @@ class AudioRecognition:
         self._overlap_in_current_turn = True
         self._overlap_open = True
         if not self._transcript_gate_active or self._transcript_gate_segment_retired:
-            self._transcript_gate_speech_start = started_at
-            self._transcript_gate_segment_retired = False
-        elif self._transcript_gate_speech_start != started_at:
-            # Untimed finals cannot be assigned to one of multiple held segments.
-            self._transcript_gate_speech_start = None
+            self._open_transcript_gate_segment(started_at)
+        elif (gate_start := self._transcript_gate_speech_start) != started_at:
+            if gate_start is not None and self._held_backchannel_segment_settled():
+                # The held segment was judged a backchannel and its final is already held,
+                # so later finals belong to this overlap. Its turn span must not become
+                # the start of the next real turn.
+                self._retire_settled_gate_segment(gate_start, started_at=started_at)
+                self._open_transcript_gate_segment(started_at)
+            else:
+                # Untimed finals cannot be assigned to one of multiple held segments.
+                self._transcript_gate_speech_start = None
+                self._transcript_gate_segment_backchannel = False
+                self._transcript_gate_segment_finalized = False
         self._transcript_gate_active = True
         self._interruption_ch.send_nowait(  # type: ignore[union-attr]
             _OverlapSpeechStartedSentinel(
@@ -730,6 +741,51 @@ class AudioRecognition:
                 user_speaking_span=user_speaking_span,
                 started_at=started_at,
             )
+        )
+
+    def _open_transcript_gate_segment(self, started_at: float) -> None:
+        self._transcript_gate_speech_start = started_at
+        self._transcript_gate_segment_retired = False
+        self._transcript_gate_segment_backchannel = False
+        self._transcript_gate_segment_finalized = False
+
+    def _held_backchannel_segment_settled(self) -> bool:
+        """Whether the gate's ended segment is a backchannel whose ignore-word final is held."""
+        if (
+            not self._transcript_gate_segment_backchannel
+            or not self._transcript_gate_segment_finalized
+            or self._speaking
+            or self._audio_transcript
+        ):
+            return False
+        ignore_words = self._session.options.interruption_ignore_words
+        # a held transcript that is not an exact ignore word may be a real answer
+        return all(
+            not event.alternatives
+            or not event.alternatives[0].text
+            or matches_ignore_words_exactly(event.alternatives[0].text, ignore_words)
+            for event in self._transcript_buffer
+            if event.type
+            in (
+                stt.SpeechEventType.FINAL_TRANSCRIPT,
+                stt.SpeechEventType.INTERIM_TRANSCRIPT,
+                stt.SpeechEventType.PREFLIGHT_TRANSCRIPT,
+            )
+        )
+
+    def _retire_settled_gate_segment(self, gate_start: float, *, started_at: float) -> None:
+        # The held final is still recorded at its own time when it is trimmed.
+        if self._speech_start_time == gate_start:
+            self._speech_start_time = started_at
+        retired_span = self._user_turn_start == gate_start
+        if retired_span:
+            self._end_user_turn_span()
+            self._stt_request_ids = []
+            self._reset_transcription_timeout()
+            self._ensure_user_turn_span(start_time=started_at)
+        logger.debug(
+            "retired held backchannel segment at the next overlap",
+            extra={"turn_span_retired": retired_span},
         )
 
     def _on_end_of_speech(
@@ -1430,6 +1486,8 @@ class AudioRecognition:
                     speech_start_time=self._speech_start_time,
                     speech_end_time=self._last_speaking_time,
                 )
+            if ev.type == stt.SpeechEventType.FINAL_TRANSCRIPT:
+                self._transcript_gate_segment_finalized = True
             logger.trace("holding STT event during agent speech", extra={"event": ev.type})
             self._transcript_buffer.append(ev)
             return
@@ -1735,6 +1793,9 @@ class AudioRecognition:
                 "ignoring backchannel event during backchannel boundary cooldown, falling back to vad"
             )
             return
+
+        if not ev.is_interruption and not ev.agent_ended and self._transcript_gate_active:
+            self._transcript_gate_segment_backchannel = True
 
         if ev.is_interruption and self._transcript_gate_active:
             self._flush_held_transcripts(

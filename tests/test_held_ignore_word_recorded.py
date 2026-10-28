@@ -80,6 +80,8 @@ def _recognition() -> AudioRecognition:
     ar._transcript_gate_active = False
     ar._transcript_gate_speech_start = None
     ar._transcript_gate_segment_retired = False
+    ar._transcript_gate_segment_backchannel = False
+    ar._transcript_gate_segment_finalized = False
     ar._active_vad_speech_started_at = None
     ar._endpointing = MagicMock()
     ar._backchannel_boundary = None
@@ -591,3 +593,95 @@ async def test_ack_consumed_while_the_answer_is_held_keeps_the_answer_clock() ->
     assert ar._user_turn_start == held_start
     assert ar._stt_request_ids == held_request_ids
     ar._process_stt_event.assert_not_called()  # type: ignore[attr-defined]
+
+
+async def _ack_judged_before_its_final(ar: AudioRecognition, start: float) -> None:
+    # "네." over the agent: the verdict lands while it is still spoken, its final only after
+    _user_speech_starts(ar, start)
+    _verdict(ar, is_interruption=False, at=start + 0.6, started=start)
+    _user_speech_ends(ar, start + 0.39)
+    if ar._stt_aligned_transcript:
+        ack = _final("네.", start=start, end=start + 0.39, created_at=start + 0.79)
+    else:
+        ack = SpeechEvent(
+            type=SpeechEventType.FINAL_TRANSCRIPT,
+            alternatives=[SpeechData(language="ko", text="네.")],
+            created_at=start + 0.79,
+        )
+    await ar._on_stt_event(ack)
+
+
+@pytest.mark.parametrize("aligned", [True, False])
+@pytest.mark.parametrize("answer_held", [True, False])
+async def test_ack_judged_before_its_final_does_not_lend_its_turn_start_to_the_answer(
+    aligned: bool, answer_held: bool
+) -> None:
+    first_ack, second_ack = 155.24, 163.30
+    agent_end = 171.05 if answer_held else 166.00
+    answer_start = 169.05 if answer_held else 172.40
+    answer_text = "3개가 필요해요."
+    ar = _recognition()
+    ar._stt_aligned_transcript = aligned
+    activity, added = _activity(llm.ChatContext.empty())
+    activity._create_speech_task = MagicMock()  # type: ignore[method-assign]
+    ar._hooks.on_held_ignore_word_discarded.side_effect = activity.on_held_ignore_word_discarded
+    ar._on_start_of_agent_speech(started_at=AGENT_START)
+
+    await _ack_judged_before_its_final(ar, first_ack)
+    # the second "네." starts while the first one's final is still held
+    _user_speech_starts(ar, second_ack)
+    assert ar._user_turn_start == second_ack
+    if aligned:
+        second = _final("네.", start=second_ack, end=second_ack + 0.3, created_at=second_ack + 0.5)
+    else:
+        second = SpeechEvent(
+            type=SpeechEventType.FINAL_TRANSCRIPT,
+            alternatives=[SpeechData(language="ko", text="네.")],
+            created_at=second_ack + 0.5,
+        )
+    await ar._on_stt_event(second)
+    _verdict(ar, is_interruption=False, at=second_ack + 0.55, started=second_ack)
+    _user_speech_ends(ar, second_ack + 0.3)
+
+    # the first acknowledgement is recorded at its own speech time
+    assert _recorded(ar) == [("네.", first_ack, first_ack + 0.39)]
+
+    if answer_held:
+        # the real answer starts during the same agent utterance and remains held
+        _user_speech_starts(ar, answer_start)
+        assert ar._user_turn_start == answer_start
+        await ar._on_stt_event(
+            _final(answer_text, start=answer_start, end=answer_start + 1.2, created_at=170.45)
+            if aligned
+            else SpeechEvent(
+                type=SpeechEventType.FINAL_TRANSCRIPT,
+                alternatives=[SpeechData(language="ko", text=answer_text)],
+                created_at=170.45,
+            )
+        )
+        ar._process_stt_event.assert_not_called()  # type: ignore[attr-defined]
+        ar._on_end_of_agent_speech(ended_at=agent_end)
+    else:
+        ar._on_end_of_agent_speech(ended_at=agent_end)
+        _user_speech_starts(ar, answer_start)
+
+    second_timing = (second_ack, second_ack + 0.3) if aligned else (second_ack + 0.5,) * 2
+    assert _recorded(ar) == [
+        ("네.", first_ack, first_ack + 0.39),
+        ("네.", *second_timing),
+    ]
+    assert [item.text_content for item in added] == ["네.", "네."]
+    # the answer owns its turn start: not the first or second acknowledgement's
+    assert ar._speech_start_time == answer_start
+    assert ar._user_turn_start == answer_start
+    if answer_held:
+        # playout completion releases only the answer; the acknowledgements never replay
+        ar._process_stt_event.assert_called_once()  # type: ignore[attr-defined]
+        (replayed,) = ar._process_stt_event.call_args.args  # type: ignore[attr-defined]
+        assert replayed.alternatives[0].text == answer_text
+    else:
+        ar._process_stt_event.assert_not_called()  # type: ignore[attr-defined]
+    # neither acknowledgement interrupted the agent or requested a turn/reply
+    assert ar._hooks.interruption_by_audio_activity_enabled is False
+    ar._hooks.on_end_of_turn.assert_not_called()  # type: ignore[attr-defined]
+    activity._create_speech_task.assert_not_called()  # type: ignore[attr-defined]
