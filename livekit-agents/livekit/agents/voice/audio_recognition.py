@@ -938,6 +938,14 @@ class AudioRecognition:
                 self._end_user_turn_span()
                 self._stt_request_ids = []
                 self._reset_transcription_timeout()
+                # a held final of the segment that takes the turn still counts as received
+                self._turn_transcript_received = any(
+                    ev.type == stt.SpeechEventType.FINAL_TRANSCRIPT
+                    and ev.alternatives
+                    and ev.alternatives[0].text
+                    and held.owner_of(ev) in candidates
+                    for ev in self._transcript_buffer
+                )
                 logger.debug(
                     "retired held backchannel clock",
                     extra={"retired_segments": len(retired), "has_owner": start is not None},
@@ -1114,6 +1122,7 @@ class AudioRecognition:
         # the gate is released: the remaining events replay into the turn. The segments stay
         # until the next gated speech, so a verdict that lands after this still retires its
         # backchannel's clock.
+        owners = [self._held_segments.owner_of(ev) for ev in self._transcript_buffer]
         self._held_segments.forget_events()
 
         if not self._transcript_buffer:
@@ -1121,8 +1130,9 @@ class AudioRecognition:
 
         events_to_emit = list(self._transcript_buffer)
         self._transcript_buffer.clear()
-        for ev in events_to_emit:
+        for ev, segment in zip(events_to_emit, owners, strict=True):
             logger.trace("re-emitting held STT event", extra={"event": ev.type})
+            self._restore_retired_turn_clock(ev, segment)
             self._process_stt_event(ev)
 
     def _set_interruption_enabled(self, enabled: bool) -> None:
@@ -1618,7 +1628,10 @@ class AudioRecognition:
             self._recompute_turn_owner()
             return
 
-        self._restore_retired_turn_clock(ev)
+        if self._held_segments.cleared_clock or self._held_segments.cleared_span:
+            self._restore_retired_turn_clock(
+                ev, self._held_segments.attribute(ev, speaking=self._speaking)
+            )
         self._process_stt_event(ev)
 
     def _restore_segment_clock(self, segment: _HeldSegment) -> None:
@@ -1627,27 +1640,22 @@ class AudioRecognition:
             # without it the final's arrival is taken as the end of speech
             self._last_speaking_time = segment.end
 
-    def _restore_retired_turn_clock(self, ev: stt.SpeechEvent) -> None:
-        """Give a late real answer the clock its segment lost when it was judged a backchannel.
+    def _restore_retired_turn_clock(
+        self, ev: stt.SpeechEvent, segment: _HeldSegment | None
+    ) -> None:
+        """Give a final that reaches the turn the clock its segment lost to a backchannel verdict.
 
-        The gate is off by now, so the final was not held and could not make its segment a turn
-        candidate again; without this the turn would start with no speech time at all. A newer
-        onset has set its own clock, which is left alone.
+        A final that is replayed or arrives after the gate closed was not a pending candidate
+        when the clock was retired; without this the turn would start with no speech time at all.
+        A newer onset has set its own clock, which is left alone.
         """
         held = self._held_segments
-        if not (held.cleared_clock or held.cleared_span):
-            return
         if (
-            ev.type != stt.SpeechEventType.FINAL_TRANSCRIPT
+            segment is None
+            or ev.type != stt.SpeechEventType.FINAL_TRANSCRIPT
             or not ev.alternatives
             or not ev.alternatives[0].text
-            or matches_ignore_words_exactly(
-                ev.alternatives[0].text, self._session.options.interruption_ignore_words
-            )
         ):
-            return
-        segment = held.attribute(ev, speaking=self._speaking)
-        if segment is None:
             return
         if held.cleared_clock and self._speech_start_time is None:
             self._restore_segment_clock(segment)

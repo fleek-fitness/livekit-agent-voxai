@@ -538,14 +538,28 @@ async def test_held_final_is_processed_with_the_segment_speech_end() -> None:
     assert ends == [160.50]
 
 
-async def test_ack_after_the_gate_closed_does_not_get_the_retired_turn_clock_back() -> None:
+async def test_replayed_ack_keeps_its_speech_time() -> None:
+    # an ignore word inside the end boundary is not trimmed: it reaches the turn, so it needs the
+    # clock its segment lost to the backchannel verdict
     ar = _recognition(aligned=False)
+    clocks: list[tuple[float | None, float | None]] = []
+    ar._process_stt_event.side_effect = lambda ev: clocks.append(  # type: ignore[attr-defined]
+        (ar._user_turn_start, ar._speech_start_time)
+    )
+    ar._backchannel_boundary = (0.0, 1.0)
 
-    await _play(ar, [Sos(160.00), Eos(160.50), Verdict(160.60, 160.00), AgentEnd(AGENT_END)])
-    await _play_text(ar, Text("네.", 160.00, 160.50, 161.20))
+    await _play(
+        ar,
+        [
+            Sos(160.00),
+            Eos(160.50),
+            Verdict(160.60, 160.00),
+            Text("네.", 160.00, 160.50, 160.80),
+            AgentEnd(AGENT_END),
+        ],
+    )
 
-    assert ar._user_turn_start is None
-    assert ar._speech_start_time is None
+    assert clocks == [(160.00, 160.00)]
 
 
 async def test_final_after_the_gate_closed_keeps_a_newer_onset_clock() -> None:
@@ -572,6 +586,29 @@ async def test_transcription_timeout_is_not_reported_for_a_retired_backchannel()
 
     ar._hooks.on_transcription_timeout.assert_not_called()  # type: ignore[attr-defined]
     assert ar._user_turn_start is None
+
+
+async def test_transcription_timeout_is_not_reported_when_the_next_segment_holds_a_final() -> None:
+    # A's backchannel verdict arrives after B's final is held: handing the clock to B must not
+    # forget that B's text was received
+    ar = _recognition(aligned=True, transcription_timeout=0.05)
+    await _play(
+        ar,
+        [
+            Sos(150.00),
+            Eos(150.39),
+            Text("네.", 150.00, 150.39, 150.79),
+            Sos(152.00),
+            Text("두 개요", 152.00, 153.00, 153.20),
+            Verdict(153.30, 150.00),
+            Eos(153.40),
+        ],
+    )
+
+    await asyncio.sleep(0.1)
+
+    ar._hooks.on_transcription_timeout.assert_not_called()  # type: ignore[attr-defined]
+    assert ar._user_turn_start == 152.00
 
 
 async def test_transcription_timeout_is_still_reported_for_an_untranscribed_turn() -> None:
