@@ -655,20 +655,6 @@ def test_exact_matcher_accepts_ack_only_text(text: str) -> None:
     assert _recognition()._is_late_ack_final(_final(text), text) is True
 
 
-# full-width and other Unicode punctuation is stripped like ASCII punctuation
-@pytest.mark.parametrize("text", ["네～", "네…", "네〜", "네。", "네！", "네？", "「네」", "네·"])
-def test_matchers_strip_unicode_punctuation(text: str) -> None:
-    assert matches_ignore_words_exactly(text, IGNORE_WORDS) is True
-    assert matches_ignore_words(text, IGNORE_WORDS) is True
-    assert _recognition()._is_late_ack_final(_final(text), text) is True
-
-
-def test_unicode_punctuation_does_not_make_other_text_an_ack() -> None:
-    assert matches_ignore_words_exactly("네… 왜", IGNORE_WORDS) is False
-    assert matches_ignore_words_exactly("…", IGNORE_WORDS) is False
-    assert matches_ignore_words_exactly("ＯＫ", IGNORE_WORDS) is True  # NFKC folds full-width
-
-
 @pytest.mark.parametrize("text", ["넵", "넵."])
 def test_word_missing_from_the_list_is_not_an_exact_ack(text: str) -> None:
     # "넵" is not in this list: the exact matcher used by the gate and the end-of-turn path

@@ -209,9 +209,9 @@ def _ack_only_during_question(ack: str = ACK) -> FakeActions:
     return actions
 
 
-# full-width "～" and "…" are punctuation like the ASCII "." in ACK
-@pytest.mark.parametrize("ack", [ACK, "네～", "네…"])
-async def test_ignore_word_alone_never_interrupts_or_replies(ack: str) -> None:
+async def test_ignore_word_alone_never_interrupts_or_replies() -> None:
+    ack = ACK
+
     def _question_finished(agent: Agent, _items: list[ConversationItemAddedEvent]) -> bool:
         return bool(_assistant_messages(agent))
 

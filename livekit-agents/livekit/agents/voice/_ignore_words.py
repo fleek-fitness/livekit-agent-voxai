@@ -3,20 +3,6 @@
 from __future__ import annotations
 
 import string
-import unicodedata
-
-_ASCII_PUNCTUATION = str.maketrans("", "", string.punctuation)
-
-
-def _strip_punctuation(text: str) -> str:
-    """Lowercase `text` and drop ASCII and Unicode punctuation.
-
-    NFKC folds full-width forms to ASCII ("～" to "~", "！" to "!") and "…" to "...", so they
-    are stripped like their ASCII counterparts. Any remaining Unicode punctuation ("〜", "。",
-    "「」") is dropped as well.
-    """
-    folded = unicodedata.normalize("NFKC", text.lower()).translate(_ASCII_PUNCTUATION)
-    return "".join(ch for ch in folded if not unicodedata.category(ch).startswith("P"))
 
 
 def matches_ignore_words(text: str, ignore_words: list[str] | None) -> bool:
@@ -26,7 +12,7 @@ def matches_ignore_words(text: str, ignore_words: list[str] | None) -> bool:
     if not text:
         return False
 
-    text_cleaned = _strip_punctuation(text).strip()
+    text_cleaned = text.lower().strip().translate(str.maketrans("", "", string.punctuation))
     if not text_cleaned:
         return True
 
@@ -41,7 +27,7 @@ def matches_ignore_words(text: str, ignore_words: list[str] | None) -> bool:
     for word in ignore_words:
         if not isinstance(word, str):
             continue
-        cleaned = _strip_punctuation(word).strip()
+        cleaned = word.lower().strip().translate(str.maketrans("", "", string.punctuation))
         if cleaned:
             cleaned_ignore_words.append(cleaned)
 
@@ -78,7 +64,8 @@ def matches_ignore_words(text: str, ignore_words: list[str] | None) -> bool:
 
 
 def _clean_for_exact_match(text: str) -> str:
-    return "".join(_strip_punctuation(text).split())
+    stripped = text.lower().translate(str.maketrans("", "", string.punctuation))
+    return "".join(stripped.split())
 
 
 def matches_ignore_words_exactly(text: str, ignore_words: list[str] | None) -> bool:

@@ -334,11 +334,6 @@ CASES: dict[str, Case] = {
         ANSWER,
         [("네.", A1, A1 + 0.39), ("네.", 158.00, 158.39)],
     ),
-    "unicode_punctuation_ack": Case(
-        [*_ack(A1, text="네～"), *_ack(158.00, text="네…"), AgentEnd(), Sos(ANSWER)],
-        ANSWER,
-        [("네～", A1, A1 + 0.39), ("네…", 158.00, 158.39)],
-    ),
     # a backchannel that is not an ignore word is dropped, and so is its clock
     "non_ignore_backchannel_dropped": Case(
         [*_ack(A1, text="아 그렇구나"), AgentEnd(), Sos(ANSWER)], ANSWER, []

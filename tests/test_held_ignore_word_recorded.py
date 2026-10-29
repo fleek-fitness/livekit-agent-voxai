@@ -747,19 +747,6 @@ async def test_pending_interim_after_the_ack_final_keeps_the_held_answer() -> No
     ar._hooks.on_end_of_turn.assert_not_called()  # type: ignore[attr-defined]
 
 
-@pytest.mark.parametrize("text", ["네～", "네…", "네〜", "네。"])
-async def test_ack_with_unicode_punctuation_is_recorded_when_agent_stops(text: str) -> None:
-    ar = _recognition()
-    _open_overlap(ar)
-    _backchannel_verdict(ar)
-    await ar._on_stt_event(_final(text, start=ACK_START, end=ACK_END, created_at=ACK_ARRIVED))
-
-    ar._on_end_of_agent_speech(ended_at=AGENT_END)
-
-    assert _recorded(ar) == [(text, ACK_START, ACK_END)]
-    ar._process_stt_event.assert_not_called()  # type: ignore[attr-defined]
-
-
 async def test_dropped_backchannel_does_not_lend_its_turn_start_to_the_answer() -> None:
     backchannel_start, answer_start = 155.24, 165.00
     ar = _recognition()
