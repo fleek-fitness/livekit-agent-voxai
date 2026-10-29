@@ -910,7 +910,7 @@ class AudioRecognition:
             or (self._speech_start_time is None and held.cleared_clock)
         ):
             if owner is not None:
-                self._speech_start_time = owner.start
+                self._restore_segment_clock(owner)
                 held.cleared_clock = False
             elif not self._speaking or self._active_vad_speech_started_at in retired:
                 # (the VAD end of a retired segment is handled before _speaking is cleared)
@@ -1621,6 +1621,12 @@ class AudioRecognition:
         self._restore_retired_turn_clock(ev)
         self._process_stt_event(ev)
 
+    def _restore_segment_clock(self, segment: _HeldSegment) -> None:
+        self._speech_start_time = segment.start
+        if self._last_speaking_time is None and segment.end is not None:
+            # without it the final's arrival is taken as the end of speech
+            self._last_speaking_time = segment.end
+
     def _restore_retired_turn_clock(self, ev: stt.SpeechEvent) -> None:
         """Give a late real answer the clock its segment lost when it was judged a backchannel.
 
@@ -1644,10 +1650,7 @@ class AudioRecognition:
         if segment is None:
             return
         if held.cleared_clock and self._speech_start_time is None:
-            self._speech_start_time = segment.start
-            if self._last_speaking_time is None and segment.end is not None:
-                # without it the final's arrival is taken as the end of speech
-                self._last_speaking_time = segment.end
+            self._restore_segment_clock(segment)
             held.cleared_clock = False
         if held.cleared_span and self._user_turn_start is None:
             self._ensure_user_turn_span(start_time=segment.start)

@@ -505,6 +505,39 @@ async def test_final_after_the_gate_closed_is_processed_with_the_segment_speech_
     ar._run_eou_detection.assert_called_once()
 
 
+async def test_held_final_is_processed_with_the_segment_speech_end() -> None:
+    # same as above while the gate is still open: the held final is replayed when the agent
+    # stops, and the retired segment gets its speech end back along with its start
+    ar = _recognition(aligned=False)
+    del ar._process_stt_event
+    ar._run_eou_detection = MagicMock()  # type: ignore[method-assign]
+    ar._vad = MagicMock()
+    ar._vad_base_turn_detection = True
+    ar._endpointing.max_delay = 3.0
+    ar._check_user_turn_limit = MagicMock()  # type: ignore[method-assign]
+    # a final that arrives within the end boundary is replayed instead of trimmed
+    ar._backchannel_boundary = (0.0, 1.0)
+    ends: list[float | None] = []
+    process = ar._process_stt_event
+    ar._process_stt_event = lambda ev: (  # type: ignore[method-assign]
+        ends.append(ar._last_speaking_time),
+        process(ev),
+    )[1]
+
+    await _play(
+        ar,
+        [
+            Sos(160.00),
+            Eos(160.50),
+            Verdict(160.60, 160.00),
+            Text("두 개요", 160.00, 160.50, 160.80),
+            AgentEnd(AGENT_END),
+        ],
+    )
+
+    assert ends == [160.50]
+
+
 async def test_ack_after_the_gate_closed_does_not_get_the_retired_turn_clock_back() -> None:
     ar = _recognition(aligned=False)
 
