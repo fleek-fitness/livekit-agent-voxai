@@ -155,6 +155,16 @@ async def _play(ar: AudioRecognition, steps: list[Step]) -> None:
             ar._on_end_of_agent_speech(ended_at=step.at)
 
 
+async def _play_text(ar: AudioRecognition, text: Text) -> None:
+    """Deliver one STT text to a recognition whose agent speech was already played."""
+    started = ar._on_start_of_agent_speech
+    ar._on_start_of_agent_speech = lambda **_: None  # type: ignore[method-assign]
+    try:
+        await _play(ar, [text])
+    finally:
+        ar._on_start_of_agent_speech = started  # type: ignore[method-assign]
+
+
 def _recorded(ar: AudioRecognition) -> list[tuple[str, float, float]]:
     hook = ar._hooks.on_held_ignore_word_discarded  # type: ignore[attr-defined]
     return [
@@ -457,6 +467,49 @@ async def test_late_final_answer_gives_the_turn_clock_back_to_the_earlier_segmen
     assert ar._user_turn_start == 148.00
     assert ar._speech_start_time == 148.00
     assert _replayed(ar) == ["그런데 말이죠"]
+
+
+@pytest.mark.parametrize("aligned", [True, False], ids=["aligned", "untimed"])
+async def test_final_after_the_gate_closed_gets_the_retired_turn_clock_back(aligned: bool) -> None:
+    # The overlap is judged a backchannel and the agent stops before its final arrives. The gate
+    # is off, so the final is not held; it still has to start the turn at its own speech time.
+    ar = _recognition(aligned=aligned)
+    clocks: list[tuple[float | None, float | None]] = []
+    ar._process_stt_event.side_effect = lambda ev: clocks.append(  # type: ignore[attr-defined]
+        (ar._user_turn_start, ar._speech_start_time)
+    )
+
+    await _play(ar, [Sos(160.00), Eos(160.50), Verdict(160.60, 160.00), AgentEnd(AGENT_END)])
+    assert ar._user_turn_start is None
+    await _play_text(ar, Text("두 개요", 160.00, 160.50, 161.20))
+
+    assert clocks == [(160.00, 160.00)]
+
+
+async def test_ack_after_the_gate_closed_does_not_get_the_retired_turn_clock_back() -> None:
+    ar = _recognition(aligned=False)
+
+    await _play(ar, [Sos(160.00), Eos(160.50), Verdict(160.60, 160.00), AgentEnd(AGENT_END)])
+    await _play_text(ar, Text("네.", 160.00, 160.50, 161.20))
+
+    assert ar._user_turn_start is None
+    assert ar._speech_start_time is None
+
+
+async def test_final_after_the_gate_closed_keeps_a_newer_onset_clock() -> None:
+    ar = _recognition(aligned=False)
+    clocks: list[tuple[float | None, float | None]] = []
+    ar._process_stt_event.side_effect = lambda ev: clocks.append(  # type: ignore[attr-defined]
+        (ar._user_turn_start, ar._speech_start_time)
+    )
+
+    await _play(
+        ar,
+        [Sos(160.00), Eos(160.50), Verdict(160.60, 160.00), AgentEnd(AGENT_END), Sos(ANSWER)],
+    )
+    await _play_text(ar, Text("두 개요", ANSWER, ANSWER + 0.5, ANSWER + 0.9))
+
+    assert clocks == [(ANSWER, ANSWER)]
 
 
 async def test_transcription_timeout_is_not_reported_for_a_retired_backchannel() -> None:

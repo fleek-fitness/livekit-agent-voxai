@@ -1618,7 +1618,37 @@ class AudioRecognition:
             self._recompute_turn_owner()
             return
 
+        self._restore_retired_turn_clock(ev)
         self._process_stt_event(ev)
+
+    def _restore_retired_turn_clock(self, ev: stt.SpeechEvent) -> None:
+        """Give a late real answer the clock its segment lost when it was judged a backchannel.
+
+        The gate is off by now, so the final was not held and could not make its segment a turn
+        candidate again; without this the turn would start with no speech time at all. A newer
+        onset has set its own clock, which is left alone.
+        """
+        held = self._held_segments
+        if not (held.cleared_clock or held.cleared_span):
+            return
+        if (
+            ev.type != stt.SpeechEventType.FINAL_TRANSCRIPT
+            or not ev.alternatives
+            or not ev.alternatives[0].text
+            or matches_ignore_words_exactly(
+                ev.alternatives[0].text, self._session.options.interruption_ignore_words
+            )
+        ):
+            return
+        segment = held.attribute(ev, speaking=self._speaking)
+        if segment is None:
+            return
+        if held.cleared_clock and self._speech_start_time is None:
+            self._speech_start_time = segment.start
+            held.cleared_clock = False
+        if held.cleared_span and self._user_turn_start is None:
+            self._ensure_user_turn_span(start_time=segment.start)
+            held.cleared_span = False
 
     def _process_stt_event(self, ev: stt.SpeechEvent) -> None:
         has_stt_end_time = bool(
