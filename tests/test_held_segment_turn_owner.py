@@ -486,6 +486,25 @@ async def test_final_after_the_gate_closed_gets_the_retired_turn_clock_back(alig
     assert clocks == [(160.00, 160.00)]
 
 
+async def test_final_after_the_gate_closed_is_processed_with_the_segment_speech_end() -> None:
+    # the real STT handler, not the stub: the end of speech must be the segment's end, not the
+    # arrival of the final, or the transcription delay collapses to zero
+    ar = _recognition(aligned=False)
+    del ar._process_stt_event  # use the class method
+    ar._run_eou_detection = MagicMock()  # type: ignore[method-assign]
+    ar._vad = MagicMock()  # a VAD anchors the end of speech
+    ar._vad_base_turn_detection = True
+    ar._endpointing.max_delay = 3.0
+    ar._check_user_turn_limit = MagicMock()  # type: ignore[method-assign]
+
+    await _play(ar, [Sos(160.00), Eos(160.50), Verdict(160.60, 160.00), AgentEnd(AGENT_END)])
+    await _play_text(ar, Text("두 개요", 160.00, 160.50, 161.20))
+
+    assert ar._speech_start_time == 160.00
+    assert ar._last_speaking_time == 160.50
+    ar._run_eou_detection.assert_called_once()
+
+
 async def test_ack_after_the_gate_closed_does_not_get_the_retired_turn_clock_back() -> None:
     ar = _recognition(aligned=False)
 

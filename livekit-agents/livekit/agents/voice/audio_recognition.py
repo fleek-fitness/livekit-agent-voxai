@@ -1645,6 +1645,9 @@ class AudioRecognition:
             return
         if held.cleared_clock and self._speech_start_time is None:
             self._speech_start_time = segment.start
+            if self._last_speaking_time is None and segment.end is not None:
+                # without it the final's arrival is taken as the end of speech
+                self._last_speaking_time = segment.end
             held.cleared_clock = False
         if held.cleared_span and self._user_turn_start is None:
             self._ensure_user_turn_span(start_time=segment.start)
