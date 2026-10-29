@@ -436,6 +436,29 @@ async def test_turn_owner(name: str, aligned: bool) -> None:
     ar._hooks.on_end_of_turn.assert_not_called()  # type: ignore[attr-defined]
 
 
+async def test_late_final_answer_gives_the_turn_clock_back_to_the_earlier_segment() -> None:
+    # A is judged a backchannel before its final arrives, so its clock is retired and the next
+    # segment B takes it. A's untimed final then turns out to be a real answer: A is the earliest
+    # segment that can start a turn again, and the clock and the span follow it.
+    ar = _recognition(aligned=False)
+
+    await _play(
+        ar,
+        [
+            Sos(148.00),
+            Verdict(148.60, 148.00),
+            Eos(149.00),
+            Sos(150.00),
+            Text("그런데 말이죠", 148.00, 149.00, 150.20),
+            AgentEnd(150.30),
+        ],
+    )
+
+    assert ar._user_turn_start == 148.00
+    assert ar._speech_start_time == 148.00
+    assert _replayed(ar) == ["그런데 말이죠"]
+
+
 async def test_transcription_timeout_is_not_reported_for_a_retired_backchannel() -> None:
     ar = _recognition(aligned=True, transcription_timeout=0.05)
     await _play(ar, [Sos(A1), Verdict(A1 + 0.6, A1), Eos(A1 + 0.39)])

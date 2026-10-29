@@ -900,9 +900,14 @@ class AudioRecognition:
         candidates = [s for s in held.segments if not self._held_segment_settled(s)]
         owner = candidates[0] if candidates else None
         retired = {s.start for s in held.segments if s not in candidates}
+        # a later candidate's start is stale once an earlier segment becomes a candidate again
+        # (a late final turns out to be a real answer)
+        later = {s.start for s in candidates[1:]}
 
-        if self._speech_start_time in retired or (
-            self._speech_start_time is None and held.cleared_clock
+        if (
+            self._speech_start_time in retired
+            or (self._speech_start_time in later and owner is not None)
+            or (self._speech_start_time is None and held.cleared_clock)
         ):
             if owner is not None:
                 self._speech_start_time = owner.start
@@ -921,7 +926,11 @@ class AudioRecognition:
         start = owner.start if owner is not None else self._speech_start_time
         if start in retired:
             start = None
-        if self._user_turn_start in retired or (
+        if self._user_turn_start in later and owner is not None:
+            self._end_user_turn_span()
+            self._ensure_user_turn_span(start_time=owner.start)
+            held.cleared_span = False
+        elif self._user_turn_start in retired or (
             self._user_turn_start is None and held.cleared_span
         ):
             if self._user_turn_start is not None:
