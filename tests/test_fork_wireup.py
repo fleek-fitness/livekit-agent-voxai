@@ -9,7 +9,11 @@ import pytest
 from livekit.agents import llm
 from livekit.agents.voice import PreemptiveGenerationOutcomeEvent
 from livekit.agents.voice.agent_activity import AgentActivity, _PreemptiveGeneration
-from livekit.agents.voice.audio_recognition import AudioRecognition, _PreemptiveGenerationInfo
+from livekit.agents.voice.audio_recognition import (
+    AudioRecognition,
+    _HeldSegments,
+    _PreemptiveGenerationInfo,
+)
 from livekit.agents.voice.dynamic_interruption import DynamicInterruptionManager
 
 pytestmark = pytest.mark.unit
@@ -39,6 +43,7 @@ def _activity(opts: SimpleNamespace) -> AgentActivity:
 
 def _audio_recognition(opts: SimpleNamespace, multiplier: float) -> AudioRecognition:
     audio_recognition = AudioRecognition.__new__(AudioRecognition)
+    audio_recognition._held_segments = _HeldSegments()
     audio_recognition._session = SimpleNamespace(options=opts)
     audio_recognition._hooks = SimpleNamespace(
         _dynamic_interruption=SimpleNamespace(get_endpointing_multiplier=lambda: multiplier)

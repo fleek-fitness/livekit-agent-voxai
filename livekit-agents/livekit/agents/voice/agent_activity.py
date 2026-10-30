@@ -45,7 +45,10 @@ from ..telemetry import (
 from ..tokenize.basic import split_words
 from ..types import NOT_GIVEN, FlushSentinel, NotGivenOr
 from ..utils.misc import is_given
-from ._ignore_words import matches_ignore_words as _matches_ignore_words
+from ._ignore_words import (
+    matches_ignore_words as _matches_ignore_words,
+    matches_ignore_words_exactly,
+)
 from ._utils import _set_participant_attributes
 from .agent import (
     Agent,
@@ -2773,7 +2776,16 @@ class AgentActivity(RecognitionHooks):
         )
         return decision
 
-    def _consume_delayed_interruption_turn(self, info: _EndOfTurnInfo, *, reason: str) -> bool:
+    def _consume_delayed_interruption_turn(
+        self, info: _EndOfTurnInfo, *, reason: str, during_agent_speech: bool = False
+    ) -> bool:
+        """Record a turn that must neither interrupt the agent nor get a reply.
+
+        The transcript becomes a user message at the moment the turn ends, carrying its speech
+        timing, and the turn is committed so AudioRecognition clears its buffer. Leaving the
+        buffer in place instead would prepend this text, and its start time, to the next turn.
+        `during_agent_speech` is True when the interruptible agent speech is still playing.
+        """
         self._cancel_preemptive_generation(reason=reason)
         self._clear_user_speech_interruption_context()
         if info.new_transcript:
@@ -2782,14 +2794,58 @@ class AgentActivity(RecognitionHooks):
                 content=[info.new_transcript],
                 transcript_confidence=info.transcript_confidence,
             )
+            user_message.metrics = self._init_metrics_from_end_of_turn(info)
             user_message.extra[DELAYED_INTERRUPTION_CONSUMED_EXTRA_KEY] = True
             self._agent._chat_ctx.items.append(user_message)
             self._session._conversation_item_added(user_message)
-        logger.warning(
-            "consuming delayed interruption transcript",
-            extra={"user_input": info.new_transcript, "reason": reason},
-        )
+        if during_agent_speech:
+            # fires on every backchannel over the agent: not a warning
+            logger.info(
+                "consuming ignored interruption transcript",
+                extra={"user_input": info.new_transcript, "reason": reason},
+            )
+        else:
+            logger.warning(
+                "consuming delayed interruption transcript",
+                extra={"user_input": info.new_transcript, "reason": reason},
+            )
         return True
+
+    def on_held_ignore_word_discarded(
+        self,
+        ev: stt.SpeechEvent,
+        *,
+        started_speaking_at: float,
+        stopped_speaking_at: float,
+    ) -> None:
+        """Record an ignore word that the transcript gate trimmed as a backchannel.
+
+        It never reaches on_end_of_turn, so it is recorded here the way
+        _consume_delayed_interruption_turn records one: a user message without a reply,
+        placed in the chat context at the time it was spoken.
+        """
+        alt = ev.alternatives[0]
+        transcript = alt.text.strip()
+        metrics: llm.MetricsReport = {
+            "started_speaking_at": started_speaking_at,
+            "stopped_speaking_at": stopped_speaking_at,
+        }
+        if self.stt:
+            metrics["stt_metadata"] = self.stt.metrics_metadata
+        user_message = llm.ChatMessage(
+            role="user",
+            content=[transcript],
+            transcript_confidence=alt.confidence,
+            created_at=started_speaking_at,
+            metrics=metrics,
+        )
+        user_message.extra[DELAYED_INTERRUPTION_CONSUMED_EXTRA_KEY] = True
+        self._agent._chat_ctx.insert(user_message)
+        self._session._conversation_item_added(user_message)
+        logger.info(
+            "consuming ignored interruption transcript",
+            extra={"user_input": transcript, "reason": "transcript_gate_trimmed"},
+        )
 
     def on_end_of_turn(self, info: _EndOfTurnInfo) -> bool:
         # IMPORTANT: This method is sync to avoid it being cancelled by the AudioRecognition
@@ -2853,6 +2909,8 @@ class AgentActivity(RecognitionHooks):
                 if delayed_interruption_context and self._delayed_ack_is_answer(info):
                     delayed_ack_answer = True
                 else:
+                    # below the word threshold the transcript keeps accumulating: words spoken
+                    # after it count towards the threshold that interrupts the agent
                     self._cancel_preemptive_generation(reason="min_interruption_words")
                     if delayed_interruption_context:
                         return self._consume_delayed_interruption_turn(
@@ -2876,13 +2934,18 @@ class AgentActivity(RecognitionHooks):
                 ):
                     if delayed_interruption_context and self._delayed_ack_is_answer(info):
                         pass
+                    elif delayed_interruption_context or matches_ignore_words_exactly(
+                        info.new_transcript, opts.interruption_ignore_words
+                    ):
+                        return self._consume_delayed_interruption_turn(
+                            info,
+                            reason="interruption_ignore_words",
+                            during_agent_speech=current_speech_interruptible,
+                        )
                     else:
+                        # a loose match (a single character, or the prefix of an ignore word)
+                        # keeps accumulating like a turn below the word threshold
                         self._cancel_preemptive_generation(reason="interruption_ignore_words")
-                        if delayed_interruption_context:
-                            return self._consume_delayed_interruption_turn(
-                                info,
-                                reason="interruption_ignore_words",
-                            )
                         return False
 
         # avoid interruption if backchannel is detected with realtime model. an unjudged overlap

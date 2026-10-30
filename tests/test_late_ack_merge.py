@@ -22,13 +22,13 @@ import pytest
 
 from livekit.agents import Agent, stt, vad
 from livekit.agents.llm import ChatContext
-from livekit.agents.voice._ignore_words import matches_ignore_words_exactly
+from livekit.agents.voice._ignore_words import matches_ignore_words, matches_ignore_words_exactly
 from livekit.agents.voice.agent_activity import (
     ActivityClosedError,
     AgentActivity,
     _matches_ignore_words,
 )
-from livekit.agents.voice.audio_recognition import AudioRecognition
+from livekit.agents.voice.audio_recognition import AudioRecognition, _HeldSegments
 from livekit.agents.voice.events import ConversationItemAddedEvent
 
 from .fake_session import FakeActions, create_session, run_session
@@ -291,6 +291,7 @@ INPUT_STARTED = 50.0
 
 def _recognition(**overrides: Any) -> AudioRecognition:
     ar = AudioRecognition.__new__(AudioRecognition)
+    ar._held_segments = _HeldSegments()
     state: dict[str, Any] = {
         "_vad_base_turn_detection": True,
         "_vad": object(),
@@ -447,6 +448,7 @@ def test_vad_segments_are_classified_against_the_agent_speech() -> None:
 
 def test_start_of_agent_speech_drops_the_stale_newer_segment() -> None:
     ar = AudioRecognition.__new__(AudioRecognition)
+    ar._held_segments = _HeldSegments()
     ar._post_agent_vad_segment_start = NEWER_SEGMENT_START
     ar._interruption_enabled = False
     ar._interruption_ch = None
@@ -651,6 +653,15 @@ def test_exact_matcher_rejects_a_prefix_of_an_ignore_word() -> None:
 def test_exact_matcher_accepts_ack_only_text(text: str) -> None:
     assert matches_ignore_words_exactly(text, IGNORE_WORDS) is True
     assert _recognition()._is_late_ack_final(_final(text), text) is True
+
+
+@pytest.mark.parametrize("text", ["넵", "넵."])
+def test_word_missing_from_the_list_is_not_an_exact_ack(text: str) -> None:
+    # "넵" is not in this list: the exact matcher used by the gate and the end-of-turn path
+    # rejects it, while the loose matcher accepts it as a one-syllable filler
+    assert matches_ignore_words_exactly(text, IGNORE_WORDS) is False
+    assert matches_ignore_words(text, IGNORE_WORDS) is True
+    assert matches_ignore_words_exactly(text, [*IGNORE_WORDS, "넵"]) is True
 
 
 def test_exact_matcher_needs_ignore_words() -> None:
