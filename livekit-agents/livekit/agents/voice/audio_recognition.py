@@ -890,12 +890,8 @@ class AudioRecognition:
         held = self._held_segments
         if not held.segments:
             return
-        if (
-            self._audio_transcript
-            or self._audio_interim_transcript
-            or self._audio_preflight_transcript
-        ):
-            # text already in the turn owns its clock
+        if self._audio_transcript:
+            # a final already in the turn owns its clock; an interim alone may still vanish
             return
         candidates = [s for s in held.segments if not self._held_segment_settled(s)]
         owner = candidates[0] if candidates else None

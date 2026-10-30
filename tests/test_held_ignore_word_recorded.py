@@ -594,6 +594,39 @@ async def test_ack_consumed_while_the_answer_is_held_keeps_the_answer_clock() ->
     ar._process_stt_event.assert_not_called()  # type: ignore[attr-defined]
 
 
+@pytest.mark.parametrize("aligned", [True, False])
+async def test_vanished_interim_does_not_keep_the_consumed_ack_clock_for_the_answer(
+    aligned: bool,
+) -> None:
+    ack_start, answer_start = 148.91, 169.05
+    ar = _recognition()
+    ar._stt_aligned_transcript = aligned
+    activity, added = _activity(llm.ChatContext.empty())
+    activity._create_speech_task = MagicMock()  # type: ignore[method-assign]
+    ar._hooks.on_held_ignore_word_discarded.side_effect = activity.on_held_ignore_word_discarded
+    ar._on_start_of_agent_speech(started_at=AGENT_START)
+
+    _user_speech_starts(ar, ack_start)
+    _user_speech_ends(ar, ack_start + 0.3)
+    await ar._on_stt_event(
+        _ack_final(aligned, start=ack_start, end=ack_start + 0.3, created_at=151.0)
+    )
+    # an interim reached the turn and no final ever follows it: the text is only an interim
+    ar._audio_interim_transcript = "내"
+    _verdict(ar, is_interruption=False, at=ack_start + 0.5, started=ack_start)
+
+    assert [item.text_content for item in added] == ["네."]
+    # the interim alone does not own the clock: the consumed ack's clock is retired
+    assert ar._speech_start_time is None
+    assert ar._user_turn_start is None
+
+    _user_speech_starts(ar, answer_start)
+    assert ar._speech_start_time == answer_start
+    assert ar._user_turn_start == answer_start
+    activity._create_speech_task.assert_not_called()  # type: ignore[attr-defined]
+    ar._hooks.on_end_of_turn.assert_not_called()  # type: ignore[attr-defined]
+
+
 async def _ack_judged_before_its_final(
     ar: AudioRecognition, start: float, *, interim: str | None = None
 ) -> None:
