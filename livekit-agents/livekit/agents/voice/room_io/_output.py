@@ -5,6 +5,7 @@ import json
 import math
 import time
 from collections import deque
+from typing import NamedTuple
 
 from google.protobuf.json_format import MessageToDict
 
@@ -30,6 +31,14 @@ from ...types import (
 )
 from .. import io
 from ..transcription import find_micro_track_id
+
+
+class PlaybackState(NamedTuple):
+    """Playhead of a room audio output, in seconds of source audio."""
+
+    position: float
+    run_offset: float
+    paused: bool
 
 
 class _ParticipantAudioOutput(io.AudioOutput):
@@ -165,6 +174,19 @@ class _ParticipantAudioOutput(io.AudioOutput):
             ended_at=time.time(),
         )
         self._interrupted_event.set()
+
+    def playback_state(self) -> PlaybackState:
+        """Public read of the playhead for consumers that pace work against playback.
+
+        ``position`` is the seconds of source audio played so far (what ``playback_progressed``
+        will report once the run ends), ``run_offset`` is where the open run started, and
+        ``paused`` is true while playback is held. Safe to call at any time and cheap.
+        """
+        return PlaybackState(
+            position=max(0.0, self._source_pushed_duration - self._audio_source.queued_duration),
+            run_offset=self._run_offset,
+            paused=not self._playback_enabled.is_set(),
+        )
 
     def pause(self) -> None:
         super().pause()
