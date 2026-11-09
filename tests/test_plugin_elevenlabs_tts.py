@@ -46,6 +46,7 @@ class _FakeStream:
         self._text_buffer = ""
         self._start_times_ms: list[int] = []
         self._durations_ms: list[int] = []
+        self._alignment_offset_ms = 0
 
 
 class _FakeConnection:
