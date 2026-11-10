@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import time
-from collections.abc import AsyncIterable, AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import AbstractContextManager, asynccontextmanager, nullcontext
 from contextvars import Token
 from dataclasses import dataclass
@@ -306,6 +306,11 @@ class AgentSessionOptions:
     session_close_transcript_timeout: float
     recording_options: RecordingOptions
 
+    interruption_ignore_words: list[str] | None = None
+    enable_dynamic_interruption: bool = False
+    conversation_continuity_threshold: float = 8.0
+    enable_adaptive_endpointing: bool = False
+
     @property
     def endpointing(self) -> EndpointingOptions:
         return self.turn_handling["endpointing"]
@@ -357,6 +362,7 @@ class VoiceActivityVideoSampler:
 
 
 DEFAULT_TTS_TEXT_TRANSFORMS: list[TextTransforms] = ["filter_markdown", "filter_emoji"]
+_CLOSE_STEP_CANCEL_TIMEOUT = 1.0
 
 
 class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
@@ -405,6 +411,10 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
         user_away_timeout: float | None = 15.0,
         transcription_timeout: float | None = None,
         session_close_transcript_timeout: float = 2.0,
+        interruption_ignore_words: list[str] | None = None,
+        enable_dynamic_interruption: bool = False,
+        conversation_continuity_threshold: float = 8.0,
+        enable_adaptive_endpointing: bool = False,
         # Runtime settings
         conn_options: NotGivenOr[SessionConnectOptions] = NOT_GIVEN,
         loop: asyncio.AbstractEventLoop | None = None,
@@ -597,6 +607,10 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
             aec_warmup_duration=resolved_aec_warmup_duration,
             session_close_transcript_timeout=session_close_transcript_timeout,
             recording_options=_RECORDING_ALL_OFF.copy(),
+            interruption_ignore_words=interruption_ignore_words,
+            enable_dynamic_interruption=enable_dynamic_interruption,
+            conversation_continuity_threshold=conversation_continuity_threshold,
+            enable_adaptive_endpointing=enable_adaptive_endpointing,
         )
         self._expressive: bool | ExpressiveOptions = expressive
         self._conn_options = conn_options or SessionConnectOptions()
@@ -673,6 +687,7 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
         self._update_activity_atask: asyncio.Task[None] | None = None
         self._activity_lock = asyncio.Lock()
         self._lock = asyncio.Lock()
+        self._close_step_tasks: set[asyncio.Future[Any]] = set()
 
         # used to keep a reference to the room io
         self._room_io: room_io.RoomIO | None = None
@@ -1231,6 +1246,107 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
             | None
         ) = None,
     ) -> None:
+        close_started_at = time.perf_counter()
+
+        async def await_close_step(awaitable: Awaitable[Any], *, stage: str) -> Any:
+            task = asyncio.ensure_future(awaitable)
+
+            def track_late_task() -> None:
+                if task.done() or task in self._close_step_tasks:
+                    return
+
+                self._close_step_tasks.add(task)
+
+                def on_done(completed: asyncio.Future[Any]) -> None:
+                    self._close_step_tasks.discard(completed)
+                    if completed.cancelled():
+                        return
+                    try:
+                        completed.result()
+                    except Exception:
+                        logger.exception(
+                            "agent session close step failed after parent cancellation",
+                            extra={"reason": reason.value, "stage": stage, "drain": drain},
+                        )
+
+                task.add_done_callback(on_done)
+
+            async def cancel_and_reap_task() -> None:
+                if task.done():
+                    return
+
+                task.cancel()
+                done: set[asyncio.Future[Any]] = set()
+                try:
+                    done, _ = await asyncio.wait(
+                        {task},
+                        timeout=_CLOSE_STEP_CANCEL_TIMEOUT,
+                    )
+                finally:
+                    track_late_task()
+
+                if task not in done:
+                    logger.warning(
+                        "agent session close step still running after cancellation",
+                        extra={
+                            "reason": reason.value,
+                            "stage": stage,
+                            "drain": drain,
+                            "timeout": _CLOSE_STEP_CANCEL_TIMEOUT,
+                        },
+                    )
+                elif not task.cancelled():
+                    try:
+                        task.result()
+                    except Exception:
+                        logger.exception(
+                            "agent session close step failed during cancellation",
+                            extra={"reason": reason.value, "stage": stage, "drain": drain},
+                        )
+
+            try:
+                # asyncio.wait does not propagate cancellation from this parent task to the
+                # cleanup task. This lets us distinguish a cancelled cleanup step from a
+                # cancellation request targeting the whole session close.
+                await asyncio.wait({task})
+            except asyncio.CancelledError:
+                # Deliberately exclude room, job, agent, and transcript identifiers.
+                current_task = asyncio.current_task()
+                cancelling = getattr(current_task, "cancelling", None)
+                logger.warning(
+                    "agent session close cancelled",
+                    extra={
+                        "reason": reason.value,
+                        "stage": stage,
+                        "drain": drain,
+                        "elapsed_ms": round((time.perf_counter() - close_started_at) * 1000, 1),
+                        "task_cancelling_count": cancelling() if callable(cancelling) else None,
+                        "started": bool(getattr(self, "_started", False)),
+                        "closing": bool(getattr(self, "_closing", False)),
+                        "has_activity": getattr(self, "_activity", None) is not None,
+                        "has_room_io": getattr(self, "_room_io", None) is not None,
+                        "has_recorder_io": getattr(self, "_recorder_io", None) is not None,
+                        "has_session_host": getattr(self, "_session_host", None) is not None,
+                    },
+                )
+                if not task.done():
+                    await cancel_and_reap_task()
+                raise
+
+            try:
+                return task.result()
+            except asyncio.CancelledError:
+                logger.warning(
+                    "agent session close step cancelled",
+                    extra={
+                        "reason": reason.value,
+                        "stage": stage,
+                        "drain": drain,
+                        "elapsed_ms": round((time.perf_counter() - close_started_at) * 1000, 1),
+                    },
+                )
+                return None
+
         if self._root_span_context:
             # make `activity.drain` and `on_exit` under the root span
             otel_context.attach(self._root_span_context)
@@ -1244,14 +1360,16 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
             self._on_aec_warmup_expired()  # always clear aec warmup when closing the session
 
             if self._amd is not None:
-                await self._amd.aclose()
+                await await_close_step(self._amd.aclose(), stage="amd_close")
                 self._amd = None
 
             activity = self._activity
             while activity and isinstance(agent_task := activity.agent, AgentTask):
                 # notify AgentTask to complete and wait it to resume the parent agent
                 agent_task.cancel()
-                await agent_task._wait_for_inactive()
+                await await_close_step(
+                    agent_task._wait_for_inactive(), stage="agent_task_wait_inactive"
+                )
 
                 if old_agent := agent_task._old_agent:
                     activity = old_agent._activity
@@ -1262,15 +1380,17 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
                 if not drain:
                     try:
                         # force interrupt speeches when closing the session
-                        await activity.interrupt(force=True)
+                        await await_close_step(
+                            activity.interrupt(force=True), stage="activity_interrupt"
+                        )
                     except RuntimeError:
                         # uninterruptible speech
                         pass
-                await activity.drain()
+                await await_close_step(activity.drain(), stage="activity_drain")
 
                 # wait any uninterruptible speech to finish
                 if activity.current_speech:
-                    await activity.current_speech
+                    await await_close_step(activity.current_speech, stage="current_speech_wait")
 
                 # detach the inputs and outputs
                 self.input.audio = None
@@ -1288,7 +1408,7 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
                         transcript_timeout=self._opts.session_close_transcript_timeout,
                     )
 
-                await activity.aclose()
+                await await_close_step(activity.aclose(), stage="activity_close")
             self._activity = None
 
             if self._agent_speaking_span:
@@ -1300,22 +1420,31 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
                 self._user_speaking_span = None
 
             if self._forward_audio_atask is not None:
-                await utils.aio.cancel_and_wait(self._forward_audio_atask)
+                await await_close_step(
+                    utils.aio.cancel_and_wait(self._forward_audio_atask),
+                    stage="forward_audio_cancel",
+                )
 
             if self._forward_video_atask is not None:
-                await utils.aio.cancel_and_wait(self._forward_video_atask)
+                await await_close_step(
+                    utils.aio.cancel_and_wait(self._forward_video_atask),
+                    stage="forward_video_cancel",
+                )
 
             if self._recorder_io:
-                await self._recorder_io.aclose()
+                await await_close_step(self._recorder_io.aclose(), stage="recorder_close")
 
             if self._ivr_activity is not None:
-                await self._ivr_activity.aclose()
+                await await_close_step(self._ivr_activity.aclose(), stage="ivr_activity_close")
 
             toolsets = [tool for tool in self._tools if isinstance(tool, llm.Toolset)]
             if toolsets:
-                await asyncio.gather(
-                    *(toolset.aclose() for toolset in toolsets),
-                    return_exceptions=True,
+                await await_close_step(
+                    asyncio.gather(
+                        *(toolset.aclose() for toolset in toolsets),
+                        return_exceptions=True,
+                    ),
+                    stage="toolsets_close",
                 )
 
             if self._session_span:
@@ -1340,12 +1469,12 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
                 )
 
             if self._session_host:
-                await self._session_host.aclose()
+                await await_close_step(self._session_host.aclose(), stage="session_host_close")
                 self._session_host = None
 
             # close room io after close event is emitted
             if self._room_io:
-                await self._room_io.aclose()
+                await await_close_step(self._room_io.aclose(), stage="room_io_close")
                 self._room_io = None
 
         logger.debug("session closed", extra={"reason": reason.value, "error": error})
@@ -1360,6 +1489,10 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
         turn_detection: NotGivenOr[TurnDetectionMode | None] = NOT_GIVEN,
         keyterms: NotGivenOr[list[str]] = NOT_GIVEN,
         expressive: NotGivenOr[bool | ExpressiveOptions] = NOT_GIVEN,
+        interruption_ignore_words: NotGivenOr[list[str] | None] = NOT_GIVEN,
+        enable_dynamic_interruption: NotGivenOr[bool] = NOT_GIVEN,
+        conversation_continuity_threshold: NotGivenOr[float] = NOT_GIVEN,
+        enable_adaptive_endpointing: NotGivenOr[bool] = NOT_GIVEN,
         # deprecated
         min_endpointing_delay: NotGivenOr[float] = NOT_GIVEN,
         max_endpointing_delay: NotGivenOr[float] = NOT_GIVEN,
@@ -1415,6 +1548,15 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
         if is_given(turn_detection):
             self._turn_detection = turn_detection
             self._turn_detection_explicit = turn_detection is not None
+
+        if is_given(interruption_ignore_words):
+            self._opts.interruption_ignore_words = interruption_ignore_words
+        if is_given(enable_dynamic_interruption):
+            self._opts.enable_dynamic_interruption = enable_dynamic_interruption
+        if is_given(conversation_continuity_threshold):
+            self._opts.conversation_continuity_threshold = conversation_continuity_threshold
+        if is_given(enable_adaptive_endpointing):
+            self._opts.enable_adaptive_endpointing = enable_adaptive_endpointing
 
         if self._activity is not None:
             self._activity.update_options(

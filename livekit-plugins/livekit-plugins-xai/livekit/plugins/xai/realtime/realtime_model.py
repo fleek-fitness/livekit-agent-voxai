@@ -120,6 +120,10 @@ class RealtimeModel(openai.realtime.RealtimeModel):
         if is_given(speed):
             init_kwargs["speed"] = speed
         super().__init__(**init_kwargs)
+        # OPENAI_API_VERSION belongs to Azure, but the OpenAI base class reads it
+        # from the environment even when this model targets the xAI endpoint.
+        self._opts.is_azure = False
+        self._opts.api_version = None
         self._capabilities.per_response_tool_choice = False
         # client turn-taking is not stable during testing, mark it as unsupported for now
         self._capabilities.can_disable_turn_detection = False

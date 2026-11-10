@@ -16,6 +16,7 @@ from livekit.agents import (
     AgentFalseInterruptionEvent,
     AgentSession,
     AgentStateChangedEvent,
+    AgentTask,
     APIConnectionError,
     ConversationItemAddedEvent,
     FlushSentinel,
@@ -31,6 +32,10 @@ from livekit.agents import (
     inference,
     vad,
 )
+from livekit.agents.inference.interruption import (
+    _AgentSpeechStartedSentinel,
+    _OverlapSpeechStartedSentinel,
+)
 from livekit.agents.llm import (
     FunctionTool,
     FunctionToolCall,
@@ -43,10 +48,11 @@ from livekit.agents.llm import (
 from livekit.agents.llm.chat_context import ChatContext, ChatMessage
 from livekit.agents.stt import SpeechData, SpeechEvent, SpeechEventType, STTError
 from livekit.agents.utils import aio
+from livekit.agents.voice import agent_session as agent_session_module
 from livekit.agents.voice.agent_activity import AgentActivity
 from livekit.agents.voice.audio_recognition import AudioRecognition, _EndOfTurnInfo
 from livekit.agents.voice.endpointing import BaseEndpointing
-from livekit.agents.voice.events import FunctionToolsExecutedEvent
+from livekit.agents.voice.events import CloseReason, FunctionToolsExecutedEvent
 from livekit.agents.voice.io import PlaybackFinishedEvent
 from livekit.agents.voice.tool_executor import UPDATE_TEMPLATE
 
@@ -99,6 +105,235 @@ class MyAgent(Agent):
 
         if self.on_user_turn_completed_delay > 0.0:
             await asyncio.sleep(self.on_user_turn_completed_delay)
+
+
+class _CancellingCloseActivity:
+    agent = object()
+    current_speech = None
+    _audio_recognition = None
+
+    def __init__(self) -> None:
+        self.close_called = False
+
+    async def interrupt(self, *, force: bool) -> None:
+        return None
+
+    async def drain(self) -> None:
+        raise asyncio.CancelledError
+
+    async def aclose(self) -> None:
+        self.close_called = True
+
+
+class _BlockingCloseActivity(_CancellingCloseActivity):
+    def __init__(self) -> None:
+        self.drain_started = asyncio.Event()
+        self.release_drain = asyncio.Event()
+
+    async def drain(self) -> None:
+        self.drain_started.set()
+        await self.release_drain.wait()
+
+
+class _SlowCancellingCloseActivity(_CancellingCloseActivity):
+    def __init__(self) -> None:
+        self.drain_started = asyncio.Event()
+        self.cancel_received = asyncio.Event()
+        self.release_after_cancel = asyncio.Event()
+
+    async def drain(self) -> None:
+        self.drain_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancel_received.set()
+            await self.release_after_cancel.wait()
+
+
+class _CancellingAgentTask(AgentTask[None]):
+    def __init__(self) -> None:
+        self._old_agent = None
+        self.cancel_called = False
+
+    def cancel(self) -> None:
+        self.cancel_called = True
+
+    async def _wait_for_inactive(self) -> None:
+        raise asyncio.CancelledError
+
+
+class _AgentTaskCloseActivity:
+    current_speech = None
+    _audio_recognition = None
+
+    def __init__(self, agent: AgentTask[None]) -> None:
+        self.agent = agent
+        self.close_called = False
+
+    async def interrupt(self, *, force: bool) -> None:
+        return None
+
+    async def drain(self) -> None:
+        return None
+
+    async def aclose(self) -> None:
+        self.close_called = True
+
+
+class _CloseRecorder:
+    def __init__(self) -> None:
+        self.close_called = False
+
+    async def aclose(self) -> None:
+        self.close_called = True
+
+
+def _create_closing_test_session(activity: object) -> AgentSession:
+    session = AgentSession.__new__(AgentSession)
+    session._root_span_context = None
+    session._lock = asyncio.Lock()
+    session._close_step_tasks = set()
+    session._started = True
+    session._closing = False
+    session._cancel_user_away_timer = Mock()
+    session._on_aec_warmup_expired = Mock()
+    session._amd = None
+    session._activity = activity
+    session._agent_speaking_span = None
+    session._user_speaking_span = None
+    session._forward_audio_atask = None
+    session._forward_video_atask = None
+    session._global_run_state = None
+    session._recorder_io = None
+    session._ivr_activity = None
+    session._tools = []
+    session._session_span = None
+    session._session_host = None
+    session._room_io = _CloseRecorder()
+    session._input = MagicMock(audio=object(), video=object())
+    session._output = MagicMock(audio=object(), transcription=object())
+    session.emit = Mock()
+    session._user_state = "listening"
+    session._agent_state = "initializing"
+    session._llm_error_counts = 0
+    session._tts_error_counts = 0
+    return session
+
+
+async def test_aclose_logs_cancelled_stage_without_identifiers(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    activity = _CancellingCloseActivity()
+    session = _create_closing_test_session(activity)
+    room_io = session._room_io
+
+    caplog.set_level(logging.WARNING, logger="livekit.agents")
+
+    await session._aclose_impl(reason=CloseReason.USER_INITIATED)
+
+    record = next(
+        record
+        for record in caplog.records
+        if record.message == "agent session close step cancelled"
+    )
+    fields = vars(record)
+    assert fields["reason"] == CloseReason.USER_INITIATED.value
+    assert fields["stage"] == "activity_drain"
+    assert fields["drain"] is False
+    assert {"room", "job", "agent", "transcript"}.isdisjoint(fields)
+    assert activity.close_called is True
+    assert room_io.close_called is True
+    assert session._started is False
+    session.emit.assert_called_once()
+
+
+async def test_aclose_logs_child_agent_task_cancellation(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    agent_task = _CancellingAgentTask()
+    activity = _AgentTaskCloseActivity(agent_task)
+    session = _create_closing_test_session(activity)
+
+    caplog.set_level(logging.WARNING, logger="livekit.agents")
+
+    await session._aclose_impl(reason=CloseReason.USER_INITIATED)
+
+    record = next(
+        record
+        for record in caplog.records
+        if record.message == "agent session close step cancelled"
+    )
+    assert agent_task.cancel_called is True
+    assert record.stage == "agent_task_wait_inactive"
+    assert activity.close_called is True
+
+
+async def test_aclose_preserves_parent_cancellation(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    activity = _BlockingCloseActivity()
+    session = _create_closing_test_session(activity)
+    close_task = asyncio.create_task(session._aclose_impl(reason=CloseReason.USER_INITIATED))
+
+    await activity.drain_started.wait()
+    close_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await close_task
+
+    record = next(
+        record for record in caplog.records if record.message == "agent session close cancelled"
+    )
+    assert record.stage == "activity_drain"
+    assert session._close_step_tasks == set()
+
+
+async def test_aclose_handles_task_without_cancelling_method(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    activity = _BlockingCloseActivity()
+    session = _create_closing_test_session(activity)
+    close_task = asyncio.create_task(session._aclose_impl(reason=CloseReason.USER_INITIATED))
+
+    await activity.drain_started.wait()
+    monkeypatch.setattr(asyncio, "current_task", lambda *args, **kwargs: object())
+    activity.release_drain.set()
+    close_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await close_task
+
+    record = next(
+        record for record in caplog.records if record.message == "agent session close cancelled"
+    )
+    assert record.task_cancelling_count is None
+
+
+async def test_aclose_tracks_child_that_outlives_parent_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(agent_session_module, "_CLOSE_STEP_CANCEL_TIMEOUT", 0.01)
+    activity = _SlowCancellingCloseActivity()
+    session = _create_closing_test_session(activity)
+    close_task = asyncio.create_task(session._aclose_impl(reason=CloseReason.USER_INITIATED))
+
+    await activity.drain_started.wait()
+    close_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await close_task
+
+    await activity.cancel_received.wait()
+    assert len(session._close_step_tasks) == 1
+
+    activity.release_after_cancel.set()
+    for _ in range(10):
+        if not session._close_step_tasks:
+            break
+        await asyncio.sleep(0)
+
+    assert session._close_step_tasks == set()
 
 
 SESSION_TIMEOUT = 60.0
@@ -163,7 +398,9 @@ def test_interim_transcript_interrupts_only_without_local_vad(
     assert len(captured_events) == 1
     assert captured_events[0].transcript == "hello"
     if should_interrupt:
-        activity._interrupt_by_audio_activity.assert_called_once_with()
+        activity._interrupt_by_audio_activity.assert_called_once_with(
+            source="interim", text_hint="hello"
+        )
     else:
         activity._interrupt_by_audio_activity.assert_not_called()
 
@@ -231,7 +468,14 @@ async def test_events_and_metrics() -> None:
     check_timestamp(agent_state_events[3].created_at - t_origin, 5.5, speed_factor=speed)
 
     # metrics
-    metrics_events = [ev for ev in metrics_events if ev.metrics.type != "vad_metrics"]
+    fork_metric_types = {
+        "agent_llm_metrics",
+        "response_latency_metrics",
+        "tool_execution_metrics",
+    }
+    metrics_events = [
+        ev for ev in metrics_events if ev.metrics.type not in ("vad_metrics", *fork_metric_types)
+    ]
     assert len(metrics_events) == 3
     assert metrics_events[0].metrics.type == "eou_metrics"
     check_timestamp(metrics_events[0].metrics.end_of_utterance_delay, 0.5, speed_factor=speed)
@@ -1350,6 +1594,112 @@ async def test_backchannel_boundary_suppresses_start_boundary_backchannel() -> N
         await _close_test_session(session)
 
 
+def _active_adaptive_recognition() -> tuple[AgentSession, AudioRecognition]:
+    session = create_session(
+        FakeActions(), turn_handling={"interruption": {"backchannel_boundary": None}}
+    )
+    detector = MagicMock()
+    detector.state = "active"
+    recognition = AudioRecognition(
+        session,
+        hooks=_TestRecognitionHooks(),
+        endpointing=BaseEndpointing(min_delay=0.1, max_delay=1.0),
+        stt=None,
+        vad=MagicMock(),
+        interruption_detection=detector,
+        turn_detection="vad",
+    )
+    recognition._interruption_ch = aio.Chan[inference.InterruptionDataFrameType]()
+    return session, recognition
+
+
+async def test_agent_start_connects_vad_speech_that_started_before_playout() -> None:
+    session, recognition = _active_adaptive_recognition()
+    recognition._speaking = True
+    recognition._vad_speech_started = True
+    recognition._speech_start_time = 100.0
+    recognition._active_vad_speech_started_at = 100.0
+
+    try:
+        recognition._on_start_of_agent_speech(started_at=100.7)
+
+        agent_started = recognition._interruption_ch.recv_nowait()
+        overlap_started = recognition._interruption_ch.recv_nowait()
+        assert isinstance(agent_started, _AgentSpeechStartedSentinel)
+        assert isinstance(overlap_started, _OverlapSpeechStartedSentinel)
+        assert overlap_started._speech_duration == pytest.approx(0.7)
+        assert overlap_started._started_at == 100.0
+        assert overlap_started._user_speaking_span is session._user_speaking_span
+        assert recognition._interruption_ch.empty()
+    finally:
+        recognition._interruption_ch.close()
+        await _close_test_session(session)
+
+
+async def test_agent_start_does_not_connect_vad_speech_that_already_ended() -> None:
+    session, recognition = _active_adaptive_recognition()
+    recognition._vad_speech_started = False
+    recognition._speech_start_time = 100.0
+    recognition._active_vad_speech_started_at = 100.0
+
+    try:
+        recognition._on_start_of_agent_speech(started_at=100.7)
+
+        assert isinstance(
+            recognition._interruption_ch.recv_nowait(),
+            _AgentSpeechStartedSentinel,
+        )
+        assert recognition._interruption_ch.empty()
+    finally:
+        recognition._interruption_ch.close()
+        await _close_test_session(session)
+
+
+async def test_agent_start_does_not_connect_stale_vad_segment_after_stt_eos() -> None:
+    session, recognition = _active_adaptive_recognition()
+    recognition._turn_detection_mode = "stt"
+    recognition._speaking = False
+    recognition._vad_speech_started = True
+    recognition._speech_start_time = 100.0
+    recognition._active_vad_speech_started_at = 100.0
+
+    try:
+        recognition._on_start_of_agent_speech(started_at=100.7)
+
+        assert isinstance(
+            recognition._interruption_ch.recv_nowait(),
+            _AgentSpeechStartedSentinel,
+        )
+        assert recognition._interruption_ch.empty()
+    finally:
+        recognition._interruption_ch.close()
+        await _close_test_session(session)
+
+
+async def test_vad_start_after_agent_uses_normal_overlap_path_once() -> None:
+    session, recognition = _active_adaptive_recognition()
+
+    try:
+        recognition._on_start_of_agent_speech(started_at=100.0)
+        assert isinstance(
+            recognition._interruption_ch.recv_nowait(),
+            _AgentSpeechStartedSentinel,
+        )
+
+        recognition._on_start_of_speech(
+            started_at=100.2,
+            speech_duration=0.05,
+        )
+        overlap_started = recognition._interruption_ch.recv_nowait()
+        assert isinstance(overlap_started, _OverlapSpeechStartedSentinel)
+        assert overlap_started._speech_duration == 0.05
+        assert overlap_started._started_at == 100.2
+        assert recognition._interruption_ch.empty()
+    finally:
+        recognition._interruption_ch.close()
+        await _close_test_session(session)
+
+
 async def _make_stt_eos_recognition() -> AudioRecognition:
     return AudioRecognition(
         create_session(FakeActions()),
@@ -1418,6 +1768,9 @@ async def test_backchannel_boundary_releases_end_boundary_transcript() -> None:
     )
     recognition._interruption_enabled = True
     recognition._interruption_ch = aio.Chan[inference.InterruptionDataFrameType]()
+    input_started_at = time.time() - 10.0
+    # the input anchor lives on the STT pipeline (see _STTPipeline.input_started_at)
+    recognition._stt_pipeline = SimpleNamespace(input_started_at=input_started_at)  # type: ignore[assignment]
 
     try:
         recognition._on_start_of_agent_speech(started_at=8.0)
@@ -2790,11 +3143,69 @@ async def test_runtime_endpointing_opts_survive_handoff() -> None:
         await session.aclose()
 
 
+async def test_ignore_word_final_keeps_paused_speech() -> None:
+    """A backchannel final ("네") must resume the paused speech, not kill it.
+
+    Before the fix, on_final_transcript unconditionally cancelled the speech
+    pause: the paused speech was interrupted while the ignore-word gate in
+    on_end_of_turn dropped the transcript without a reply — dead air.
+    """
+    speed = 5.0
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.5, "Tell me a story.")
+    actions.add_llm("Here is a long story for you ... the end.")
+    actions.add_tts(10.0)  # playout starts at 3.5s
+
+    # Backchannel while the agent is speaking. The VAD pause fires before the
+    # transcript is known; the final arrives after end-of-speech.
+    actions.add_user_speech(5.0, 5.8, "네", stt_delay=0.3)
+
+    session = create_session(
+        actions,
+        speed_factor=speed,
+        can_pause_audio=True,
+        turn_handling={"interruption": {"false_interruption_timeout": 0.3 / speed}},
+        extra_kwargs={"interruption_ignore_words": ["네"]},
+    )
+    agent = MyAgent()
+
+    agent_state_events: list[AgentStateChangedEvent] = []
+    false_interruption_events: list[AgentFalseInterruptionEvent] = []
+    playback_finished_events: list[PlaybackFinishedEvent] = []
+    session.on("agent_state_changed", agent_state_events.append)
+    session.on("agent_false_interruption", false_interruption_events.append)
+    session.output.audio.on("playback_finished", playback_finished_events.append)
+
+    await asyncio.wait_for(run_session(session, agent), timeout=SESSION_TIMEOUT)
+
+    # the pause was recognized as a false interruption and playback resumed
+    assert false_interruption_events
+    assert false_interruption_events[-1].resumed is True
+    transitions = [(ev.old_state, ev.new_state) for ev in agent_state_events]
+    assert ("listening", "speaking") in transitions[transitions.index(("speaking", "listening")) :]
+
+    # the story played to completion and the backchannel produced no reply
+    # (the "네" transcript itself may still be flushed into the chat context
+    # during session drain — only a generated reply would be a regression)
+    assert playback_finished_events[-1].interrupted is False
+    assistant_messages = [
+        item for item in agent.chat_ctx.items if item.type == "message" and item.role == "assistant"
+    ]
+    assert len(assistant_messages) == 1
+    assert assistant_messages[-1].interrupted is False
+
+
 class FlushMultiSegmentAgent(Agent):
     """Agent whose llm_node flushes the reply into two segments via FlushSentinel."""
 
     def __init__(self) -> None:
         super().__init__(instructions="You are a helpful assistant.")
+        self.playout_futs: list[asyncio.Future[bool]] = []
+
+    def _playout_fut(self) -> asyncio.Future[bool]:
+        fut = asyncio.get_running_loop().create_future()
+        self.playout_futs.append(fut)
+        return fut
 
     async def llm_node(
         self,
@@ -2803,8 +3214,97 @@ class FlushMultiSegmentAgent(Agent):
         model_settings: ModelSettings,
     ) -> AsyncIterable[str | FlushSentinel]:
         yield "Hello there. "
-        yield FlushSentinel()
+        yield FlushSentinel(playout_fut=self._playout_fut())
         yield "How are you?"
+        yield FlushSentinel(playout_fut=self._playout_fut())
+
+
+class EmptyAudioFlushMultiSegmentAgent(FlushMultiSegmentAgent):
+    async def tts_node(
+        self, text: AsyncIterable[str], model_settings: ModelSettings
+    ) -> AsyncIterable[rtc.AudioFrame]:
+        async for _ in text:
+            pass
+        if False:
+            yield
+
+
+class FailingAudioFlushMultiSegmentAgent(FlushMultiSegmentAgent):
+    def __init__(self, *, after_first_frame: bool) -> None:
+        super().__init__()
+        self.after_first_frame = after_first_frame
+
+    async def tts_node(
+        self, text: AsyncIterable[str], model_settings: ModelSettings
+    ) -> AsyncIterable[rtc.AudioFrame]:
+        async for _ in text:
+            pass
+        if self.after_first_frame:
+            yield rtc.AudioFrame(
+                data=b"\x00\x00" * 2400,
+                sample_rate=24000,
+                num_channels=1,
+                samples_per_channel=2400,
+            )
+        raise RuntimeError("synthetic TTS failure")
+
+
+class DelayedTicketAgent(FlushMultiSegmentAgent):
+    async def llm_node(
+        self,
+        chat_ctx: ChatContext,
+        tools: list,
+        model_settings: ModelSettings,
+    ) -> AsyncIterable[str | FlushSentinel]:
+        fut = self._playout_fut()
+        yield "Hello "
+        await asyncio.sleep(0.1)
+        yield "there."
+        yield FlushSentinel(playout_fut=fut)
+
+    async def transcription_node(
+        self, text: AsyncIterable[str], model_settings: ModelSettings
+    ) -> AsyncIterable[str]:
+        async for delta in text:
+            yield delta
+            return
+
+
+class EmptyTicketAgent(FlushMultiSegmentAgent):
+    async def llm_node(
+        self,
+        chat_ctx: ChatContext,
+        tools: list,
+        model_settings: ModelSettings,
+    ) -> AsyncIterable[str | FlushSentinel]:
+        yield FlushSentinel(playout_fut=self._playout_fut())
+
+
+class PreemptiveTicketAgent(FlushMultiSegmentAgent):
+    def __init__(self) -> None:
+        super().__init__()
+        self.generation_count = 0
+
+    async def on_user_turn_completed(self, turn_ctx: ChatContext, new_message: ChatMessage) -> None:
+        await asyncio.sleep(0.4)
+
+    async def llm_node(
+        self,
+        chat_ctx: ChatContext,
+        tools: list,
+        model_settings: ModelSettings,
+    ) -> AsyncIterable[str | FlushSentinel]:
+        self.generation_count += 1
+        first = "Hello there. " if self.generation_count == 1 else "Starting over. "
+        second = "How are you?" if self.generation_count == 1 else "What next?"
+        yield first
+        yield FlushSentinel(playout_fut=self._playout_fut())
+        yield second
+        yield FlushSentinel(playout_fut=self._playout_fut())
+
+
+def test_flush_sentinel_keeps_identity_equality() -> None:
+    assert FlushSentinel() != FlushSentinel()
 
 
 async def test_pipeline_multi_segment_flush() -> None:
@@ -2827,6 +3327,7 @@ async def test_pipeline_multi_segment_flush() -> None:
     # each FlushSentinel-delimited segment plays out independently
     assert len(playback_finished_events) == 2
     assert all(not ev.interrupted for ev in playback_finished_events)
+    assert [fut.result() for fut in agent.playout_futs] == [True, True]
 
     # but both segments join into a single assistant message
     assistant_msgs = [
@@ -2858,6 +3359,7 @@ async def test_pipeline_multi_segment_interrupted() -> None:
     # segment is never forwarded
     assert len(playback_finished_events) == 1
     assert playback_finished_events[0].interrupted is True
+    assert [fut.result() for fut in agent.playout_futs] == [True, False]
 
     assistant_msgs = [
         it for it in agent.chat_ctx.items if it.type == "message" and it.role == "assistant"
@@ -2865,3 +3367,99 @@ async def test_pipeline_multi_segment_interrupted() -> None:
     assert len(assistant_msgs) == 1
     assert assistant_msgs[0].interrupted is True
     assert "How are you?" not in (assistant_msgs[0].text_content or "")
+
+
+async def test_pipeline_playout_ticket_is_false_without_audio() -> None:
+    speed = 5.0
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.5, "Hello, how are you?", stt_delay=0.2)
+
+    session = create_session(actions, speed_factor=speed)
+    agent = EmptyAudioFlushMultiSegmentAgent()
+
+    await asyncio.wait_for(run_session(session, agent), timeout=SESSION_TIMEOUT)
+
+    assert [fut.result() for fut in agent.playout_futs] == [False, False]
+
+
+@pytest.mark.parametrize(
+    ("after_first_frame", "expected"),
+    [(False, False), (True, True)],
+)
+async def test_pipeline_playout_ticket_tracks_tts_failure(
+    after_first_frame: bool, expected: bool
+) -> None:
+    speed = 5.0
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.5, "Hello, how are you?", stt_delay=0.2)
+
+    session = create_session(actions, speed_factor=speed)
+    agent = FailingAudioFlushMultiSegmentAgent(after_first_frame=after_first_frame)
+
+    await asyncio.wait_for(run_session(session, agent), timeout=SESSION_TIMEOUT)
+
+    assert [fut.result() for fut in agent.playout_futs] == [expected, False]
+
+
+async def test_pipeline_playout_ticket_is_false_for_empty_segment() -> None:
+    speed = 5.0
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.5, "Hello, how are you?", stt_delay=0.2)
+
+    session = create_session(actions, speed_factor=speed)
+    agent = EmptyTicketAgent()
+
+    await asyncio.wait_for(run_session(session, agent), timeout=SESSION_TIMEOUT)
+
+    assert [fut.result() for fut in agent.playout_futs] == [False]
+
+
+async def test_pipeline_playout_ticket_is_false_when_outputs_are_disabled() -> None:
+    speed = 5.0
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.5, "Hello, how are you?", stt_delay=0.2)
+
+    session = create_session(actions, speed_factor=speed)
+    session.output.set_audio_enabled(False)
+    session.output.set_transcription_enabled(False)
+    agent = FlushMultiSegmentAgent()
+
+    await asyncio.wait_for(run_session(session, agent), timeout=SESSION_TIMEOUT)
+
+    assert [fut.result() for fut in agent.playout_futs] == [False, False]
+
+
+async def test_pipeline_playout_ticket_can_arrive_after_output_finishes() -> None:
+    speed = 5.0
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.5, "Hello, how are you?", stt_delay=0.2)
+
+    session = create_session(actions, speed_factor=speed)
+    session.output.set_audio_enabled(False)
+    agent = DelayedTicketAgent()
+
+    await asyncio.wait_for(run_session(session, agent), timeout=SESSION_TIMEOUT)
+
+    assert [fut.result() for fut in agent.playout_futs] == [True]
+
+
+async def test_preemptive_cancel_finishes_buffered_playout_tickets() -> None:
+    speed = 5.0
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.0, "Tell me something", stt_delay=0.1)
+    actions.add_tts(1.0, input="Hello there. ", ttfb=0.1, duration=10.0)
+    actions.add_tts(1.0, input="How are you?", ttfb=0.1, duration=0.1)
+    actions.add_user_speech(2.6, 3.2, "Actually, start over", stt_delay=0.1)
+    actions.add_tts(1.0, input="Starting over. ", ttfb=0.1, duration=0.1)
+    actions.add_tts(1.0, input="What next?", ttfb=0.1, duration=0.1)
+
+    session = create_session(
+        actions,
+        speed_factor=speed,
+        turn_handling={"preemptive_generation": {"enabled": True, "preemptive_tts": True}},
+    )
+    agent = PreemptiveTicketAgent()
+
+    await asyncio.wait_for(run_session(session, agent, drain_delay=1.0), timeout=SESSION_TIMEOUT)
+
+    assert [fut.result() for fut in agent.playout_futs[:2]] == [False, False]

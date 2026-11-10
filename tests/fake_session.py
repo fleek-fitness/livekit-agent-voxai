@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
+from collections.abc import Callable
 from typing import Any
 
 from livekit.agents import (
@@ -99,7 +100,21 @@ def create_session(
     return session
 
 
-async def run_session(session: AgentSession, agent: Agent, *, drain_delay: float = 5) -> float:
+async def run_session(
+    session: AgentSession,
+    agent: Agent,
+    *,
+    drain_delay: float = 5,
+    until: Callable[[], bool] | None = None,
+    until_timeout: float = 30.0,
+) -> float:
+    """Run the scripted session and tear it down.
+
+    `drain_delay` is a fixed settle time after the scripted user speech is done. With `until`,
+    the session first waits (polling, up to `until_timeout` seconds) for that condition, so a
+    test can wait for the record it expects instead of guessing how long the pipeline takes on a
+    loaded machine; `drain_delay` then only covers the "nothing else happens" settle.
+    """
     stt = session.stt
     audio_input = session.input.audio
     assert isinstance(audio_input, FakeAudioInput)
@@ -117,6 +132,11 @@ async def run_session(session: AgentSession, agent: Agent, *, drain_delay: float
     if stt is not None:
         assert isinstance(stt, FakeSTT)
         await stt.fake_user_speeches_done
+
+    if until is not None:
+        deadline = time.monotonic() + until_timeout
+        while not until() and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
 
     await asyncio.sleep(drain_delay)
     with contextlib.suppress(RuntimeError):

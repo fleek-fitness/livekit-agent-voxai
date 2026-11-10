@@ -134,9 +134,9 @@ class TTS(tts.TTS):
             voice_id (str): Voice ID. Defaults to `DEFAULT_VOICE_ID`.
             voice_settings (NotGivenOr[VoiceSettings]): Voice settings.
             model (TTSModels | str): TTS model to use. Defaults to "eleven_turbo_v2_5".
-                "eleven_v3" and "eleven_v3_conversational" go through ElevenLabs'
-                text-to-dialogue API instead (single voice per instance, same as
-                other models).
+                "eleven_v3", "eleven_v3_conversational", "eleven_v4" and "eleven_v4_turbo"
+                go through ElevenLabs' text-to-dialogue API instead (single voice per
+                instance, same as other models).
             api_key (NotGivenOr[str]): ElevenLabs API key. Can be set via argument or `ELEVEN_API_KEY` environment variable.
             base_url (NotGivenOr[str]): Custom base URL for the API. Optional.
             streaming_latency (NotGivenOr[int]): Optimize for streaming latency, defaults to 0 - disabled. 4 for max latency optimizations. deprecated
@@ -448,6 +448,7 @@ class SynthesizeStream(tts.SynthesizeStream):
         self._text_buffer = ""
         self._start_times_ms: list[int] = []
         self._durations_ms: list[int] = []
+        self._alignment_offset_ms = 0
         self._connection: _Connection | _DialogueConnection | None = None
 
     async def aclose(self) -> None:
@@ -458,6 +459,7 @@ class SynthesizeStream(tts.SynthesizeStream):
         self._text_buffer = ""
         self._start_times_ms = []
         self._durations_ms = []
+        self._alignment_offset_ms = 0
 
         sent_tokenizer_stream = self._opts.word_tokenizer.stream()
 
@@ -680,9 +682,20 @@ def _accumulate_alignment(
     chars: list[str] | None,
     starts: list[int] | None,
     durs: list[int] | None,
+    *,
+    chunk_relative: bool = False,
 ) -> None:
     if not (chars and starts and durs and len(chars) == len(starts) == len(durs)):
         return
+
+    if chunk_relative:
+        # text-to-dialogue restarts every message's char times at 0; make them stream-relative
+        # so words stay in order across messages.
+        base = stream._alignment_offset_ms
+        starts = [base + start for start in starts]
+        stream._alignment_offset_ms = max(
+            start + dur for start, dur in zip(starts, durs, strict=True)
+        )
 
     stream._text_buffer += "".join(chars)
     # in case item in chars has multiple characters
@@ -1172,6 +1185,7 @@ class _DialogueConnection(_Connection):
                         alignment.get("chars"),
                         alignment.get("char_start_times_ms"),
                         alignment.get("char_durations_ms"),
+                        chunk_relative=True,
                     )
 
                 if data.get("audio"):
