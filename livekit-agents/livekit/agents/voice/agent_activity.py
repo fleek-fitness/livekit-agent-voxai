@@ -85,6 +85,7 @@ from .generation import (
     _ForwardOutput,
     _inject_running_tool_calls,
     _interrupted_tool_output,
+    _release_running_tools,
     _strip_assistant_markup,
     _strip_running_tool_calls,
     _TextOutput,
@@ -3970,11 +3971,14 @@ class AgentActivity(RecognitionHooks):
             if self.interruption_enabled:
                 self._disable_vad_interruption_soon()
 
+        started_calls: list[llm.FunctionCall] = []
+
         # messages in RunResult are ordered by the `created_at` field
         def _tool_execution_started_cb(fnc_call: llm.FunctionCall) -> None:
             # function call is created during LLM generation, might be before the speech is authorized
             # reset the `created_at` to the start time of the tool execution
             fnc_call.created_at = time.time()
+            started_calls.append(fnc_call)
             speech_handle._item_added([fnc_call])
 
         def _tool_execution_completed_cb(out: ToolExecutionOutput) -> None:
@@ -4179,7 +4183,15 @@ class AgentActivity(RecognitionHooks):
         speech_handle._mark_generation_done()  # mark the playout done before waiting for the tool execution  # noqa: E501
 
         if speech_handle.interrupted:
-            await utils.aio.cancel_and_wait(exe_task)
+            timeout_cancel: asyncio.CancelledError | None = None
+            try:
+                await utils.aio.cancel_and_wait(exe_task)
+            except asyncio.CancelledError as e:
+                # the interruption timeout stopped waiting for the tools: release them as an
+                # async tool's first update does, and commit that update below
+                timeout_cancel = e
+                await _release_running_tools(self._session, started_calls, speech_handle)
+                await asyncio.wait([exe_task])
 
             # commit results of tools that finished despite the interruption (#3702), so
             # the next inference doesn't run them again
@@ -4199,6 +4211,8 @@ class AgentActivity(RecognitionHooks):
                 )
                 self._agent._chat_ctx.insert(interrupted_tool_messages)
                 self._session._tool_items_added(interrupted_tool_messages)
+            if timeout_cancel is not None:
+                raise timeout_cancel
             return
 
         # wait for the tool execution to complete
@@ -4736,12 +4750,15 @@ class AgentActivity(RecognitionHooks):
         )
         tasks.append(process_msg_task)
 
+        started_calls: list[llm.FunctionCall] = []
+
         # messages in RunResult are ordered by the `created_at` field
         def _tool_execution_started_cb(fnc_call: llm.FunctionCall) -> None:
             # function call is created during the realtime generation, before the assistant
             # message it belongs to is placed at `started_speaking_at`
             # reset the `created_at` to the start time of the tool execution
             fnc_call.created_at = time.time()
+            started_calls.append(fnc_call)
             speech_handle._item_added([fnc_call])
             self._agent._chat_ctx._upsert_item(fnc_call)
             self._session._tool_items_added([fnc_call])
@@ -4890,7 +4907,15 @@ class AgentActivity(RecognitionHooks):
         speech_handle._mark_generation_done()
 
         if speech_handle.interrupted:
-            await utils.aio.cancel_and_wait(exe_task)
+            timeout_cancel: asyncio.CancelledError | None = None
+            try:
+                await utils.aio.cancel_and_wait(exe_task)
+            except asyncio.CancelledError as e:
+                # the interruption timeout stopped waiting for the tools: release them as an
+                # async tool's first update does, and commit that update below
+                timeout_cancel = e
+                await _release_running_tools(self._session, started_calls, speech_handle)
+                await asyncio.wait([exe_task])
 
             # commit results of tools that finished despite the interruption, as the pipeline
             # task does. the calls are already recorded, so each one answers or the model waits
@@ -4921,6 +4946,8 @@ class AgentActivity(RecognitionHooks):
                         "failed to sync the tool results of an interrupted generation",
                         extra={"error": str(e)},
                     )
+            if timeout_cancel is not None:
+                raise timeout_cancel
             return
 
         # wait for the tool execution to complete
