@@ -74,7 +74,7 @@ async def test_concurrent_acquire_is_per_attempt_and_wait_count_balanced(caplog)
     launch = ProcPool.launch_job
     await asyncio.gather(
         *(
-            launch(pool, SimpleNamespace(job=SimpleNamespace(id=job)))
+            launch(pool, SimpleNamespace(job=SimpleNamespace(id=job), fake_job=False))
             for job in ["AJ_one", "AJ_two"]
         )
     )
@@ -94,7 +94,9 @@ async def test_acquire_cancellation_balances_wait_count(caplog):
         _jobs_waiting_for_process=0, _acquire_proc=acquire, _warmed_proc_queue=asyncio.Queue()
     )
     with pytest.raises(asyncio.CancelledError):
-        await ProcPool.launch_job(pool, SimpleNamespace(job=SimpleNamespace(id="AJ_cancel")))
+        await ProcPool.launch_job(
+            pool, SimpleNamespace(job=SimpleNamespace(id="AJ_cancel"), fake_job=False)
+        )
     assert pool._jobs_waiting_for_process == 0
     assert records(caplog)[0]["outcome"] == "failed_or_cancelled"
 
@@ -202,7 +204,9 @@ async def test_launch_retry_logs_distinct_attempts_and_preserves_retry_count(cap
         emit=lambda *args: None,
         _close_tasks=set(),
     )
-    await ProcPool.launch_job(pool, SimpleNamespace(job=SimpleNamespace(id="AJ_retry")))
+    await ProcPool.launch_job(
+        pool, SimpleNamespace(job=SimpleNamespace(id="AJ_retry"), fake_job=False)
+    )
     await asyncio.gather(*pool._close_tasks)
     launches = [r for r in records(caplog) if r["phase"] == "job_launch"]
     assert [r["attempt"] for r in launches] == [1, 2, 3]
