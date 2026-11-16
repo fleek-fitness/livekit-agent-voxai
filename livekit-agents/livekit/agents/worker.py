@@ -1512,7 +1512,7 @@ class AgentServer(utils.EventEmitter[EventTypes]):
                 fake_job=False,
             )
 
-            await self._proc_pool.launch_job(running_info)
+            await self._proc_pool.launch_job(running_info, reassignable=True)
 
         job_req = JobRequest(job=msg.job, on_reject=_on_reject, on_accept=_on_accept)
 

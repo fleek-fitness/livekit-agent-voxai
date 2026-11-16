@@ -26,9 +26,10 @@ EventTypes = Literal[
 
 MAX_CONCURRENT_INITIALIZATIONS = min(math.ceil(get_cpu_monitor().cpu_count()), 4)
 
-# A real job that waited longer than this for a process is not launched: LiveKit re-sends an
-# unanswered job to another worker after roughly 16s, and nothing tells this worker it lost it.
-# Normal waits are around 1s, and the margin leaves time to connect to the room before then.
+# A job assigned by the LiveKit server that waited longer than this for a process is not launched:
+# LiveKit re-sends an unanswered job to another worker after roughly 16s, and nothing tells this
+# worker it lost it. Normal waits are around 1s, and the margin leaves time to connect to the room
+# before then.
 MAX_JOB_PROCESS_WAIT_S = 10.0
 
 
@@ -168,7 +169,14 @@ class ProcPool(utils.EventEmitter[EventTypes]):
         )
         raise RuntimeError(f"no process became available after {MAX_ACQUIRE_ATTEMPTS} attempts")
 
-    async def launch_job(self, info: RunningJobInfo) -> None:
+    async def launch_job(self, info: RunningJobInfo, *, reassignable: bool = False) -> None:
+        """Run a job on a warm process.
+
+        Set ``reassignable`` for a job assigned by the LiveKit server, which may be handed to
+        another worker while this one waits for a process. Such a job is dropped, not launched,
+        once the wait exceeds ``MAX_JOB_PROCESS_WAIT_S``. Jobs started locally (simulated,
+        reloaded or connected by hand) are never reassigned and always launched.
+        """
         MAX_LAUNCH_ATTEMPTS = 3
         launch_requested_at = time.monotonic()
 
@@ -187,7 +195,7 @@ class ProcPool(utils.EventEmitter[EventTypes]):
                 self._jobs_waiting_for_process -= 1
 
             waited = time.monotonic() - launch_requested_at
-            if not info.fake_job and waited > MAX_JOB_PROCESS_WAIT_S:
+            if reassignable and waited > MAX_JOB_PROCESS_WAIT_S:
                 # LiveKit has most likely handed this job to another worker by now, and launching
                 # it here would run the same job twice. Give the idle process back and drop it.
                 self._warmed_proc_queue.put_nowait(proc)
