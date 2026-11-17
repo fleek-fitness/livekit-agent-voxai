@@ -27,7 +27,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from livekit.agents.vad import VADEvent, VADEventType
-from livekit.agents.voice.audio_recognition import AudioRecognition
+from livekit.agents.voice.audio_recognition import AudioRecognition, _HeldSegments
 
 pytestmark = [pytest.mark.unit, pytest.mark.virtual_time, pytest.mark.no_concurrent]
 
@@ -39,6 +39,7 @@ class TestUserTurnStartPersistence:
         """Create an AudioRecognition instance with mocked dependencies."""
         with patch.object(AudioRecognition, "__init__", lambda self, *args, **kwargs: None):
             audio_recognition = AudioRecognition.__new__(AudioRecognition)
+            audio_recognition._held_segments = _HeldSegments()
 
         # state read/written by _on_vad_event SOS/EOS branches
         audio_recognition._speech_start_time = None

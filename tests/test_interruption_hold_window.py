@@ -12,7 +12,7 @@ import pytest
 from livekit import rtc
 from livekit.agents import ModelSettings
 from livekit.agents.stt import SpeechData, SpeechEvent, SpeechEventType
-from livekit.agents.voice.audio_recognition import AudioRecognition, _STTPipeline
+from livekit.agents.voice.audio_recognition import AudioRecognition, _HeldSegments, _STTPipeline
 
 pytestmark = pytest.mark.unit
 
@@ -24,12 +24,22 @@ def _make_recognition(
     end_boundary: float = 1.0,
 ) -> AudioRecognition:
     recognition = AudioRecognition.__new__(AudioRecognition)
+    recognition._session = MagicMock()
+    recognition._session.options.interruption_ignore_words = []
     recognition._agent_speech_started_at = agent_sos
     recognition._active_vad_speech_started_at = vad_sos
     recognition._backchannel_boundary = (0.0, end_boundary)
     recognition._backchannel_boundary_timer = None
     recognition._transcript_buffer = deque()
     recognition._transcript_gate_active = True
+    recognition._held_segments = _HeldSegments()
+    recognition._audio_transcript = ""
+    recognition._audio_interim_transcript = ""
+    recognition._audio_preflight_transcript = ""
+    recognition._speech_start_time = None
+    recognition._user_turn_start = None
+    recognition._user_silence_ev = asyncio.Event()
+    recognition._user_silence_ev.set()
     recognition._stt_aligned_transcript = False
     recognition._hooks = MagicMock()
     recognition._hooks.interruption_by_audio_activity_enabled = False

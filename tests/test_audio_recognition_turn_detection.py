@@ -35,7 +35,7 @@ import pytest
 
 from livekit.agents import LanguageCode, vad
 from livekit.agents.utils import aio
-from livekit.agents.voice.audio_recognition import AudioRecognition
+from livekit.agents.voice.audio_recognition import AudioRecognition, _HeldSegments
 from livekit.agents.voice.turn import (
     TurnDetectionEvent,
     _StreamingTurnDetector,
@@ -53,6 +53,7 @@ def _make_full_recognition_for_eou() -> AudioRecognition:
     """Wire enough of AudioRecognition to drive `_run_eou_detection` against
     a fake audio turn-detector — used by the speaking-guard tests."""
     ar = AudioRecognition.__new__(AudioRecognition)
+    ar._held_segments = _HeldSegments()
     ar._session = MagicMock()
     ar._hooks = MagicMock()
     ar._hooks.on_end_of_turn.return_value = False  # don't commit
@@ -133,6 +134,7 @@ def _make_chat_ctx_stub() -> MagicMock:
 class TestLanguageTracking:
     def test_non_specific_language_does_not_replace_concrete_language(self) -> None:
         ar = AudioRecognition.__new__(AudioRecognition)
+        ar._held_segments = _HeldSegments()
         ar._last_language = LanguageCode("en")
 
         ar._update_last_language(LanguageCode("multi"), "ambiguous phrase")
@@ -141,6 +143,7 @@ class TestLanguageTracking:
 
     def test_non_specific_language_does_not_initialize_language(self) -> None:
         ar = AudioRecognition.__new__(AudioRecognition)
+        ar._held_segments = _HeldSegments()
         ar._last_language = None
 
         ar._update_last_language(LanguageCode("multi"), "we")
@@ -149,6 +152,7 @@ class TestLanguageTracking:
 
     def test_concrete_language_still_updates_after_long_transcript(self) -> None:
         ar = AudioRecognition.__new__(AudioRecognition)
+        ar._held_segments = _HeldSegments()
         ar._last_language = LanguageCode("en")
 
         ar._update_last_language(LanguageCode("fr"), "bonjour")
@@ -640,6 +644,7 @@ class _FakeVad:
 def _make_recognition_for_validation() -> AudioRecognition:
     """Minimal AudioRecognition wired for the VAD-silence validation — no tasks."""
     ar = AudioRecognition.__new__(AudioRecognition)
+    ar._held_segments = _HeldSegments()
     ar._vad = None
     ar._turn_detector = None
     ar._turn_detector_stream = None

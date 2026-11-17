@@ -31,6 +31,7 @@ from livekit.agents import stt
 from livekit.agents.voice.audio_recognition import (
     AudioRecognition,
     _compute_end_of_turn_metrics,
+    _HeldSegments,
 )
 
 pytestmark = pytest.mark.unit
@@ -44,6 +45,7 @@ def _make_recognition(
 ) -> AudioRecognition:
     """Wire the attributes ``_on_stt_event`` touches for transcript events."""
     ar = AudioRecognition.__new__(AudioRecognition)
+    ar._held_segments = _HeldSegments()
     ar._session = MagicMock()
     ar._session.amd = None
     ar._session._room_io = None

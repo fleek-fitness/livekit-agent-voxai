@@ -136,6 +136,122 @@ class _UserTurnTracker:
     started_at: float | None = None
 
 
+_TRANSCRIPT_EVENT_TYPES = (
+    stt.SpeechEventType.FINAL_TRANSCRIPT,
+    stt.SpeechEventType.INTERIM_TRANSCRIPT,
+    stt.SpeechEventType.PREFLIGHT_TRANSCRIPT,
+)
+
+
+@dataclass
+class _HeldSegment:
+    """A VAD segment that started during agent speech while the transcript gate held it."""
+
+    start: float
+    end: float | None = None
+    verdict: Literal["pending", "backchannel", "interruption"] = "pending"
+    # a final transcript was attributed to it
+    finalized: bool = False
+    # some of its held text was trimmed: that text never reaches a turn
+    consumed: bool = False
+
+
+class _HeldSegments:
+    """The overlap segments of the gate's agent speech, oldest first.
+
+    VAD onsets and ends and overlap verdicts are local and ordered, so they decide which segment
+    may own the turn clock. STT events are only attributed to a segment, to know whether its
+    text is still pending and, for untimed finals, where it was spoken.
+    """
+
+    def __init__(self) -> None:
+        self.segments: list[_HeldSegment] = []
+        # id(event) -> segment, for events still held in the transcript buffer
+        self._owners: dict[int, _HeldSegment] = {}
+        # the turn clock / span was cleared because every segment was settled; a segment that
+        # becomes a turn candidate again takes it back
+        self.cleared_clock = False
+        self.cleared_span = False
+
+    def reset(self) -> None:
+        self.segments.clear()
+        self._owners.clear()
+        self.cleared_clock = False
+        self.cleared_span = False
+
+    def forget_events(self) -> None:
+        self._owners.clear()
+
+    def open(self, start: float) -> None:
+        if self.segments and self.segments[-1].start == start:
+            return
+        if self.segments and self.segments[-1].end is None:
+            # VAD segments do not overlap: a new onset ends the previous one
+            self.segments[-1].end = start
+        self.segments.append(_HeldSegment(start=start))
+
+    def end_latest(self, ended_at: float) -> None:
+        if self.segments and self.segments[-1].end is None:
+            self.segments[-1].end = ended_at
+
+    def find(self, start: float | None) -> _HeldSegment | None:
+        """The segment an overlap verdict belongs to; the latest one when it has no start."""
+        if start is None:
+            return self.segments[-1] if self.segments else None
+        return next((s for s in reversed(self.segments) if s.start == start), None)
+
+    def ended(self, segment: _HeldSegment, *, speaking: bool) -> bool:
+        return segment.end is not None or segment is not self.segments[-1] or not speaking
+
+    def attribute(self, ev: SpeechEvent, *, speaking: bool) -> _HeldSegment | None:
+        """Attribute a held transcript event to the segment it was spoken in.
+
+        Timed events go by their end time. An untimed final follows the end of its speech, so
+        it belongs to the one ended segment still without a final; with several such segments
+        (one final late, another missing) it is ambiguous and stays unattributed.
+        """
+        if ev.type not in _TRANSCRIPT_EVENT_TYPES:
+            return None
+        segment = self._by_time(ev)
+        if segment is None and ev.speech_end_time is None and self.segments:
+            latest = self.segments[-1]
+            open_segment = latest if not self.ended(latest, speaking=speaking) else None
+            if ev.type == stt.SpeechEventType.FINAL_TRANSCRIPT:
+                unfinalized = [
+                    s for s in self.segments if s is not open_segment and not s.finalized
+                ]
+                if len(unfinalized) == 1:
+                    segment = unfinalized[0]
+                elif not unfinalized:
+                    segment = open_segment or latest
+            else:
+                segment = open_segment or latest
+        if segment is not None:
+            self._owners[id(ev)] = segment
+            if ev.type == stt.SpeechEventType.FINAL_TRANSCRIPT:
+                segment.finalized = True
+        return segment
+
+    def adopt(self, previous: SpeechEvent, ev: SpeechEvent) -> None:
+        if (segment := self._owners.pop(id(previous), None)) is not None:
+            self._owners[id(ev)] = segment
+
+    def owner_of(self, ev: SpeechEvent) -> _HeldSegment | None:
+        return self._owners.get(id(ev)) or self._by_time(ev)
+
+    def release(self, ev: SpeechEvent) -> _HeldSegment | None:
+        return self._owners.pop(id(ev), None) or self._by_time(ev)
+
+    def _by_time(self, ev: SpeechEvent) -> _HeldSegment | None:
+        if ev.speech_end_time is None:
+            return None
+        owner = None
+        for segment in self.segments:
+            if segment.start <= ev.speech_end_time:
+                owner = segment
+        return owner
+
+
 class RecognitionHooks(Protocol):
     @property
     def interruption_by_audio_activity_enabled(self) -> bool: ...
@@ -150,6 +266,13 @@ class RecognitionHooks(Protocol):
     def on_end_of_speech(self, ev: vad.VADEvent | None) -> None: ...
     def on_interim_transcript(self, ev: stt.SpeechEvent, *, speaking: bool | None) -> None: ...
     def on_final_transcript(self, ev: stt.SpeechEvent, *, speaking: bool | None = None) -> None: ...
+    def on_held_ignore_word_discarded(
+        self,
+        ev: stt.SpeechEvent,
+        *,
+        started_speaking_at: float,
+        stopped_speaking_at: float,
+    ) -> None: ...
     def on_transcription_timeout(self, *, speech_duration: float, turn_start: float) -> None: ...
     def on_end_of_turn(self, info: _EndOfTurnInfo) -> bool: ...
     def on_eot_prediction(self, ev: EotPredictionEvent) -> None: ...
@@ -354,6 +477,9 @@ class AudioRecognition:
         self._interruption_ch: aio.Chan[inference.InterruptionDataFrameType] | None = None
         self._transcript_buffer: deque[SpeechEvent] = deque()
         self._transcript_gate_active: bool = False
+        # overlap segments of the gated agent speech; the only owner of the turn clock while
+        # held segments are judged (see _recompute_turn_owner)
+        self._held_segments = _HeldSegments()
         self._interruption_enabled: bool = interruption_detection is not None and vad is not None
         # Tracks active audio playout, independently of the generation lifecycle.
         self._agent_speaking: bool = False
@@ -706,6 +832,10 @@ class AudioRecognition:
         # overlap over agent speech started this turn; gates verdict acceptance below
         self._overlap_in_current_turn = True
         self._overlap_open = True
+        if not self._transcript_gate_active:
+            self._held_segments.reset()
+        self._held_segments.open(started_at)
+        self._recompute_turn_owner()
         self._transcript_gate_active = True
         self._interruption_ch.send_nowait(  # type: ignore[union-attr]
             _OverlapSpeechStartedSentinel(
@@ -714,6 +844,113 @@ class AudioRecognition:
                 started_at=started_at,
             )
         )
+
+    def _held_segment_settled(self, segment: _HeldSegment) -> bool:
+        """Whether a held segment can no longer start a turn.
+
+        It has ended, was judged a backchannel or lost its held text to a trim, and none of its
+        held text is still pending. Whether its final arrived does not matter: a final that is
+        late, missing, or corrected from another interim must not keep its clock alive.
+        """
+        segments = self._held_segments
+        if not segments.ended(segment, speaking=self._speaking):
+            return False
+        if segment.verdict == "interruption":
+            return False
+        if segment.verdict != "backchannel" and not segment.consumed:
+            return False
+        ignore_words = self._session.options.interruption_ignore_words
+        # A held transcript that is not an exact ignore word may be a real answer. An interim
+        # or preflight followed by a final of the same segment was superseded by that final
+        # ("내" corrected to "네"); only the ones after its last final are still pending.
+        superseded = False
+        for event in reversed(self._transcript_buffer):
+            if event.type not in _TRANSCRIPT_EVENT_TYPES or segments.owner_of(event) is not segment:
+                continue
+            if event.type == stt.SpeechEventType.FINAL_TRANSCRIPT:
+                superseded = True
+            elif superseded:
+                continue
+            if (
+                event.alternatives
+                and event.alternatives[0].text
+                and not matches_ignore_words_exactly(event.alternatives[0].text, ignore_words)
+            ):
+                return False
+        return True
+
+    def _recompute_turn_owner(self) -> None:
+        """Keep the turn clock on the earliest held segment that can still start a turn.
+
+        This is the only place that moves the clock between held segments. The owner is a pure
+        function of the segments' state, recomputed on every change: an onset or end, a verdict,
+        a held transcript, a trim, and the end of agent speech. A clock that is not a held
+        segment's start (an earlier turn, a newer segment after the agent stopped) is left alone.
+        """
+        held = self._held_segments
+        if not held.segments:
+            return
+        if self._audio_transcript:
+            # a final already in the turn owns its clock; an interim alone may still vanish
+            return
+        candidates = [s for s in held.segments if not self._held_segment_settled(s)]
+        owner = candidates[0] if candidates else None
+        retired = {s.start for s in held.segments if s not in candidates}
+        # a later candidate's start is stale once an earlier segment becomes a candidate again
+        # (a late final turns out to be a real answer)
+        later = {s.start for s in candidates[1:]}
+
+        if (
+            self._speech_start_time in retired
+            or (self._speech_start_time in later and owner is not None)
+            or (self._speech_start_time is None and held.cleared_clock)
+        ):
+            if owner is not None:
+                self._restore_segment_clock(owner)
+                held.cleared_clock = False
+            elif not self._speaking or self._active_vad_speech_started_at in retired:
+                # (the VAD end of a retired segment is handled before _speaking is cleared)
+                self._speech_start_time = None
+                self._last_speaking_time = None
+                self._vad_speech_started = False
+                held.cleared_clock = True
+        elif self._speech_start_time is not None:
+            held.cleared_clock = False
+
+        # without a held candidate, a newer onset outside the held segments (speech after the
+        # agent stopped) owns the turn
+        start = owner.start if owner is not None else self._speech_start_time
+        if start in retired:
+            start = None
+        if self._user_turn_start in later and owner is not None:
+            self._end_user_turn_span()
+            self._ensure_user_turn_span(start_time=owner.start)
+            held.cleared_span = False
+        elif self._user_turn_start in retired or (
+            self._user_turn_start is None and held.cleared_span
+        ):
+            if self._user_turn_start is not None:
+                # EOU metrics read the span's start, not _speech_start_time
+                self._end_user_turn_span()
+                self._stt_request_ids = []
+                self._reset_transcription_timeout()
+                # a held final of the segment that takes the turn still counts as received
+                self._turn_transcript_received = any(
+                    ev.type == stt.SpeechEventType.FINAL_TRANSCRIPT
+                    and ev.alternatives
+                    and ev.alternatives[0].text
+                    and held.owner_of(ev) in candidates
+                    for ev in self._transcript_buffer
+                )
+                logger.debug(
+                    "retired held backchannel clock",
+                    extra={"retired_segments": len(retired), "has_owner": start is not None},
+                )
+            if start is not None:
+                self._ensure_user_turn_span(start_time=start)
+            held.cleared_span = start is None
+        elif self._user_turn_start is not None:
+            held.cleared_span = False
 
     def _on_end_of_speech(
         self,
@@ -728,6 +965,8 @@ class AudioRecognition:
             )
 
         self._on_end_of_overlap_speech(ended_at=ended_at, user_speaking_span=user_speaking_span)
+        self._held_segments.end_latest(ended_at)
+        self._recompute_turn_owner()
 
     def _on_end_of_overlap_speech(
         self,
@@ -807,6 +1046,49 @@ class AudioRecognition:
                 # so filtering later events can separate SOS, transcripts, and EOS.
                 break
             self._transcript_buffer.popleft()
+            self._record_discarded_ignore_word(event)
+            segment = self._held_segments.release(event)
+            if (
+                segment is not None
+                and event.type in _TRANSCRIPT_EVENT_TYPES
+                and event.alternatives
+                and event.alternatives[0].text
+            ):
+                # recorded or dropped, this text never reaches a turn
+                segment.consumed = True
+        self._recompute_turn_owner()
+
+    def _record_discarded_ignore_word(self, ev: stt.SpeechEvent) -> None:
+        """Hand a trimmed ignore-word final to the hooks so it is still recorded.
+
+        Trimming drops a backchannel's transcript so it never becomes a user turn. An ignore
+        word ("네") over the agent is often the customer's answer, so it is recorded where it
+        was spoken, without a turn or a reply. Other trimmed events are dropped as before.
+        """
+        if ev.type != stt.SpeechEventType.FINAL_TRANSCRIPT or not ev.alternatives:
+            return
+        alt = ev.alternatives[0]
+        if not matches_ignore_words_exactly(
+            alt.text, self._session.options.interruption_ignore_words
+        ):
+            return
+
+        # Known speech timing takes precedence; arrival time is the fallback. Word times are
+        # relative to the STT input only for aligned transcripts (_on_stt_event).
+        stopped_at = ev.speech_end_time if ev.speech_end_time is not None else ev.created_at
+        started_at = ev.speech_start_time
+        input_started_at = self._input_started_at
+        if (
+            started_at is None
+            and self._stt_aligned_transcript
+            and alt.start_time > 0
+            and input_started_at is not None
+        ):
+            started_at = input_started_at + alt.start_time
+        started_at = stopped_at if started_at is None else min(started_at, stopped_at)
+        self._hooks.on_held_ignore_word_discarded(
+            ev, started_speaking_at=started_at, stopped_speaking_at=stopped_at
+        )
 
     def _flush_held_transcripts(
         self,
@@ -833,14 +1115,20 @@ class AudioRecognition:
                 resolved_at=resolved_at,
                 vad_speech_started_at=vad_speech_started_at,
             )
+        # the gate is released: the remaining events replay into the turn. The segments stay
+        # until the next gated speech, so a verdict that lands after this still retires its
+        # backchannel's clock.
+        owners = [self._held_segments.owner_of(ev) for ev in self._transcript_buffer]
+        self._held_segments.forget_events()
 
         if not self._transcript_buffer:
             return
 
         events_to_emit = list(self._transcript_buffer)
         self._transcript_buffer.clear()
-        for ev in events_to_emit:
+        for ev, segment in zip(events_to_emit, owners, strict=True):
             logger.trace("re-emitting held STT event", extra={"event": ev.type})
+            self._restore_retired_turn_clock(ev, segment)
             self._process_stt_event(ev)
 
     def _set_interruption_enabled(self, enabled: bool) -> None:
@@ -992,6 +1280,7 @@ class AudioRecognition:
             self._stt_pipeline = pipeline
             # reset interruption handling related state
             self._transcript_buffer.clear()
+            self._held_segments.reset()
         else:
             self._cancel_transcription_timeout()
 
@@ -1132,6 +1421,7 @@ class AudioRecognition:
 
     def _clear_user_turn(self) -> None:
         self._clear_late_ack_wait()
+        self._held_segments.reset()
         self._agent_overlap_segment_unfinalized = False
         self._post_agent_vad_segment_start = None
         self._audio_transcript = ""
@@ -1308,11 +1598,67 @@ class AudioRecognition:
                 self._hooks.interruption_by_audio_activity_enabled = True
 
         if ev.type != stt.SpeechEventType.RECOGNITION_USAGE and self._transcript_gate_active:
+            segment = self._held_segments.attribute(ev, speaking=self._speaking)
+            # Unaligned providers may omit wall-clock timestamps. Take the VAD timing of the
+            # ended segment the final was attributed to.
+            if (
+                segment is not None
+                and ev.type == stt.SpeechEventType.FINAL_TRANSCRIPT
+                and ev.alternatives
+                and matches_ignore_words_exactly(
+                    ev.alternatives[0].text, self._session.options.interruption_ignore_words
+                )
+                and ev.speech_start_time is None
+                and ev.speech_end_time is None
+                and not self._stt_aligned_transcript
+                and not self._speaking
+                and (segment_end := segment.end or self._last_speaking_time) is not None
+                and self._agent_speech_started_at is not None
+                and self._agent_speech_started_at <= segment.start <= segment_end <= ev.created_at
+            ):
+                held = replace(ev, speech_start_time=segment.start, speech_end_time=segment_end)
+                self._held_segments.adopt(ev, held)
+                ev = held
             logger.trace("holding STT event during agent speech", extra={"event": ev.type})
             self._transcript_buffer.append(ev)
+            self._recompute_turn_owner()
             return
 
+        if self._held_segments.cleared_clock or self._held_segments.cleared_span:
+            self._restore_retired_turn_clock(
+                ev, self._held_segments.attribute(ev, speaking=self._speaking)
+            )
         self._process_stt_event(ev)
+
+    def _restore_segment_clock(self, segment: _HeldSegment) -> None:
+        self._speech_start_time = segment.start
+        if self._last_speaking_time is None and segment.end is not None:
+            # without it the final's arrival is taken as the end of speech
+            self._last_speaking_time = segment.end
+
+    def _restore_retired_turn_clock(
+        self, ev: stt.SpeechEvent, segment: _HeldSegment | None
+    ) -> None:
+        """Give a final that reaches the turn the clock its segment lost to a backchannel verdict.
+
+        A final that is replayed or arrives after the gate closed was not a pending candidate
+        when the clock was retired; without this the turn would start with no speech time at all.
+        A newer onset has set its own clock, which is left alone.
+        """
+        held = self._held_segments
+        if (
+            segment is None
+            or ev.type != stt.SpeechEventType.FINAL_TRANSCRIPT
+            or not ev.alternatives
+            or not ev.alternatives[0].text
+        ):
+            return
+        if held.cleared_clock and self._speech_start_time is None:
+            self._restore_segment_clock(segment)
+            held.cleared_clock = False
+        if held.cleared_span and self._user_turn_start is None:
+            self._ensure_user_turn_span(start_time=segment.start)
+            held.cleared_span = False
 
     def _process_stt_event(self, ev: stt.SpeechEvent) -> None:
         has_stt_end_time = bool(
@@ -1614,6 +1960,16 @@ class AudioRecognition:
             )
             return
 
+        # The verdict belongs to the overlap that started at overlap_started_at, even when it
+        # lands after a newer overlap started or after the agent stopped.
+        segment = (
+            self._held_segments.find(ev.overlap_started_at)
+            if self._transcript_gate_active or ev.overlap_started_at is not None
+            else None
+        )
+        if segment is not None and not ev.agent_ended:
+            segment.verdict = "interruption" if ev.is_interruption else "backchannel"
+
         if ev.is_interruption and self._transcript_gate_active:
             self._flush_held_transcripts(
                 resolved_at=ev.detected_at,
@@ -1624,6 +1980,8 @@ class AudioRecognition:
                 resolved_at=ev.detected_at,
                 vad_speech_started_at=self._active_vad_speech_started_at,
             )
+        else:
+            self._recompute_turn_owner()
 
         # only honor the verdict while this turn's overlap is unresolved so a late verdict
         # can't leak into the next turn; an interruption supersedes a prior backchannel
@@ -2010,6 +2368,8 @@ class AudioRecognition:
                 self._user_turn_start = None
                 self._stt_request_ids = []
                 self._reset_transcription_timeout()
+                # the held segments' clock went into this turn
+                self._held_segments.reset()
 
                 # clear the transcript if the user turn was committed
                 self._audio_transcript = ""

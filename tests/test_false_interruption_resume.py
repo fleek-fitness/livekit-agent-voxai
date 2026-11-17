@@ -21,6 +21,7 @@ from livekit.agents.voice.audio_recognition import (
     AudioRecognition,
     _EndOfTurnInfo,
     _EndOfTurnMetrics,
+    _HeldSegments,
 )
 from livekit.agents.voice.turn import (
     TurnDetectionEvent,
@@ -43,6 +44,7 @@ MAX_DELAY = 0.5
 def _recognition(hooks: AgentActivity, last_speaking_time: float) -> AudioRecognition:
     """AudioRecognition wired to drive one real eou bounce against ``hooks``."""
     ar = AudioRecognition.__new__(AudioRecognition)
+    ar._held_segments = _HeldSegments()
     ar._session = MagicMock()
     ar._hooks = hooks
     ar._stt = None  # realtime model, no STT
