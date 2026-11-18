@@ -3595,10 +3595,15 @@ class AgentActivity(RecognitionHooks):
                 assistant_metrics["playback_latency"] = started_speaking_at - started_forwarding_at
 
             # the audio answers the user turn, stored message or not
-            if _previous_user_metrics and "stopped_speaking_at" in _previous_user_metrics:
+            if (
+                _previous_user_metrics
+                and "stopped_speaking_at" in _previous_user_metrics
+                and _previous_user_metrics is not self._session._answered_user_metrics
+            ):
                 e2e_latency = started_speaking_at - _previous_user_metrics["stopped_speaking_at"]
                 assistant_metrics["e2e_latency"] = e2e_latency
                 current_span.set_attribute(trace_types.ATTR_E2E_LATENCY, e2e_latency)
+                self._session._answered_user_metrics = _previous_user_metrics
 
         if forwarded_text and add_to_chat_ctx:
             msg = self._agent._chat_ctx.add_message(

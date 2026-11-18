@@ -722,3 +722,31 @@ async def test_reply_from_timer_set_in_silent_tool_answers_nothing() -> None:
     messages = await _messages(actions, Router(), drain_delay=4.0)
     (greeting,) = _by_role(messages, "assistant")
     assert "e2e_latency" not in greeting.metrics
+
+
+async def test_tool_announcement_answers_the_turn() -> None:
+    """A tool says an announcement before it runs: the announcement answers, the tool reply does not."""
+
+    class Router(Agent):
+        def __init__(self) -> None:
+            super().__init__(instructions="router")
+
+        @function_tool
+        async def handoff(self, ctx: RunContext) -> str:
+            await self.session.say("one moment")
+            return "looked up"
+
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.5, "go")
+    actions.add_llm("", tool_calls=[HANDOFF_CALL])
+    actions.add_tts(1.0, input="one moment")
+    actions.add_llm("here is your answer", input="looked up")
+    actions.add_tts(1.0)
+
+    messages = await _messages(actions, Router(), drain_delay=4.0)
+    (user,) = _by_role(messages, "user")
+    announcement, answer = _by_role(messages, "assistant")
+    assert announcement.text_content == "one moment"
+    _assert_answers(announcement, user)
+    assert answer.text_content == "here is your answer"
+    assert "e2e_latency" not in answer.metrics
