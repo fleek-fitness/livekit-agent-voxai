@@ -128,6 +128,8 @@ class SpeechEvent:
     """Wall-clock time when this event was created."""
     speech_end_time: float | None = None
     """Wall-clock time when the recognized speech ended, when known."""
+    transcript_span: NotGivenOr[tuple[float, float] | None] = NOT_GIVEN
+    """Wall-clock bounds of the final text for message history. None means unresolvable."""
 
 
 @dataclass

@@ -5410,11 +5410,13 @@ class AgentActivity(RecognitionHooks):
         metrics_report: llm.MetricsReport = {}
         if self.stt:
             metrics_report["stt_metadata"] = self.stt.metrics_metadata
-        if info.metrics.started_speaking_at is not None:
-            metrics_report["started_speaking_at"] = info.metrics.started_speaking_at
-
-        if info.metrics.stopped_speaking_at is not None:
-            metrics_report["stopped_speaking_at"] = info.metrics.stopped_speaking_at
+        start, end = info.metrics.started_speaking_at, info.metrics.stopped_speaking_at
+        if is_given(info.transcript_span) and not info.transcript_clock_suppressed:
+            start, end = info.transcript_span or (None, None)
+        if start is not None:
+            metrics_report["started_speaking_at"] = start
+        if end is not None:
+            metrics_report["stopped_speaking_at"] = end
 
         if info.metrics.transcription_delay is not None:
             metrics_report["transcription_delay"] = info.metrics.transcription_delay

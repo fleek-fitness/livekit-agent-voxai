@@ -76,6 +76,7 @@ class _EndOfTurnInfo:
     transcript_confidence: float
     metrics: _EndOfTurnMetrics
     transcript_clock_suppressed: bool = False
+    transcript_span: NotGivenOr[tuple[float, float] | None] = NOT_GIVEN
     backchannel_over_agent: bool = False
     """The turn's speech overlapped agent speech and was classified a backchannel by adaptive interruption."""
 
@@ -367,6 +368,7 @@ class _STTPipeline:
 
 
 class AudioRecognition:
+    _transcript_span: NotGivenOr[tuple[float, float] | None] = NOT_GIVEN
     # Keep recent VAD bounds until STT confirms which burst supplied the first text.
     _vad_finalize_start: float | None = None
     _completed_vad_bursts: deque[tuple[float, float]] | None = None
@@ -467,6 +469,7 @@ class AudioRecognition:
         self._final_transcript_received = asyncio.Event()
         self._final_transcript_confidence: list[float] = []
         self._audio_transcript = ""
+        self._transcript_span = NOT_GIVEN
         self._audio_interim_transcript = ""
         # used for STTs that support preflight mode, so it could start preemptive generation earlier
         self._audio_preflight_transcript = ""
@@ -1159,7 +1162,9 @@ class AudioRecognition:
             # stamp the wall-clock anchor on the first frame to reach the pipeline
             if self._stt_pipeline.input_started_at is None:
                 self._stt_pipeline.input_started_at = time.time() - frame.duration
-            self._stt_pipeline.audio_ch.send_nowait(stt_frame if stt_frame is not None else frame)
+            outgoing = stt_frame if stt_frame is not None else frame
+            outgoing.userdata["lk.audio_frame_start"] = time.time() - frame.duration
+            self._stt_pipeline.audio_ch.send_nowait(outgoing)
 
         if self._vad_ch is not None:
             self._vad_ch.send_nowait(frame)
@@ -1435,6 +1440,7 @@ class AudioRecognition:
         self._agent_overlap_segment_unfinalized = False
         self._post_agent_vad_segment_start = None
         self._audio_transcript = ""
+        self._transcript_span = NOT_GIVEN
         self._audio_interim_transcript = ""
         self._audio_preflight_transcript = ""
         self._final_transcript_confidence = []
@@ -1521,6 +1527,9 @@ class AudioRecognition:
                         ],
                     )
                 )
+
+                if is_given(self._transcript_span):
+                    self._transcript_span = None
 
                 # append interim transcript in case the final transcript is not ready
                 self._audio_transcript = (
@@ -1728,6 +1737,16 @@ class AudioRecognition:
             if not late_ack:
                 self._anchor_turn_to_first_final(ev)
             self._record_final_transcript_time()
+            bounds = ev.transcript_span
+            if not self._audio_transcript:
+                self._transcript_span = bounds
+            elif isinstance(self._transcript_span, tuple) and isinstance(bounds, tuple):
+                self._transcript_span = (
+                    min(self._transcript_span[0], bounds[0]),
+                    max(self._transcript_span[1], bounds[1]),
+                )
+            elif is_given(self._transcript_span) or is_given(bounds):
+                self._transcript_span = None
             self._audio_transcript += f" {transcript}"
             self._audio_transcript = self._audio_transcript.lstrip()
             self._final_transcript_confidence.append(confidence)
@@ -2429,6 +2448,7 @@ class AudioRecognition:
                 _EndOfTurnInfo(
                     skip_reply=skip_reply,
                     new_transcript=self._audio_transcript,
+                    transcript_span=self._transcript_span,
                     transcript_confidence=confidence_avg,
                     metrics=metrics,
                     transcript_clock_suppressed=transcript_clock_suppressed,
@@ -2471,6 +2491,7 @@ class AudioRecognition:
 
                 # clear the transcript if the user turn was committed
                 self._audio_transcript = ""
+                self._transcript_span = NOT_GIVEN
                 self._final_transcript_confidence = []
                 self._last_final_transcript_time = None
                 self._clear_late_ack_wait()

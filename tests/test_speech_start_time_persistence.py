@@ -274,3 +274,44 @@ class TestUserTurnStartPersistence:
         assert committed_turn.metrics.started_speaking_at == pytest.approx(
             origin + expected_start, abs=0.001, rel=0
         )
+
+    async def test_stored_message_uses_only_finals_in_the_turn(self) -> None:
+        from livekit.agents.voice.agent_activity import AgentActivity
+
+        session = MagicMock()
+        session.amd = session._room_io = None
+        session.options.interruption = {}
+        session.options.transcription_timeout = None
+        session.options.turn_handling = {"user_turn_limit": {}}
+        hooks = MagicMock()
+        hooks.retrieve_chat_ctx.return_value = llm.ChatContext.empty()
+        hooks.on_end_of_turn.return_value = True
+        ar = AudioRecognition(
+            session,
+            hooks=hooks,
+            endpointing=MagicMock(min_delay=0.0, max_delay=10.0),
+            stt=MagicMock(),
+            vad=MagicMock(),
+            interruption_detection=None,
+            turn_detection="vad",
+        )
+        origin = time.time() - 12.0
+        with patch("time.time", return_value=origin + 0.8):
+            await ar._on_vad_event(self._vad_event(VADEventType.START_OF_SPEECH))
+        for word, start, end in [("my", 7.0, 7.5), ("answer", 7.7, 8.1)]:
+            await ar._on_stt_event(
+                stt.SpeechEvent(
+                    type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                    alternatives=[stt.SpeechData(text=word, language="en")],
+                    transcript_span=(origin + start, origin + end),
+                )
+            )
+        await ar._on_vad_event(self._vad_event(VADEventType.END_OF_SPEECH))
+        assert ar._end_of_turn_task is not None
+        await ar._end_of_turn_task
+        info = hooks.on_end_of_turn.call_args.args[0]
+        assert info.new_transcript == "my answer"
+        assert info.metrics.started_speaking_at == origin + 0.8
+        metrics = AgentActivity._init_metrics_from_end_of_turn(MagicMock(stt=None), info)
+        assert metrics["started_speaking_at"] == origin + 7.0
+        assert metrics["stopped_speaking_at"] == origin + 8.1
