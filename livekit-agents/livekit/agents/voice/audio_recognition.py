@@ -152,6 +152,7 @@ class _HeldSegment:
     verdict: Literal["pending", "backchannel", "interruption"] = "pending"
     # a final transcript was attributed to it
     finalized: bool = False
+    empty_finalized: bool = False
     # some of its held text was trimmed: that text never reaches a turn
     consumed: bool = False
 
@@ -218,7 +219,9 @@ class _HeldSegments:
             open_segment = latest if not self.ended(latest, speaking=speaking) else None
             if ev.type == stt.SpeechEventType.FINAL_TRANSCRIPT:
                 unfinalized = [
-                    s for s in self.segments if s is not open_segment and not s.finalized
+                    s
+                    for s in self.segments
+                    if s is not open_segment and not (s.finalized or s.empty_finalized)
                 ]
                 if len(unfinalized) == 1:
                     segment = unfinalized[0]
@@ -365,6 +368,7 @@ class _STTPipeline:
 
 class AudioRecognition:
     # Keep recent VAD bounds until STT confirms which burst supplied the first text.
+    _vad_finalize_start: float | None = None
     _completed_vad_bursts: deque[tuple[float, float]] | None = None
 
     # late-ack merge state; immutable class-level defaults keep instances that skip __init__ valid
@@ -858,6 +862,8 @@ class AudioRecognition:
         segments = self._held_segments
         if not segments.ended(segment, speaking=self._speaking):
             return False
+        if segment.empty_finalized and not segment.finalized:
+            return True
         if segment.verdict == "interruption":
             return False
         if segment.verdict != "backchannel" and not segment.consumed:
@@ -1558,6 +1564,10 @@ class AudioRecognition:
         return self._audio_transcript
 
     async def _on_stt_event(self, ev: stt.SpeechEvent) -> None:
+        if ev.type == stt.SpeechEventType.VAD_FINALIZE_EMPTY:
+            self._retire_empty_vad_burst(ev.speech_start_time)
+            return
+
         if (
             ev.speech_end_time is None
             and self._stt_aligned_transcript
@@ -1876,6 +1886,36 @@ class AudioRecognition:
             if self._end_of_turn_task is not None:
                 self._end_of_turn_task.cancel()
 
+    def _retire_empty_vad_burst(self, start: float | None) -> None:
+        bursts = self._completed_vad_bursts
+        if start is None or not bursts or self._audio_transcript:
+            return
+        burst = next((burst for burst in bursts if burst[0] == start), None)
+        if burst is None:
+            return
+
+        held_segment = self._held_segments.find(start)
+        if held_segment is not None and held_segment.finalized:
+            return
+        owned_turn = self._user_turn_start == start
+        bursts.remove(burst)
+
+        if held_segment is not None:
+            held_segment.empty_finalized = True
+            self._recompute_turn_owner()
+
+        next_start = next(
+            (burst_start for burst_start, _ in bursts if burst_start > start),
+            self._active_vad_speech_started_at,
+        )
+        if self._speech_start_time == start:
+            self._speech_start_time = next_start
+        if self._user_turn_start == start:
+            self._end_user_turn_span()
+        if owned_turn and self._user_turn_start is None and next_start is not None:
+            self._ensure_user_turn_span(start_time=next_start)
+            self._held_segments.cleared_span = False
+
     def _anchor_turn_to_first_final(self, ev: stt.SpeechEvent) -> None:
         """Move a provisional VAD onset only when a newer burst supplied the text."""
         turn_start = self._user_turn_start
@@ -1965,8 +2005,14 @@ class AudioRecognition:
 
         elif ev.type == vad.VADEventType.END_OF_SPEECH:
             vad_speech_started = self._vad_speech_started
-            with tracer.use_span(self._ensure_user_turn_span()):
-                self._hooks.on_end_of_speech(ev)
+            self._vad_finalize_start = (
+                self._active_vad_speech_started_at if vad_speech_started else None
+            )
+            try:
+                with tracer.use_span(self._ensure_user_turn_span()):
+                    self._hooks.on_end_of_speech(ev)
+            finally:
+                self._vad_finalize_start = None
 
             if self._vad_segment_overlaps_agent:
                 self._vad_segment_overlaps_agent = False

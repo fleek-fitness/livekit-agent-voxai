@@ -184,12 +184,14 @@ class TestUserTurnStartPersistence:
         assert audio_recognition._speech_start_time > first_burst_speech_start
 
     @pytest.mark.parametrize(
-        ("final_start", "final_end", "expected_start"),
+        ("final_start", "final_end", "expected_start", "empty_ack"),
         [
-            pytest.param(14.4, 15.8, 14.3, id="first-burst-has-no-text"),
-            pytest.param(2.8, 3.0, 2.7, id="late-final-for-first-burst"),
-            pytest.param(2.8, 15.8, 2.7, id="final-spans-both-bursts"),
-            pytest.param(0.0, 0.0, 2.7, id="untimed-final-keeps-provisional-start"),
+            pytest.param(14.4, 15.8, 14.3, None, id="first-burst-has-no-text"),
+            pytest.param(2.8, 3.0, 2.7, None, id="late-final-for-first-burst"),
+            pytest.param(2.8, 15.8, 2.7, None, id="final-spans-both-bursts"),
+            pytest.param(0.0, 0.0, 2.7, None, id="untimed-final-keeps-provisional-start"),
+            pytest.param(0.0, 0.0, 14.3, "before", id="empty-vad-before-next-onset"),
+            pytest.param(0.0, 0.0, 14.3, "after", id="empty-vad-after-next-onset"),
         ],
     )
     @pytest.mark.parametrize("final_before_vad_end", [False, True])
@@ -199,6 +201,7 @@ class TestUserTurnStartPersistence:
         final_end: float,
         expected_start: float,
         final_before_vad_end: bool,
+        empty_ack: str | None,
     ) -> None:
         session = MagicMock()
         session.amd = None
@@ -227,9 +230,22 @@ class TestUserTurnStartPersistence:
             with patch("time.time", return_value=origin + at):
                 await recognition._on_vad_event(self._vad_event(kind))
 
+        async def acknowledge_empty_burst() -> None:
+            await recognition._on_stt_event(
+                stt.SpeechEvent(
+                    type=stt.SpeechEventType.VAD_FINALIZE_EMPTY,
+                    speech_start_time=origin + 2.7,
+                )
+            )
+            hooks.on_final_transcript.assert_not_called()
+
         await vad_event(VADEventType.START_OF_SPEECH, 2.7)
         await vad_event(VADEventType.END_OF_SPEECH, 3.1)
+        if empty_ack == "before":
+            await acknowledge_empty_burst()
         await vad_event(VADEventType.START_OF_SPEECH, 14.3)
+        if empty_ack == "after":
+            await acknowledge_empty_burst()
         if not final_before_vad_end:
             await vad_event(VADEventType.END_OF_SPEECH, 16.1)
         hooks.on_end_of_turn.assert_not_called()

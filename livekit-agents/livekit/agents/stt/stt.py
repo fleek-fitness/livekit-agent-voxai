@@ -50,6 +50,8 @@ class SpeechEventType(str, Enum):
     portion of speech will not change"""
     RECOGNITION_USAGE = "recognition_usage"
     """usage event, emitted periodically to indicate usage metrics"""
+    VAD_FINALIZE_EMPTY = "vad_finalize_empty"
+    """A VAD-triggered finalize returned no text for the onset in speech_start_time."""
     END_OF_SPEECH = "end_of_speech"
     """indicate the end of speech, emitted when the user stops speaking"""
 
@@ -360,7 +362,8 @@ class RecognizeStream(ABC):
     class _FlushSentinel:
         """Sentinel to mark when it was flushed"""
 
-        pass
+        def __init__(self, vad_started_at: float | None = None) -> None:
+            self.vad_started_at = vad_started_at
 
     def __init__(
         self,
@@ -568,7 +571,14 @@ class RecognizeStream(ABC):
             self._input_ch.send_nowait(frame)
 
     def flush(self) -> None:
-        """Mark the end of the current segment"""
+        """Mark the end of the current segment."""
+        self._flush(self._FlushSentinel())
+
+    def flush_vad(self, speech_start_time: float) -> None:
+        """Flush after a local VAD segment ended, with its wall-clock onset."""
+        self.flush()
+
+    def _flush(self, sentinel: _FlushSentinel) -> None:
         self._check_input_not_ended()
         self._check_not_closed()
 
@@ -576,7 +586,7 @@ class RecognizeStream(ABC):
             for frame in self._resampler.flush():
                 self._input_ch.send_nowait(frame)
 
-        self._input_ch.send_nowait(self._FlushSentinel())
+        self._input_ch.send_nowait(sentinel)
 
     def end_input(self) -> None:
         """Mark the end of input, no more audio will be pushed"""
