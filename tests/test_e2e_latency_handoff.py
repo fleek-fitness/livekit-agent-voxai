@@ -929,3 +929,63 @@ async def test_silent_chain_from_on_enter_answers_nothing_later() -> None:
     _assert_answers(reply, hello)
     assert nudge.text_content == "are you still there?"
     assert "e2e_latency" not in nudge.metrics
+
+
+async def test_reply_after_task_in_on_enter_of_task_in_tool_answers_the_last_turn() -> None:
+    """A tool awaits a task whose on_enter awaits another, then replies: the reply answers the last turn."""
+
+    class AskName(AgentTask[str]):
+        def __init__(self) -> None:
+            super().__init__(instructions="ask name")
+
+        async def on_enter(self) -> None:
+            self.session.generate_reply(instructions="ask_name")
+
+        @function_tool
+        async def record_name(self, ctx: RunContext, name: str) -> None:
+            """Called when the user provides their name."""
+            self.complete(name)
+
+    class Survey(AgentTask[None]):
+        def __init__(self) -> None:
+            super().__init__(instructions="survey")
+
+        async def on_enter(self) -> None:
+            name = await AskName()
+            self.session.generate_reply(instructions=f"thank {name}")
+
+        @function_tool
+        async def finish(self, ctx: RunContext) -> None:
+            """Called when the survey is done."""
+            self.complete(None)
+
+    class Booker(Agent):
+        def __init__(self) -> None:
+            super().__init__(instructions="booker")
+
+        @function_tool
+        async def book(self, ctx: RunContext) -> None:
+            """Book a room."""
+            await Survey()
+
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.5, "book a room")
+    actions.add_llm("", tool_calls=[FunctionToolCall(name="book", arguments="{}", call_id="c1")])
+    actions.add_llm("what is your name?", input="ask_name")
+    actions.add_tts(1.0)
+    actions.add_user_speech(6.0, 7.0, "Bob")
+    actions.add_llm(
+        "",
+        tool_calls=[
+            FunctionToolCall(name="record_name", arguments='{"name": "Bob"}', call_id="c2")
+        ],
+    )
+    actions.add_llm("thanks Bob", input="thank Bob")
+    actions.add_tts(1.0)
+
+    messages = await _messages(actions, Booker(), drain_delay=4.0)
+    book, bob = _by_role(messages, "user")
+    question, thanks = _by_role(messages, "assistant")
+    _assert_answers(question, book)
+    assert thanks.text_content == "thanks Bob"
+    _assert_answers(thanks, bob)

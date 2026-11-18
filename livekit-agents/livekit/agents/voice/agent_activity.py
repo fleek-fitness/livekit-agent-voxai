@@ -958,6 +958,7 @@ class AgentActivity(RecognitionHooks):
                     entered_on = self._session._unanswered_user_metrics
                     try:
                         tk = _OnEnterContextVar.set(data)
+                        _ReplyUserMetricsContextVar.set(None)
                         await self._agent.on_enter()
                     finally:
                         _OnEnterContextVar.reset(tk)
@@ -3645,19 +3646,21 @@ class AgentActivity(RecognitionHooks):
 
     def _take_on_enter_user_metrics(self) -> llm.MetricsReport | None:
         """Claim the user turn for a speech created inside on_enter or a running reply."""
+        parent = _SpeechHandleContextVar.get(None)
+        reply_metrics = _ReplyUserMetricsContextVar.get()
+        if (
+            reply_metrics is not None
+            and parent is not None
+            and not parent.done()
+            and _AgentActivityContextVar.get(None) is self
+        ):
+            return reply_metrics
         on_enter_data = _OnEnterContextVar.get(None)
         if (
             on_enter_data is None
             or on_enter_data.agent != self._agent
             or on_enter_data.session != self._session
         ):
-            parent = _SpeechHandleContextVar.get(None)
-            if (
-                parent is not None
-                and not parent.done()
-                and _AgentActivityContextVar.get(None) is self
-            ):
-                return _ReplyUserMetricsContextVar.get()
             return None
         metrics = self._session._unanswered_user_metrics
         self._session._unanswered_user_metrics = None
