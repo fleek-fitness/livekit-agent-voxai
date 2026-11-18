@@ -26,6 +26,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from livekit.agents import llm, stt
 from livekit.agents.vad import VADEvent, VADEventType
 from livekit.agents.voice.audio_recognition import AudioRecognition, _HeldSegments
 
@@ -181,3 +182,79 @@ class TestUserTurnStartPersistence:
         # _speech_start_time should now reflect the second burst's start, not the first
         assert audio_recognition._speech_start_time is not None
         assert audio_recognition._speech_start_time > first_burst_speech_start
+
+    @pytest.mark.parametrize(
+        ("final_start", "final_end", "expected_start"),
+        [
+            pytest.param(14.4, 15.8, 14.3, id="first-burst-has-no-text"),
+            pytest.param(2.8, 3.0, 2.7, id="late-final-for-first-burst"),
+            pytest.param(2.8, 15.8, 2.7, id="final-spans-both-bursts"),
+            pytest.param(0.0, 0.0, 2.7, id="untimed-final-keeps-provisional-start"),
+        ],
+    )
+    @pytest.mark.parametrize("final_before_vad_end", [False, True])
+    async def test_committed_turn_start_follows_first_final(
+        self,
+        final_start: float,
+        final_end: float,
+        expected_start: float,
+        final_before_vad_end: bool,
+    ) -> None:
+        session = MagicMock()
+        session.amd = None
+        session._room_io = None
+        session.options.interruption = {}
+        session.options.transcription_timeout = None
+        session.options.turn_handling = {"user_turn_limit": {}}
+        hooks = MagicMock()
+        hooks.retrieve_chat_ctx.return_value = llm.ChatContext.empty()
+        hooks.on_end_of_turn.return_value = True
+        recognition = AudioRecognition(
+            session,
+            hooks=hooks,
+            endpointing=MagicMock(min_delay=0.0, max_delay=10.0),
+            stt=MagicMock(),
+            vad=MagicMock(),
+            interruption_detection=None,
+            turn_detection="vad",
+            stt_aligned_transcript=True,
+        )
+        # The provider sends times relative to the input clock, while VAD is wall-clock.
+        origin = time.time() - 16.5
+        recognition._stt_pipeline = MagicMock(input_started_at=origin)
+
+        async def vad_event(kind: VADEventType, at: float) -> None:
+            with patch("time.time", return_value=origin + at):
+                await recognition._on_vad_event(self._vad_event(kind))
+
+        await vad_event(VADEventType.START_OF_SPEECH, 2.7)
+        await vad_event(VADEventType.END_OF_SPEECH, 3.1)
+        await vad_event(VADEventType.START_OF_SPEECH, 14.3)
+        if not final_before_vad_end:
+            await vad_event(VADEventType.END_OF_SPEECH, 16.1)
+        hooks.on_end_of_turn.assert_not_called()
+
+        await recognition._on_stt_event(
+            stt.SpeechEvent(
+                type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                alternatives=[
+                    stt.SpeechData(
+                        text="I have a question",
+                        language="en",
+                        start_time=final_start,
+                        end_time=final_end,
+                    )
+                ],
+            )
+        )
+        if final_before_vad_end:
+            await vad_event(VADEventType.END_OF_SPEECH, 16.1)
+        assert recognition._end_of_turn_task is not None
+        await recognition._end_of_turn_task
+
+        hooks.on_end_of_turn.assert_called_once()
+        committed_turn = hooks.on_end_of_turn.call_args.args[0]
+        assert committed_turn.new_transcript == "I have a question"
+        assert committed_turn.metrics.started_speaking_at == pytest.approx(
+            origin + expected_start, abs=0.001, rel=0
+        )

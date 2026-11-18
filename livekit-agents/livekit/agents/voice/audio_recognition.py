@@ -364,6 +364,9 @@ class _STTPipeline:
 
 
 class AudioRecognition:
+    # Keep recent VAD bounds until STT confirms which burst supplied the first text.
+    _completed_vad_bursts: deque[tuple[float, float]] | None = None
+
     # late-ack merge state; immutable class-level defaults keep instances that skip __init__ valid
     _last_agent_speech_interval: tuple[float, float] | None = None
     _active_vad_speech_started_at: float | None = None
@@ -1422,6 +1425,7 @@ class AudioRecognition:
     def _clear_user_turn(self) -> None:
         self._clear_late_ack_wait()
         self._held_segments.reset()
+        self._completed_vad_bursts = None
         self._agent_overlap_segment_unfinalized = False
         self._post_agent_vad_segment_start = None
         self._audio_transcript = ""
@@ -1711,6 +1715,8 @@ class AudioRecognition:
             logger.debug("received user transcript", extra=extra)
 
             late_ack = self._is_late_ack_final(ev, transcript)
+            if not late_ack:
+                self._anchor_turn_to_first_final(ev)
             self._record_final_transcript_time()
             self._audio_transcript += f" {transcript}"
             self._audio_transcript = self._audio_transcript.lstrip()
@@ -1870,6 +1876,44 @@ class AudioRecognition:
             if self._end_of_turn_task is not None:
                 self._end_of_turn_task.cancel()
 
+    def _anchor_turn_to_first_final(self, ev: stt.SpeechEvent) -> None:
+        """Move a provisional VAD onset only when a newer burst supplied the text."""
+        turn_start = self._user_turn_start
+        completed_bursts = self._completed_vad_bursts
+        if (
+            turn_start is None
+            or self._audio_transcript
+            or not completed_bursts
+            or self._held_segments.segments
+            or self._final_transcript_clock_suppressed
+        ):
+            return
+
+        start, end = ev.speech_start_time, ev.speech_end_time
+        if self._stt_aligned_transcript and (input_start := self._input_started_at) is not None:
+            alt = ev.alternatives[0]
+            if start is None and alt.start_time >= 0 and alt.end_time > 0:
+                start = input_start + alt.start_time
+            if end is None and alt.end_time > 0:
+                end = input_start + alt.end_time
+        if start is None or end is None or not start <= end <= ev.created_at or end < turn_start:
+            return
+
+        # Use the earliest burst covered by the final. This also preserves an
+        # earlier burst when a late final spans both sides of a VAD pause.
+        for burst_start, burst_end in completed_bursts:
+            if burst_start >= turn_start and burst_start <= end and start <= burst_end:
+                break
+        else:
+            active_start = self._active_vad_speech_started_at
+            if active_start is None or not turn_start <= active_start <= end:
+                return
+            burst_start = active_start
+
+        if burst_start > turn_start:
+            self._end_user_turn_span()
+            self._ensure_user_turn_span(start_time=burst_start)
+
     @utils.log_exceptions(logger=logger)
     async def _on_vad_event(self, ev: vad.VADEvent) -> None:
         if ev.type == vad.VADEventType.START_OF_SPEECH:
@@ -1928,10 +1972,17 @@ class AudioRecognition:
                 self._vad_segment_overlaps_agent = False
                 if not self._final_since_agent_overlap_segment:
                     self._agent_overlap_segment_unfinalized = True
+            speech_end_time = time.time() - ev.silence_duration - ev.inference_duration
+            if (
+                self._stt is not None
+                and (burst_start := self._active_vad_speech_started_at) is not None
+            ):
+                if self._completed_vad_bursts is None:
+                    self._completed_vad_bursts = deque(maxlen=64)
+                self._completed_vad_bursts.append((burst_start, speech_end_time))
             self._active_vad_speech_started_at = None
             self._vad_speech_started = False
             self._speaking = False
-            speech_end_time = time.time() - ev.silence_duration - ev.inference_duration
             self._last_speaking_time = speech_end_time
 
             # A committed turn clears _vad_speech_started before its late VAD EOS arrives.
@@ -2370,6 +2421,7 @@ class AudioRecognition:
                 self._reset_transcription_timeout()
                 # the held segments' clock went into this turn
                 self._held_segments.reset()
+                self._completed_vad_bursts = None
 
                 # clear the transcript if the user turn was committed
                 self._audio_transcript = ""
