@@ -831,6 +831,46 @@ async def test_say_chained_from_on_enter_reply_answers_the_turn() -> None:
     _assert_answers(reply, user)
 
 
+class _SilentHandoffRouter(Agent):
+    """Hands off with a tool output, then skips the tool reply while the handoff is pending."""
+
+    def __init__(self, target: Agent) -> None:
+        super().__init__(instructions="router")
+        self._target = target
+        self._handoff_pending = False
+
+    async def on_enter(self) -> None:
+        def _on_executed(ev) -> None:  # type: ignore[no-untyped-def]
+            self._handoff_pending = ev.has_agent_handoff
+
+        self.session.on("function_tools_executed", _on_executed)
+
+    @function_tool
+    async def handoff(self, ctx: RunContext) -> tuple[dict, Agent]:
+        return {"status": "you are the new agent"}, self._target
+
+    async def llm_node(self, chat_ctx, tools, model_settings):  # type: ignore[no-untyped-def]
+        if self._handoff_pending:
+            return
+        async for chunk in Agent.default.llm_node(self, chat_ctx, tools, model_settings):
+            yield chunk
+
+
+async def test_silent_tool_reply_before_handoff_leaves_the_turn_to_on_enter() -> None:
+    """A tool returns (output, agent) and the tool reply is silent: the target's chained reply answers."""
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.5, "go")
+    actions.add_llm("", tool_calls=[HANDOFF_CALL])
+    actions.add_llm("hello from the last node", input="hop0")
+    actions.add_tts(1.0)
+
+    messages = await _messages(actions, _SilentHandoffRouter(_FlowGreeter(1)))
+    (user,) = _by_role(messages, "user")
+    (reply,) = _by_role(messages, "assistant")
+    assert reply.text_content == "hello from the last node"
+    _assert_answers(reply, user)
+
+
 class _ChainingTool(Agent):
     """A silent tool chains generate_reply(), whose node chains once more."""
 
