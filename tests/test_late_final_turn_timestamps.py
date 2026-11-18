@@ -37,7 +37,7 @@ def _recognition() -> tuple[AudioRecognition, MagicMock]:
         vad=MagicMock(),
         interruption_detection=None,
         turn_detection="vad",
-        stt_aligned_transcript="chunk",
+        stt_aligned_transcript=True,
     )
     return recognition, hooks
 
