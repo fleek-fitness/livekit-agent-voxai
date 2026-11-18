@@ -750,3 +750,182 @@ async def test_tool_announcement_answers_the_turn() -> None:
     _assert_answers(announcement, user)
     assert answer.text_content == "here is your answer"
     assert "e2e_latency" not in answer.metrics
+
+
+class _FlowGreeter(Agent):
+    """A flow agent entered by a handoff: its first nodes are silent and chain to the next."""
+
+    def __init__(self, hops: int, *, say_last: bool = False) -> None:
+        super().__init__(instructions="flow greeter")
+        self._hops = hops
+        self._say_last = say_last
+
+    async def on_enter(self) -> None:
+        self.session.generate_reply(instructions="greet")
+
+    async def llm_node(self, chat_ctx, tools, model_settings):  # type: ignore[no-untyped-def]
+        if self._hops > 0:
+            self._hops -= 1
+            if self._hops == 0 and self._say_last:
+                self.session.say("hello from the last node")
+            else:
+                self.session.generate_reply(instructions=f"hop{self._hops}")
+            return
+        async for chunk in Agent.default.llm_node(self, chat_ctx, tools, model_settings):
+            yield chunk
+
+
+def _flow_router(flow: Agent) -> Agent:
+    class Router(Agent):
+        def __init__(self) -> None:
+            super().__init__(instructions="router")
+
+        @function_tool
+        async def handoff(self, ctx: RunContext) -> Agent:
+            return flow
+
+    return Router()
+
+
+async def test_reply_chained_from_on_enter_reply_answers_the_turn() -> None:
+    """Handoff, on_enter replies, its node chains generate_reply(): the chained reply answers."""
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.5, "go")
+    actions.add_llm("", tool_calls=[HANDOFF_CALL])
+    actions.add_llm("hello from the last node", input="hop0")
+    actions.add_tts(1.0)
+
+    messages = await _messages(actions, _flow_router(_FlowGreeter(1)))
+    (user,) = _by_role(messages, "user")
+    (reply,) = _by_role(messages, "assistant")
+    assert reply.text_content == "hello from the last node"
+    _assert_answers(reply, user)
+
+
+async def test_reply_chained_three_times_from_on_enter_reply_answers_the_turn() -> None:
+    """Handoff, on_enter replies, three silent nodes chain in turn: the last reply answers."""
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.5, "go")
+    actions.add_llm("", tool_calls=[HANDOFF_CALL])
+    actions.add_llm("hello from the last node", input="hop0")
+    actions.add_tts(1.0)
+
+    messages = await _messages(actions, _flow_router(_FlowGreeter(3)))
+    (user,) = _by_role(messages, "user")
+    (reply,) = _by_role(messages, "assistant")
+    assert reply.text_content == "hello from the last node"
+    _assert_answers(reply, user)
+
+
+async def test_say_chained_from_on_enter_reply_answers_the_turn() -> None:
+    """Handoff, on_enter replies, its node says the next node's text: the say() answers."""
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.5, "go")
+    actions.add_llm("", tool_calls=[HANDOFF_CALL])
+    actions.add_tts(1.0, input="hello from the last node")
+
+    messages = await _messages(actions, _flow_router(_FlowGreeter(2, say_last=True)))
+    (user,) = _by_role(messages, "user")
+    (reply,) = _by_role(messages, "assistant")
+    assert reply.text_content == "hello from the last node"
+    _assert_answers(reply, user)
+
+
+class _ChainingTool(Agent):
+    """A silent tool chains generate_reply(), whose node chains once more."""
+
+    def __init__(self, *, say_last: bool = False) -> None:
+        super().__init__(instructions="router")
+        self._chain = False
+        self._say_last = say_last
+
+    @function_tool
+    async def handoff(self, ctx: RunContext) -> None:
+        self._chain = True
+        self.session.generate_reply(instructions="greet")
+
+    async def llm_node(self, chat_ctx, tools, model_settings):  # type: ignore[no-untyped-def]
+        if self._chain:
+            self._chain = False
+            if self._say_last:
+                self.session.say("hello from the last node")
+            else:
+                self.session.generate_reply(instructions="next")
+            return
+        async for chunk in Agent.default.llm_node(self, chat_ctx, tools, model_settings):
+            yield chunk
+
+
+async def test_reply_chained_from_tool_reply_answers_the_turn() -> None:
+    """A tool chains generate_reply(), whose node chains again: the last reply answers."""
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.5, "go")
+    actions.add_llm("", tool_calls=[HANDOFF_CALL])
+    actions.add_llm("hello from the last node", input="next")
+    actions.add_tts(1.0)
+
+    messages = await _messages(actions, _ChainingTool())
+    (user,) = _by_role(messages, "user")
+    (reply,) = _by_role(messages, "assistant")
+    assert reply.text_content == "hello from the last node"
+    _assert_answers(reply, user)
+
+
+async def test_say_chained_from_tool_reply_answers_the_turn() -> None:
+    """A tool chains generate_reply(), whose node says the next text: the say() answers."""
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.5, "go")
+    actions.add_llm("", tool_calls=[HANDOFF_CALL])
+    actions.add_tts(1.0, input="hello from the last node")
+
+    messages = await _messages(actions, _ChainingTool(say_last=True))
+    (user,) = _by_role(messages, "user")
+    (reply,) = _by_role(messages, "assistant")
+    assert reply.text_content == "hello from the last node"
+    _assert_answers(reply, user)
+
+
+async def test_silent_chain_from_on_enter_answers_nothing_later() -> None:
+    """Every hop of the on_enter chain is silent: a nudge it scheduled and the next turn's reply keep their own turns."""
+
+    class SilentFlow(Agent):
+        def __init__(self) -> None:
+            super().__init__(instructions="silent flow")
+            self._hops = 2
+
+        async def on_enter(self) -> None:
+            self.session.generate_reply(instructions="greet")
+
+        async def llm_node(self, chat_ctx, tools, model_settings):  # type: ignore[no-untyped-def]
+            if self._hops > 0:
+                self._hops -= 1
+                if self._hops > 0:
+                    self.session.generate_reply(instructions=f"hop{self._hops}")
+                else:
+                    asyncio.get_event_loop().call_later(
+                        5.0, lambda: self.session.generate_reply(instructions="nudge")
+                    )
+                return
+            async for chunk in Agent.default.llm_node(self, chat_ctx, tools, model_settings):
+                yield chunk
+
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.5, "go")
+    actions.add_llm("", tool_calls=[HANDOFF_CALL])
+    actions.add_user_speech(4.0, 4.5, "hello?")
+    actions.add_llm("hi there")
+    actions.add_tts(1.0)
+    actions.add_llm("are you still there?", input="nudge")
+    actions.add_tts(1.0)
+
+    session = create_session(actions, turn_handling={"preemptive_generation": {"enabled": False}})
+    events: list = []
+    session.on("conversation_item_added", events.append)
+    await run_session(session, _flow_router(SilentFlow()), drain_delay=6.0)
+    messages = [ev.item for ev in events if ev.item.type == "message"]
+    _go, hello = _by_role(messages, "user")
+    reply, nudge = _by_role(messages, "assistant")
+    assert reply.text_content == "hi there"
+    _assert_answers(reply, hello)
+    assert nudge.text_content == "are you still there?"
+    assert "e2e_latency" not in nudge.metrics
