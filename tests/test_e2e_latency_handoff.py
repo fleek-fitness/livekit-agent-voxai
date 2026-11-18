@@ -561,3 +561,108 @@ async def test_turn_committed_during_on_enter_survives_its_end() -> None:
     _go, support = _by_role(messages, "user")
     (greeting,) = _by_role(messages, "assistant")
     _assert_answers(greeting, support)
+
+
+async def test_reply_chained_from_llm_node_answers_the_turn() -> None:
+    """llm_node handles the turn silently and chains generate_reply(): the chained reply answers."""
+
+    class Flow(Agent):
+        def __init__(self) -> None:
+            super().__init__(instructions="flow")
+            self._chained = False
+
+        async def llm_node(self, chat_ctx, tools, model_settings):  # type: ignore[no-untyped-def]
+            if not self._chained:
+                self._chained = True
+                self.session.generate_reply(instructions="next")
+                return
+            async for chunk in Agent.default.llm_node(self, chat_ctx, tools, model_settings):
+                yield chunk
+
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.5, "go")
+    actions.add_llm("hello from the next node", input="next")
+    actions.add_tts(1.0)
+
+    # a preemptive llm_node call would chain before the turn is committed
+    session = create_session(actions, turn_handling={"preemptive_generation": {"enabled": False}})
+    events: list = []
+    session.on("conversation_item_added", events.append)
+    await run_session(session, Flow(), drain_delay=2.0)
+    messages = [ev.item for ev in events if ev.item.type == "message"]
+    (user,) = _by_role(messages, "user")
+    (reply,) = _by_role(messages, "assistant")
+    assert reply.text_content == "hello from the next node"
+    _assert_answers(reply, user)
+
+
+async def test_reply_chained_from_tool_answers_the_turn() -> None:
+    """A silent tool chains generate_reply(): the chained reply answers the turn."""
+
+    class Router(Agent):
+        def __init__(self) -> None:
+            super().__init__(instructions="router")
+
+        @function_tool
+        async def handoff(self, ctx: RunContext) -> None:
+            self.session.generate_reply(instructions="greet")
+
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.5, "go")
+    actions.add_llm("", tool_calls=[HANDOFF_CALL])
+    actions.add_llm("hello from the greeter", input="greet")
+    actions.add_tts(1.0)
+
+    messages = await _messages(actions, Router())
+    (user,) = _by_role(messages, "user")
+    (reply,) = _by_role(messages, "assistant")
+    _assert_answers(reply, user)
+
+
+async def test_say_from_tool_answers_the_turn() -> None:
+    """A silent tool calls say(): the said text answers the turn."""
+
+    class Router(Agent):
+        def __init__(self) -> None:
+            super().__init__(instructions="router")
+
+        @function_tool
+        async def handoff(self, ctx: RunContext) -> None:
+            self.session.say("one moment")
+
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.5, "go")
+    actions.add_llm("", tool_calls=[HANDOFF_CALL])
+    actions.add_tts(1.0, input="one moment")
+
+    messages = await _messages(actions, Router())
+    (user,) = _by_role(messages, "user")
+    (said,) = _by_role(messages, "assistant")
+    assert said.text_content == "one moment"
+    _assert_answers(said, user)
+
+
+async def test_speech_before_chained_reply_answers_the_turn() -> None:
+    """The LLM speaks and its tool chains generate_reply(): the speech answers, the chained reply does not."""
+
+    class Router(Agent):
+        def __init__(self) -> None:
+            super().__init__(instructions="router")
+
+        @function_tool
+        async def handoff(self, ctx: RunContext) -> None:
+            self.session.generate_reply(instructions="greet")
+
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.5, "go")
+    actions.add_llm("let me check", tool_calls=[HANDOFF_CALL])
+    actions.add_tts(1.0)
+    actions.add_llm("hello from the greeter", input="greet")
+    actions.add_tts(1.0)
+
+    messages = await _messages(actions, Router())
+    (user,) = _by_role(messages, "user")
+    speech, reply = _by_role(messages, "assistant")
+    assert speech.text_content == "let me check"
+    _assert_answers(speech, user)
+    assert "e2e_latency" not in reply.metrics
