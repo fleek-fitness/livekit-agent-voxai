@@ -124,6 +124,10 @@ if TYPE_CHECKING:
 _AgentActivityContextVar = contextvars.ContextVar["AgentActivity"]("agents_activity")
 _SpeechHandleContextVar = contextvars.ContextVar["SpeechHandle"]("agents_speech_handle")
 _IdleHoldContextVar = contextvars.ContextVar[bool]("agents_idle_hold", default=False)
+# the user turn the running pipeline reply answers, for speeches its llm_node or tools create
+_ReplyUserMetricsContextVar = contextvars.ContextVar["llm.MetricsReport | None"](
+    "agents_reply_user_metrics", default=None
+)
 
 
 async def _aligned_transcript_or_text(
@@ -3635,13 +3639,20 @@ class AgentActivity(RecognitionHooks):
         ]
 
     def _take_on_enter_user_metrics(self) -> llm.MetricsReport | None:
-        """Claim the unanswered user turn for a speech created inside on_enter."""
+        """Claim the user turn for a speech created inside on_enter or a running reply."""
         on_enter_data = _OnEnterContextVar.get(None)
         if (
             on_enter_data is None
             or on_enter_data.agent != self._agent
             or on_enter_data.session != self._session
         ):
+            parent = _SpeechHandleContextVar.get(None)
+            if (
+                parent is not None
+                and not parent.done()
+                and _AgentActivityContextVar.get(None) is self
+            ):
+                return _ReplyUserMetricsContextVar.get()
             return None
         metrics = self._session._unanswered_user_metrics
         self._session._unanswered_user_metrics = None
@@ -3733,6 +3744,9 @@ class AgentActivity(RecognitionHooks):
 
         self._agent._reply_chat_ctx = None
         self._agent._reply_messages = []
+        _ReplyUserMetricsContextVar.set(
+            new_message.metrics if new_message is not None else _previous_user_metrics
+        )
 
         if new_message is not None:
             chat_ctx.insert(new_message)
@@ -3944,6 +3958,7 @@ class AgentActivity(RecognitionHooks):
             self._session._conversation_item_added(new_message)
             user_metrics = new_message.metrics
             self._session._unanswered_user_metrics = user_metrics
+            _ReplyUserMetricsContextVar.set(user_metrics)
 
         if speech_handle.interrupted:
             current_span.set_attribute(trace_types.ATTR_SPEECH_INTERRUPTED, True)
@@ -4181,10 +4196,15 @@ class AgentActivity(RecognitionHooks):
             if started_forwarding_at is not None:
                 assistant_metrics["playback_latency"] = started_speaking_at - started_forwarding_at
 
-            if user_metrics and "stopped_speaking_at" in user_metrics:
+            if (
+                user_metrics
+                and "stopped_speaking_at" in user_metrics
+                and user_metrics is not self._session._answered_user_metrics
+            ):
                 e2e_latency = started_speaking_at - user_metrics["stopped_speaking_at"]
                 assistant_metrics["e2e_latency"] = e2e_latency
                 current_span.set_attribute(trace_types.ATTR_E2E_LATENCY, e2e_latency)
+                self._session._answered_user_metrics = user_metrics
 
             if self._session._unanswered_user_metrics is user_metrics:
                 self._session._unanswered_user_metrics = None

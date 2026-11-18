@@ -596,6 +596,38 @@ async def test_reply_chained_from_llm_node_answers_the_turn() -> None:
     _assert_answers(reply, user)
 
 
+async def test_reply_chained_twice_from_llm_node_answers_the_turn() -> None:
+    """Two silent nodes chain generate_reply() in turn: the third reply answers the turn."""
+
+    class Flow(Agent):
+        def __init__(self) -> None:
+            super().__init__(instructions="flow")
+            self._hops = 0
+
+        async def llm_node(self, chat_ctx, tools, model_settings):  # type: ignore[no-untyped-def]
+            if self._hops < 2:
+                self._hops += 1
+                self.session.generate_reply(instructions=f"hop{self._hops}")
+                return
+            async for chunk in Agent.default.llm_node(self, chat_ctx, tools, model_settings):
+                yield chunk
+
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.5, "go")
+    actions.add_llm("hello from the last node", input="hop2")
+    actions.add_tts(1.0)
+
+    session = create_session(actions, turn_handling={"preemptive_generation": {"enabled": False}})
+    events: list = []
+    session.on("conversation_item_added", events.append)
+    await run_session(session, Flow(), drain_delay=2.0)
+    messages = [ev.item for ev in events if ev.item.type == "message"]
+    (user,) = _by_role(messages, "user")
+    (reply,) = _by_role(messages, "assistant")
+    assert reply.text_content == "hello from the last node"
+    _assert_answers(reply, user)
+
+
 async def test_reply_chained_from_tool_answers_the_turn() -> None:
     """A silent tool chains generate_reply(): the chained reply answers the turn."""
 
@@ -666,3 +698,27 @@ async def test_speech_before_chained_reply_answers_the_turn() -> None:
     assert speech.text_content == "let me check"
     _assert_answers(speech, user)
     assert "e2e_latency" not in reply.metrics
+
+
+async def test_reply_from_timer_set_in_silent_tool_answers_nothing() -> None:
+    """A tool starts a timer and ends the turn silently; the timer's reply answers nothing."""
+
+    class Router(Agent):
+        def __init__(self) -> None:
+            super().__init__(instructions="router")
+
+        @function_tool
+        async def handoff(self, ctx: RunContext) -> None:
+            asyncio.get_event_loop().call_later(
+                2.0, lambda: self.session.generate_reply(instructions="greet")
+            )
+
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.5, "go")
+    actions.add_llm("", tool_calls=[HANDOFF_CALL])
+    actions.add_llm("hello from the greeter", input="greet")
+    actions.add_tts(1.0)
+
+    messages = await _messages(actions, Router(), drain_delay=4.0)
+    (greeting,) = _by_role(messages, "assistant")
+    assert "e2e_latency" not in greeting.metrics
