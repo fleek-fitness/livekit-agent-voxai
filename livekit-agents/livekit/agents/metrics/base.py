@@ -121,6 +121,11 @@ class EOUMetrics(_BaseMetrics):
 
     speech_id: str | None = None
 
+    user_message_id: str | None = None
+    """Id of the user chat message this end of turn produced, as the conversation history
+    keeps it. The replies to that turn carry the same id as `answered_user_message_id`.
+    """
+
     metadata: Metadata | None = None
 
 

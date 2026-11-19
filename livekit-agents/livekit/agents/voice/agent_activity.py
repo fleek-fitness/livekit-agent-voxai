@@ -3020,6 +3020,7 @@ class AgentActivity(RecognitionHooks):
 
         if user_message is not None:
             user_message.metrics = metrics_report
+            metrics_report["user_message_id"] = user_message.id
 
         if isinstance(self.llm, llm.RealtimeModel):
             if self._rt_turn_detection_enabled:
@@ -3116,6 +3117,8 @@ class AgentActivity(RecognitionHooks):
                 preemptive.user_message.content = user_message.content.copy()
                 preemptive.user_message.transcript_confidence = user_message.transcript_confidence
                 preemptive.user_message.metrics = metrics_report
+                # the history keeps the preemptive message, so its id names the turn
+                metrics_report["user_message_id"] = preemptive.user_message.id
                 self._schedule_speech(speech_handle, priority=SpeechHandle.SPEECH_PRIORITY_NORMAL)
                 self._emit_preemptive_generation_outcome(
                     preemptive,
@@ -3172,6 +3175,7 @@ class AgentActivity(RecognitionHooks):
                 transcription_delay=info.metrics.transcription_delay or 0.0,
                 on_user_turn_completed_delay=on_user_turn_completed_delay,
                 speech_id=speech_handle.id,
+                user_message_id=metrics_report.get("user_message_id") if user_message else None,
                 metadata=metadata,
             )
             self._session.emit("metrics_collected", MetricsCollectedEvent(metrics=eou_metrics))
@@ -3603,6 +3607,8 @@ class AgentActivity(RecognitionHooks):
             ):
                 e2e_latency = started_speaking_at - _previous_user_metrics["stopped_speaking_at"]
                 assistant_metrics["e2e_latency"] = e2e_latency
+                if answered_id := _previous_user_metrics.get("user_message_id"):
+                    assistant_metrics["answered_user_message_id"] = answered_id
                 current_span.set_attribute(trace_types.ATTR_E2E_LATENCY, e2e_latency)
                 self._session._answered_user_metrics = _previous_user_metrics
 
@@ -4211,6 +4217,8 @@ class AgentActivity(RecognitionHooks):
             ):
                 e2e_latency = started_speaking_at - user_metrics["stopped_speaking_at"]
                 assistant_metrics["e2e_latency"] = e2e_latency
+                if answered_id := user_metrics.get("user_message_id"):
+                    assistant_metrics["answered_user_message_id"] = answered_id
                 current_span.set_attribute(trace_types.ATTR_E2E_LATENCY, e2e_latency)
                 self._session._answered_user_metrics = user_metrics
 

@@ -40,6 +40,8 @@ def _assert_answers(assistant: ChatMessage, user: ChatMessage) -> None:
     assert assistant.metrics["e2e_latency"] == pytest.approx(
         assistant.metrics["started_speaking_at"] - user.metrics["stopped_speaking_at"]
     )
+    # the reply names the user message it answers, however deep in the chain it plays
+    assert assistant.metrics["answered_user_message_id"] == user.id
 
 
 async def test_handoff_reply_reports_e2e_latency() -> None:
@@ -174,6 +176,7 @@ async def test_say_in_on_enter_answers_the_turn() -> None:
     assert welcome.text_content == "welcome"
     _assert_answers(welcome, user)
     assert "e2e_latency" not in reply.metrics
+    assert "answered_user_message_id" not in reply.metrics
 
 
 async def test_concurrent_on_enter_speeches_answer_once() -> None:
