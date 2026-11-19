@@ -78,16 +78,8 @@ async def test_interrupting_turn_keeps_each_eou_on_its_own_user_message(
     users = [m for m in items if m.role == "user"]
     replies = [m for m in items if m.role == "assistant"]
     assert len(users) == 2
-    user_ids = {m.id for m in users}
-    # every end of turn names a stored user message, and each message is named once
-    eou_ids = [e.user_message_id for e in eous]
-    assert None not in eou_ids
-    assert set(eou_ids) <= user_ids
-    assert len(set(eou_ids)) == len(eou_ids)
+    # each user message ends exactly one turn, and each reply answers its own turn in order
+    assert [e.user_message_id for e in eous] == [m.id for m in users]
     assert len(replies) == 2
     assert replies[0].interrupted
-    # every reply points at a stored user message, never at a stale or foreign id
-    for reply in replies:
-        assert reply.metrics["answered_user_message_id"] in user_ids
-    # the last reply answers the last user message
-    assert replies[-1].metrics["answered_user_message_id"] == users[-1].id
+    assert [r.metrics["answered_user_message_id"] for r in replies] == [m.id for m in users]
