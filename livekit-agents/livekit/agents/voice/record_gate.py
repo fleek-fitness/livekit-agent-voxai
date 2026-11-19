@@ -88,26 +88,27 @@ class RecordGate:
             (
                 t
                 for t in self._turns.values()
-                if item is not None and id(item) in t.message_ids and not t.released
+                if item is not None and id(item) in t.message_ids and not t.message_pushed
             ),
             None,
         )
         self._queue.append((name, arg))
-        if owner is not None and not owner.message_pushed:
+        if owner is not None:
             owner.message_pushed = True
             owner.last_item = item
             for late in owner.pending_late:
                 self._queue.append(late)
                 owner.last_item = late[1].item
             owner.pending_late.clear()
-            owner.marker = _Marker(owner)
-            self._queue.append(owner.marker)
+            if not owner.released:
+                owner.marker = _Marker(owner)
+                self._queue.append(owner.marker)
         self._flush()
 
     def insert_late(self, turn_id: int, name: str, arg: Any) -> None:
         """Record a late final right after the turn's last item."""
         turn = self._turns.get(turn_id)
-        if turn is None or turn.released:
+        if turn is None or (turn.released and turn.message_pushed):
             self._queue.append((name, arg))
             self._flush()
             return
@@ -130,16 +131,21 @@ class RecordGate:
             turn.timer = None
         if turn.marker is not None and turn.marker in self._queue:
             self._queue.remove(turn.marker)
-        for late in turn.pending_late:
-            self._queue.append(late)
-        turn.pending_late.clear()
+        # a late final still waiting for the turn's own message stays behind it: the message
+        # is on its way (it is added by a task), and the pair must come out in this order
         self._flush()
         if not self._queue:
-            self._turns = {k: t for k, t in self._turns.items() if not t.released}
+            self._turns = {
+                k: t for k, t in self._turns.items() if not (t.released and not t.pending_late)
+            }
 
     def release_all(self) -> None:
         for turn_id in list(self._turns):
             self.release_turn(turn_id)
+        # the session ends: a turn whose own message never came leaves its late finals last
+        for turn in self._turns.values():
+            self._queue.extend(turn.pending_late)
+            turn.pending_late.clear()
         self._queue = [e for e in self._queue if not isinstance(e, _Marker)]
         self._flush()
 

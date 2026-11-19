@@ -305,8 +305,6 @@ class _ConfirmedTurn:
 
 
 _MAX_CONFIRMED_TURNS = 16
-# a final this much earlier than the pending turn's first segment is not part of it
-_LATE_FINAL_MARGIN = 0.2
 
 
 class _STTPipeline:
@@ -398,6 +396,10 @@ class AudioRecognition:
     _next_turn_id: int = 0
     _turn_final_spans: list[tuple[float, float]] | None = None
     _stt_watermark: float | None = None
+    _last_confirmed_end: float | None = None
+    # which VAD segment (by onset) set the speech clock / the agent-overlap flag
+    _speech_clock_burst: float | None = None
+    _overlap_unfinalized_burst: float | None = None
     _completed_vad_bursts: deque[tuple[float, float]] | None = None
 
     # late-ack merge state; immutable class-level defaults keep instances that skip __init__ valid
@@ -1780,7 +1782,8 @@ class AudioRecognition:
             if isinstance(bounds, tuple):
                 self._close_empty_bursts_before(bounds)
             late_ack = self._is_late_ack_final(ev, transcript)
-            if not late_ack:
+            if not late_ack and is_given(ev.transcript_span):
+                # providers without spans keep the VAD-owned turn start they always had
                 self._anchor_turn_to_first_final(ev)
             self._record_final_transcript_time()
             if isinstance(bounds, tuple):
@@ -1979,10 +1982,17 @@ class AudioRecognition:
             if owner is None:
                 # the record of its turn is gone: a final that ended before everything the
                 # pending turn has seen cannot belong to it
+                # a final that ended before the last committed turn did cannot be audio of the
+                # pending turn, whether or not that turn's record is still kept
                 firsts = [b[0] for b in self._completed_vad_bursts or ()]
                 if active is not None:
                     firsts.append(active)
-                if not firsts or not span[1] < min(firsts) - _LATE_FINAL_MARGIN:
+                confirmed_end = self._last_confirmed_end
+                if (
+                    confirmed_end is None
+                    or span[1] > confirmed_end
+                    or (firsts and span[1] > min(firsts))
+                ):
                     return False
                 own_span = span
         elif span is None and ev.finalize_onset is not None:
@@ -2032,6 +2042,8 @@ class AudioRecognition:
             self._hooks.on_turn_released(turn_id)
             return
         end = max([b[1] for b in segments] + [s[1] for s in final_spans])
+        if self._last_confirmed_end is None or end > self._last_confirmed_end:
+            self._last_confirmed_end = end
         if self._stt_watermark is not None and self._stt_watermark >= end:
             self._hooks.on_turn_released(turn_id)
             return
@@ -2103,8 +2115,9 @@ class AudioRecognition:
             self._active_vad_speech_started_at,
         )
         if not self._audio_transcript:
-            if self._speech_start_time == start:
+            if self._speech_start_time == start or self._speech_clock_burst == start:
                 self._speech_start_time = next_start
+                self._speech_clock_burst = next_start
             if self._user_turn_start == start:
                 self._end_user_turn_span()
             if owned_turn and self._user_turn_start is None and next_start is not None:
@@ -2116,13 +2129,10 @@ class AudioRecognition:
             self._post_agent_vad_segment_start = next(
                 (b[0] for b in bursts if b[0] > start), self._active_vad_speech_started_at
             )
-        interval = self._last_agent_speech_interval
-        if (
-            self._agent_overlap_segment_unfinalized
-            and interval is not None
-            and interval[0] <= start <= interval[1]
-        ):
+        if self._agent_overlap_segment_unfinalized and self._overlap_unfinalized_burst == start:
+            # only the flag this very segment raised; another overlapped segment keeps its own
             self._agent_overlap_segment_unfinalized = False
+            self._overlap_unfinalized_burst = None
         self._hooks.on_empty_vad_segment_retired(start)
 
     def _anchor_turn_to_first_final(self, ev: stt.SpeechEvent) -> None:
@@ -2170,6 +2180,7 @@ class AudioRecognition:
             self._active_vad_speech_started_at = speech_start_time
             if not self._vad_speech_started:
                 self._speech_start_time = speech_start_time
+                self._speech_clock_burst = speech_start_time
                 self._vad_speech_started = True
 
             self._on_vad_segment_started(speech_start_time)
@@ -2200,6 +2211,7 @@ class AudioRecognition:
 
                 if self._speech_start_time is None:
                     self._speech_start_time = time.time() - ev.raw_accumulated_speech
+                    self._speech_clock_burst = self._active_vad_speech_started_at
                 if self._speaking and self._turn_detector_prediction_fut is not None:
                     if self._turn_detector_stream is not None:
                         self._turn_detector_stream.cancel_inference()
@@ -2227,6 +2239,7 @@ class AudioRecognition:
                 self._vad_segment_overlaps_agent = False
                 if not self._final_since_agent_overlap_segment:
                     self._agent_overlap_segment_unfinalized = True
+                    self._overlap_unfinalized_burst = self._active_vad_speech_started_at
             speech_end_time = time.time() - ev.silence_duration - ev.inference_duration
             if (
                 self._stt is not None

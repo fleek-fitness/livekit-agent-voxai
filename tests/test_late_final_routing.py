@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections import deque
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -36,6 +37,7 @@ def _with_turn(ar: AudioRecognition) -> AudioRecognition:
     ar._confirmed_turns = {5: _ConfirmedTurn(5, [(100.0, 101.0), (101.4, 102.0)], 102.0)}
     ar._completed_vad_bursts = deque([(130.0, 131.0)])
     ar._active_vad_speech_started_at = None
+    ar._last_confirmed_end = 102.0
     return ar
 
 
@@ -284,3 +286,99 @@ async def test_late_final_before_the_turn_message_follows_it() -> None:
     gate.push("conversation_item_added", event("reply"))
     gate.release_turn(1)
     assert out == [message, "late", "reply"]
+
+
+async def test_late_final_is_consumed_even_when_its_record_was_dropped_and_vad_is_close() -> None:
+    ar = _recognition(aligned=False)
+    ar._last_confirmed_end = 102.0
+    ar._completed_vad_bursts = deque([(102.05, 103.0)])
+    late, normal = await _send(ar, _final("없습니다", span=(101.5, 101.95)))
+    assert late == [(None, (101.5, 101.95))]
+    assert normal == 0
+
+
+async def test_without_a_committed_turn_nothing_is_late() -> None:
+    # the first utterance whose VAD segment is missing must still get its reply
+    ar = _recognition(aligned=False)
+    ar._completed_vad_bursts = deque([(130.0, 131.0)])
+    late, normal = await _send(ar, _final("여보세요", span=(100.0, 100.8)))
+    assert late == []
+    assert normal == 1
+
+
+async def test_a_final_after_the_last_committed_turn_is_the_pending_turns() -> None:
+    ar = _with_turn(_recognition(aligned=False))
+    ar._confirmed_turns = {}
+    late, normal = await _send(ar, _final("네", span=(102.5, 102.9)))
+    assert late == []
+    assert normal == 1
+
+
+async def test_empty_segment_clears_the_clock_it_set_through_an_inference_event() -> None:
+    ar = _recognition(aligned=False)
+    ar._completed_vad_bursts = deque([(10.0, 10.3), (12.0, 13.0)])
+    ar._speech_start_time = 10.07  # set by INFERENCE_DONE, not equal to the SOS time
+    ar._speech_clock_burst = 10.0
+    ar._retire_empty_vad_burst(10.0)
+    assert ar._speech_start_time == 12.0
+
+
+async def test_retiring_one_empty_segment_keeps_the_overlap_flag_of_another() -> None:
+    ar = _recognition(aligned=False)
+    ar._completed_vad_bursts = deque([(1.0, 1.3), (2.0, 3.0)])
+    ar._agent_overlap_segment_unfinalized = True
+    ar._overlap_unfinalized_burst = 2.0
+    ar._retire_empty_vad_burst(1.0)
+    assert ar._agent_overlap_segment_unfinalized is True
+    ar._retire_empty_vad_burst(2.0)
+    assert ar._agent_overlap_segment_unfinalized is False
+
+
+async def test_provider_without_spans_never_runs_the_span_corrections() -> None:
+    ar = _recognition(aligned=False)
+    ar._process_stt_event = AudioRecognition._process_stt_event.__get__(ar)  # type: ignore[method-assign]
+    ar._session.options.turn_handling = {"user_turn_limit": {}}
+    ar._anchor_turn_to_first_final = MagicMock()  # type: ignore[method-assign]
+    ar._close_empty_bursts_before = MagicMock()  # type: ignore[method-assign]
+    ar._completed_vad_bursts = deque([(1.0, 1.3), (5.0, 6.0)])
+    ar._user_turn_start = 1.0
+    await ar._on_stt_event(_final("네", span="not_given"))
+    ar._anchor_turn_to_first_final.assert_not_called()
+    ar._close_empty_bursts_before.assert_not_called()
+
+
+# --- the record queue: the turn's own message is added by a task ------------------------------
+
+
+async def test_late_final_waits_for_a_message_that_is_not_there_yet_after_release() -> None:
+    gate, out, event = _gate()
+    gate.open_turn(1)
+    message = SimpleNamespace()
+    gate.bind_message(1, message)
+    gate.insert_late(1, "conversation_item_added", event("second"))
+    gate.release_turn(1)  # the watermark closed the turn before the first message was added
+    assert out == []
+    gate.push("conversation_item_added", SimpleNamespace(item=message))
+    gate.push("conversation_item_added", event("reply"))
+    assert out == [message, "second", "reply"]
+
+
+async def test_session_end_emits_a_late_final_whose_message_never_came_once() -> None:
+    gate, out, event = _gate()
+    gate.open_turn(1)
+    gate.bind_message(1, SimpleNamespace())
+    gate.insert_late(1, "conversation_item_added", event("second"))
+    gate.release_all()
+    gate.release_all()
+    assert out == ["second"]
+
+
+async def test_session_end_orders_first_then_second_once() -> None:
+    gate, out, event = _gate()
+    gate.open_turn(1)
+    message = SimpleNamespace()
+    gate.bind_message(1, message)
+    gate.insert_late(1, "conversation_item_added", event("second"))
+    gate.push("conversation_item_added", SimpleNamespace(item=message))
+    gate.release_all()
+    assert out == [message, "second"]

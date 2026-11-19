@@ -261,6 +261,12 @@ class TestUserTurnStartPersistence:
                         end_time=final_end,
                     )
                 ],
+                # a provider that reports spans (the anchoring is for those only)
+                **(
+                    {"transcript_span": (origin + final_start, origin + final_end)}
+                    if final_end > 0
+                    else {}
+                ),
             )
         )
         if final_before_vad_end:
