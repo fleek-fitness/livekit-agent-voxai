@@ -592,7 +592,7 @@ async def test_empty_finalize_only_retires_a_held_burst_without_a_final(has_fina
     ar._completed_vad_bursts = deque([(first_start, first_end)], maxlen=64)
 
     await ar._on_stt_event(
-        SpeechEvent(type=SpeechEventType.VAD_FINALIZE_EMPTY, speech_start_time=first_start)
+        SpeechEvent(type=SpeechEventType.VAD_FINALIZE_EMPTY, finalize_onset=first_start)
     )
 
     assert ar._user_turn_start == (first_start if has_final else next_start)

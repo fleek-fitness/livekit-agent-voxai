@@ -5,7 +5,7 @@ import json
 import math
 import time
 from collections import deque
-from collections.abc import AsyncIterable, Callable
+from collections.abc import AsyncIterable, Callable, Iterable
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
@@ -77,6 +77,10 @@ class _EndOfTurnInfo:
     metrics: _EndOfTurnMetrics
     transcript_clock_suppressed: bool = False
     transcript_span: NotGivenOr[tuple[float, float] | None] = NOT_GIVEN
+    turn_id: int | None = None
+    """Identifies the committed turn; a late final of the same audio is recorded against it."""
+    normal_turn: bool = False
+    """Set by the hook when the turn is an ordinary reply turn (not a consumed backchannel)."""
     backchannel_over_agent: bool = False
     """The turn's speech overlapped agent speech and was classified a backchannel by adaptive interruption."""
 
@@ -278,12 +282,59 @@ class RecognitionHooks(Protocol):
         stopped_speaking_at: float,
     ) -> None: ...
     def on_transcription_timeout(self, *, speech_duration: float, turn_start: float) -> None: ...
+    def on_late_final(
+        self,
+        ev: stt.SpeechEvent,
+        *,
+        turn_id: int | None,
+        span: tuple[float, float],
+        restore_end: float | None = None,
+    ) -> None: ...
+    def on_turn_released(self, turn_id: int) -> None: ...
+    def on_empty_vad_segment_retired(self, start: float) -> None: ...
     def on_end_of_turn(self, info: _EndOfTurnInfo) -> bool: ...
     def on_eot_prediction(self, ev: EotPredictionEvent) -> None: ...
     def on_agent_backchannel_opportunity(self, ev: _AgentBackchannelOpportunityEvent) -> None: ...
     def on_preemptive_generation(self, info: _PreemptiveGenerationInfo) -> None: ...
     def on_user_turn_exceeded(self, ev: UserTurnExceededEvent) -> None: ...
     def retrieve_chat_ctx(self) -> llm.ChatContext: ...
+
+
+@dataclass
+class _ConfirmedTurn:
+    """A committed reply turn that a final of its audio may still reach."""
+
+    turn_id: int
+    segments: list[tuple[float, float]]
+    end: float
+    original_end: float | None = None
+    """End of the turn's last final as the provider reported it, when the message end was stretched."""
+    stretched_end: float | None = None
+    """The stretched end the message was given (None when the end was not stretched)."""
+
+
+_MAX_CONFIRMED_TURNS = 16
+# a message end may be extended to the end of its VAD segment by at most this much; a longer
+# tail is taken as trailing noise and the final's own end is kept
+_MAX_SPAN_END_EXTENSION = 1.0
+
+
+def _extend_span_end(
+    span: tuple[float, float], segments: Iterable[tuple[float, float]]
+) -> tuple[float, float]:
+    """Stretch a final's end to the end of the one VAD segment it overlaps.
+
+    Providers report the end of the last token, which can precede the acoustic end of the speech.
+    The end only grows, by at most _MAX_SPAN_END_EXTENSION, and only when exactly one ended
+    segment overlaps the span; the start is never touched.
+    """
+    overlapping = [seg for seg in segments if seg[0] <= span[1] and span[0] <= seg[1]]
+    if len(overlapping) != 1:
+        return span
+    seg_end = overlapping[0][1]
+    if span[1] < seg_end <= span[1] + _MAX_SPAN_END_EXTENSION:
+        return (span[0], seg_end)
+    return span
 
 
 class _STTPipeline:
@@ -371,13 +422,32 @@ class AudioRecognition:
     _transcript_span: NotGivenOr[tuple[float, float] | None] = NOT_GIVEN
     # Keep recent VAD bounds until STT confirms which burst supplied the first text.
     _vad_finalize_start: float | None = None
+    _confirmed_turns: dict[int, _ConfirmedTurn] | None = None
+    _next_turn_id: int = 0
+    _turn_final_spans: list[tuple[float, float]] | None = None
+    _stt_watermark: float | None = None
+    _last_confirmed_end: float | None = None
+    # which VAD segment (by onset) set the speech clock / the agent-overlap flag
+    _speech_clock_burst: float | None = None
+    _overlap_unfinalized_bursts: frozenset[float] = frozenset()
+
+    @property
+    def _agent_overlap_segment_unfinalized(self) -> bool:
+        return self._overlap_flag
+
+    @_agent_overlap_segment_unfinalized.setter
+    def _agent_overlap_segment_unfinalized(self, value: bool) -> None:
+        self._overlap_flag = value
+        if not value:
+            self._overlap_unfinalized_bursts = frozenset()
+
     _completed_vad_bursts: deque[tuple[float, float]] | None = None
 
     # late-ack merge state; immutable class-level defaults keep instances that skip __init__ valid
     _last_agent_speech_interval: tuple[float, float] | None = None
     _active_vad_speech_started_at: float | None = None
     _vad_segment_overlaps_agent: bool = False
-    _agent_overlap_segment_unfinalized: bool = False
+    _overlap_flag: bool = False
     _final_since_agent_overlap_segment: bool = False
     _post_agent_vad_segment_start: float | None = None
     _late_ack_wait_timer: asyncio.TimerHandle | None = None
@@ -1438,6 +1508,7 @@ class AudioRecognition:
         self._clear_late_ack_wait()
         self._held_segments.reset()
         self._completed_vad_bursts = None
+        self._turn_final_spans = None
         self._agent_overlap_segment_unfinalized = False
         self._post_agent_vad_segment_start = None
         self._audio_transcript = ""
@@ -1575,7 +1646,22 @@ class AudioRecognition:
 
     async def _on_stt_event(self, ev: stt.SpeechEvent) -> None:
         if ev.type == stt.SpeechEventType.VAD_FINALIZE_EMPTY:
-            self._retire_empty_vad_burst(ev.speech_start_time)
+            # the provider proved the finalize of the segment that began at this onset ended
+            # with no text; only an exact, unambiguous segment of the pending turn is closed
+            self._retire_empty_vad_burst(ev.finalize_onset)
+            return
+
+        if ev.type == stt.SpeechEventType.FINALIZED_UNTIL:
+            if ev.speech_end_time is not None:
+                self._on_finalized_until(ev.speech_end_time)
+            return
+
+        if (
+            ev.type == stt.SpeechEventType.FINAL_TRANSCRIPT
+            and ev.alternatives
+            and ev.alternatives[0].text
+            and self._consume_late_final(ev)
+        ):
             return
 
         if (
@@ -1734,11 +1820,18 @@ class AudioRecognition:
                 extra["transcript_delay"] = time.time() - self._last_speaking_time
             logger.debug("received user transcript", extra=extra)
 
+            bounds = self._resolve_final_span(ev)
+            if isinstance(bounds, tuple):
+                self._close_empty_bursts_before(bounds)
             late_ack = self._is_late_ack_final(ev, transcript)
-            if not late_ack:
+            if not late_ack and is_given(ev.transcript_span):
+                # providers without spans keep the VAD-owned turn start they always had
                 self._anchor_turn_to_first_final(ev)
             self._record_final_transcript_time()
-            bounds = ev.transcript_span
+            if isinstance(bounds, tuple):
+                if self._turn_final_spans is None:
+                    self._turn_final_spans = []
+                self._turn_final_spans.append(bounds)
             if not self._audio_transcript:
                 self._transcript_span = bounds
             elif isinstance(self._transcript_span, tuple) and isinstance(bounds, tuple):
@@ -1921,12 +2014,178 @@ class AudioRecognition:
             if self._end_of_turn_task is not None:
                 self._end_of_turn_task.cancel()
 
-    def _retire_empty_vad_burst(self, start: float | None) -> None:
-        bursts = self._completed_vad_bursts
-        if start is None or not bursts or self._audio_transcript:
+    # region: finals that reach a turn after it was committed
+
+    def _consume_late_final(self, ev: stt.SpeechEvent) -> bool:
+        """Record a final whose audio belongs to an already committed turn, as its own message.
+
+        It never touches the pending turn: no transcript, held segment, late-ack state, end-of-turn
+        timer or interruption is involved. A final whose audio cannot be tied to a committed turn
+        or to a position before the pending turn is left to the normal path.
+        """
+        span = ev.transcript_span
+        turns = list(self._confirmed_turns.values()) if self._confirmed_turns else []
+        active = self._active_vad_speech_started_at
+        owner: _ConfirmedTurn | None = None
+        own_span: tuple[float, float] | None = None
+
+        if isinstance(span, tuple):
+            if active is not None and span[0] >= active:
+                return False
+            for turn in reversed(turns):
+                if any(seg[0] <= span[1] and span[0] <= seg[1] for seg in turn.segments):
+                    owner, own_span = turn, span
+                    break
+            if owner is None:
+                # the record of its turn is gone: a final that ended before everything the
+                # pending turn has seen cannot belong to it
+                # a final that ended before the last committed turn did cannot be audio of the
+                # pending turn, whether or not that turn's record is still kept
+                firsts = [b[0] for b in self._completed_vad_bursts or ()]
+                if active is not None:
+                    firsts.append(active)
+                confirmed_end = self._last_confirmed_end
+                if (
+                    confirmed_end is None
+                    or span[1] > confirmed_end
+                    or (firsts and span[1] > min(firsts))
+                ):
+                    return False
+                own_span = span
+        elif span is None and ev.finalize_onset is not None:
+            for turn in reversed(turns):
+                matches = [seg for seg in turn.segments if seg[0] == ev.finalize_onset]
+                if len(matches) == 1:
+                    owner, own_span = turn, matches[0]
+                    break
+            if owner is None:
+                return False
+        else:
+            return False
+
+        if own_span is None:
+            return False
+
+        # same end rule as a committed turn: the segments of its own turn, else the pending ones
+        pool = owner.segments if owner is not None else list(self._completed_vad_bursts or ())
+        own_span = _extend_span_end(own_span, pool)
+        logger.info(
+            "late final recorded as its own message",
+            extra={"turn_id": owner.turn_id if owner else None, "span": own_span},
+        )
+        restore_end: float | None = None
+        if (
+            owner is not None
+            and owner.stretched_end is not None
+            and owner.original_end is not None
+            and owner.stretched_end > own_span[0]
+        ):
+            # the turn's message end was stretched over this late final's audio: take it back
+            restore_end = max(owner.original_end, own_span[0])
+            owner.stretched_end = restore_end if restore_end > owner.original_end else None
+        self._hooks.on_late_final(
+            ev,
+            turn_id=owner.turn_id if owner is not None else None,
+            span=own_span,
+            restore_end=restore_end,
+        )
+        return True
+
+    def _on_finalized_until(self, until: float) -> None:
+        if self._stt_watermark is None or until > self._stt_watermark:
+            self._stt_watermark = until
+        for turn_id, turn in list((self._confirmed_turns or {}).items()):
+            if turn.end <= until:
+                self._close_confirmed_turn(turn_id)
+
+    def _close_confirmed_turn(self, turn_id: int) -> None:
+        if self._confirmed_turns is not None:
+            self._confirmed_turns.pop(turn_id, None)
+        self._hooks.on_turn_released(turn_id)
+
+    def _record_confirmed_turn(
+        self,
+        info: _EndOfTurnInfo,
+        bursts: list[tuple[float, float]],
+        final_spans: list[tuple[float, float]],
+        original_end: float | None = None,
+    ) -> None:
+        """Remember a committed reply turn while a final of its audio may still arrive."""
+        turn_id = info.turn_id
+        if turn_id is None or not info.normal_turn or not is_given(info.transcript_span):
             return
-        burst = next((burst for burst in bursts if burst[0] == start), None)
-        if burst is None:
+        segments = bursts or final_spans
+        if not segments:
+            self._hooks.on_turn_released(turn_id)
+            return
+        end = max([b[1] for b in segments] + [s[1] for s in final_spans])
+        if self._last_confirmed_end is None or end > self._last_confirmed_end:
+            self._last_confirmed_end = end
+        if self._stt_watermark is not None and self._stt_watermark >= end:
+            self._hooks.on_turn_released(turn_id)
+            return
+        if self._confirmed_turns is None:
+            self._confirmed_turns = {}
+        while len(self._confirmed_turns) >= _MAX_CONFIRMED_TURNS:
+            oldest = next(iter(self._confirmed_turns))
+            logger.warning("dropping the oldest confirmed turn record", extra={"turn_id": oldest})
+            self._close_confirmed_turn(oldest)
+        stretched = (
+            isinstance(info.transcript_span, tuple)
+            and original_end is not None
+            and info.transcript_span[1] > original_end
+        )
+        self._confirmed_turns[turn_id] = _ConfirmedTurn(
+            turn_id,
+            list(segments),
+            end,
+            original_end=original_end if stretched else None,
+            stretched_end=info.transcript_span[1] if stretched else None,  # type: ignore[index]
+        )
+
+    # endregion
+
+    def _burst_has_text(self, burst: tuple[float, float]) -> bool:
+        return any(
+            span[0] <= burst[1] and burst[0] <= span[1] for span in self._turn_final_spans or ()
+        )
+
+    def _segment_for_onset(self, onset: float) -> tuple[float, float] | None:
+        """The one ended VAD segment of the pending turn that began at `onset`, if unambiguous."""
+        matches = [b for b in self._completed_vad_bursts or () if b[0] == onset]
+        return matches[0] if len(matches) == 1 else None
+
+    def _resolve_final_span(self, ev: stt.SpeechEvent) -> NotGivenOr[tuple[float, float] | None]:
+        """The call-clock span of a final's audio.
+
+        A final with no span of its own takes the VAD segment its finalize onset names, when
+        that segment is unique; anything else stays unknown.
+        """
+        span = ev.transcript_span
+        if span is None and ev.finalize_onset is not None:
+            return self._segment_for_onset(ev.finalize_onset)
+        return span
+
+    def _close_empty_bursts_before(self, span: tuple[float, float]) -> None:
+        """A final with its own span proves the segments that ended before it had no text.
+
+        The stream emits finals in audio order, so a text-less segment that ended before this
+        final's audio started will never get one.
+        """
+        for burst in list(self._completed_vad_bursts or ()):
+            if burst[1] < span[0] and not self._burst_has_text(burst):
+                self._retire_empty_vad_burst(burst[0])
+
+    def _retire_empty_vad_burst(self, start: float | None) -> None:
+        """Take back everything an ended VAD segment with no text left behind."""
+        bursts = self._completed_vad_bursts
+        if start is None or not bursts:
+            return
+        matches = [b for b in bursts if b[0] == start]
+        if len(matches) != 1:
+            return
+        burst = matches[0]
+        if self._burst_has_text(burst):
             return
 
         held_segment = self._held_segments.find(start)
@@ -1943,13 +2202,28 @@ class AudioRecognition:
             (burst_start for burst_start, _ in bursts if burst_start > start),
             self._active_vad_speech_started_at,
         )
-        if self._speech_start_time == start:
-            self._speech_start_time = next_start
-        if self._user_turn_start == start:
-            self._end_user_turn_span()
-        if owned_turn and self._user_turn_start is None and next_start is not None:
-            self._ensure_user_turn_span(start_time=next_start)
-            self._held_segments.cleared_span = False
+        if not self._audio_transcript:
+            if self._speech_start_time == start or self._speech_clock_burst == start:
+                self._speech_start_time = next_start
+                self._speech_clock_burst = next_start
+            if self._user_turn_start == start:
+                self._end_user_turn_span()
+            if owned_turn and self._user_turn_start is None and next_start is not None:
+                self._ensure_user_turn_span(start_time=next_start)
+                self._held_segments.cleared_span = False
+
+        # the late-acknowledgement bookkeeping saw this segment start and end
+        if self._post_agent_vad_segment_start == start:
+            self._post_agent_vad_segment_start = next(
+                (b[0] for b in bursts if b[0] > start), self._active_vad_speech_started_at
+            )
+        if start in self._overlap_unfinalized_bursts:
+            # every overlapped segment still waiting for text keeps the flag up; only the
+            # last one to go takes it down
+            self._overlap_unfinalized_bursts -= {start}
+            if not self._overlap_unfinalized_bursts:
+                self._agent_overlap_segment_unfinalized = False
+        self._hooks.on_empty_vad_segment_retired(start)
 
     def _anchor_turn_to_first_final(self, ev: stt.SpeechEvent) -> None:
         """Move a provisional VAD onset only when a newer burst supplied the text."""
@@ -1996,6 +2270,7 @@ class AudioRecognition:
             self._active_vad_speech_started_at = speech_start_time
             if not self._vad_speech_started:
                 self._speech_start_time = speech_start_time
+                self._speech_clock_burst = speech_start_time
                 self._vad_speech_started = True
 
             self._on_vad_segment_started(speech_start_time)
@@ -2026,6 +2301,7 @@ class AudioRecognition:
 
                 if self._speech_start_time is None:
                     self._speech_start_time = time.time() - ev.raw_accumulated_speech
+                    self._speech_clock_burst = self._active_vad_speech_started_at
                 if self._speaking and self._turn_detector_prediction_fut is not None:
                     if self._turn_detector_stream is not None:
                         self._turn_detector_stream.cancel_inference()
@@ -2053,6 +2329,8 @@ class AudioRecognition:
                 self._vad_segment_overlaps_agent = False
                 if not self._final_since_agent_overlap_segment:
                     self._agent_overlap_segment_unfinalized = True
+                    if self._active_vad_speech_started_at is not None:
+                        self._overlap_unfinalized_bursts |= {self._active_vad_speech_started_at}
             speech_end_time = time.time() - ev.silence_duration - ev.inference_duration
             if (
                 self._stt is not None
@@ -2460,18 +2738,35 @@ class AudioRecognition:
                 last_final_transcript_time=last_final_transcript_time,
                 now=time.time(),
             )
-            committed = self._hooks.on_end_of_turn(
-                _EndOfTurnInfo(
-                    skip_reply=skip_reply,
-                    new_transcript=self._audio_transcript,
-                    transcript_span=self._transcript_span,
-                    transcript_confidence=confidence_avg,
-                    metrics=metrics,
-                    transcript_clock_suppressed=transcript_clock_suppressed,
-                    backchannel_over_agent=self._turn_backchannel_over_agent,
-                )
+            turn_id = self._next_turn_id
+            self._next_turn_id += 1
+            turn_span = self._transcript_span
+            original_end = turn_span[1] if isinstance(turn_span, tuple) else None
+            if isinstance(turn_span, tuple) and self._turn_final_spans:
+                # the turn's last final (latest end) decides how far its end can stretch
+                last = max(self._turn_final_spans, key=lambda sp: sp[1])
+                extended = _extend_span_end(last, self._completed_vad_bursts or ())
+                if extended[1] > turn_span[1]:
+                    turn_span = (turn_span[0], extended[1])
+            turn_info = _EndOfTurnInfo(
+                skip_reply=skip_reply,
+                new_transcript=self._audio_transcript,
+                turn_id=turn_id,
+                transcript_span=turn_span,
+                transcript_confidence=confidence_avg,
+                metrics=metrics,
+                transcript_clock_suppressed=transcript_clock_suppressed,
+                backchannel_over_agent=self._turn_backchannel_over_agent,
             )
+            committed = self._hooks.on_end_of_turn(turn_info)
             if committed:
+                self._record_confirmed_turn(
+                    turn_info,
+                    list(self._completed_vad_bursts or ()),
+                    list(self._turn_final_spans or ()),
+                    original_end,
+                )
+                self._turn_final_spans = None
                 logger.debug(
                     "user turn committed",
                     extra={

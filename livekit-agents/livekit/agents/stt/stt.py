@@ -50,8 +50,12 @@ class SpeechEventType(str, Enum):
     portion of speech will not change"""
     RECOGNITION_USAGE = "recognition_usage"
     """usage event, emitted periodically to indicate usage metrics"""
+    FINALIZED_UNTIL = "finalized_until"
+    """No further final will be emitted for audio before `speech_end_time` (call-clock epoch
+    seconds). Emitted only within one connection of the provider; a provider that cannot say so
+    never emits it."""
     VAD_FINALIZE_EMPTY = "vad_finalize_empty"
-    """A VAD-triggered finalize returned no text for the onset in speech_start_time."""
+    """A VAD-triggered finalize ended without text; the segment onset is in finalize_onset."""
     END_OF_SPEECH = "end_of_speech"
     """indicate the end of speech, emitted when the user stops speaking"""
 
@@ -129,7 +133,13 @@ class SpeechEvent:
     speech_end_time: float | None = None
     """Wall-clock time when the recognized speech ended, when known."""
     transcript_span: NotGivenOr[tuple[float, float] | None] = NOT_GIVEN
-    """Wall-clock bounds of the final text for message history. None means unresolvable."""
+    """FINAL_TRANSCRIPT only. Wall-clock (epoch seconds) start and end of the audio that
+    produced this final's text. NOT_GIVEN: the provider does not report it (current
+    behavior is kept). None: supported, but this final's span cannot be proven."""
+    finalize_onset: float | None = None
+    """Set only when the adapter can prove this final answers the manual finalize (or flush)
+    sent for the VAD segment that began at this wall-clock onset. On VAD_FINALIZE_EMPTY it
+    names the segment whose finalize ended with no text."""
 
 
 @dataclass

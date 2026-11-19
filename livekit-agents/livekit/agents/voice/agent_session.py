@@ -80,6 +80,7 @@ from .keyterm_detection import (
     _resolve_stt_context_options,
     _stt_context_from_keyterms_options,
 )
+from .record_gate import GATED_EVENTS, RecordGate
 from .recorder_io import RecorderIO
 from .remote_session import RoomSessionTransport, SessionHost, SessionTransport
 from .run_result import RunOutputOptions, RunResult
@@ -742,6 +743,7 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
         self._session_ctx_token: Token[otel_context.Context] | None = None
 
         self._recorded_events: list[AgentEvent] = []
+        self._record_gate = RecordGate(self._emit_now)
         self._started_at: float | None = None
         self._usage_collector = ModelUsageCollector()
         self._redaction_enabled = False
@@ -766,8 +768,15 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
         return super().on(event, callback)
 
     def emit(self, event: EventTypes, arg: AgentEvent) -> None:
+        gate = getattr(self, "_record_gate", None)
+        if gate is not None and event in GATED_EVENTS and gate.active:
+            gate.push(event, arg)
+            return
+        self._emit_now(event, arg)
+
+    def _emit_now(self, event: str, arg: AgentEvent) -> None:
         self._recorded_events.append(arg)
-        super().emit(event, arg)
+        super().emit(event, arg)  # type: ignore[arg-type]
 
     @property
     def userdata(self) -> Userdata_T:
@@ -1454,6 +1463,8 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
 
             self._started = False
 
+            if (gate := getattr(self, "_record_gate", None)) is not None:
+                gate.release_all()
             self.emit("close", CloseEvent(error=error, reason=reason))
 
             self._cancel_user_away_timer()
@@ -2257,6 +2268,19 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
                 extra={"role": message.role, "lk.pii.text": text},
             )
         self.emit("conversation_item_added", ConversationItemAddedEvent(item=message))
+
+    def _late_final_item_added(self, message: llm.ChatMessage, *, turn_id: int | None) -> None:
+        """Record a user message made from a final that arrived after its turn was committed.
+
+        It goes right after the turn's last recorded item while the turn is still open, and at
+        the arrival position otherwise.
+        """
+        self._chat_ctx.insert(message)
+        self._record_gate.insert_late(
+            turn_id if turn_id is not None else -1,
+            "conversation_item_added",
+            ConversationItemAddedEvent(item=message),
+        )
 
     def _tool_items_added(self, items: Sequence[llm.FunctionCall | llm.FunctionCallOutput]) -> None:
         self._chat_ctx.insert(items)
