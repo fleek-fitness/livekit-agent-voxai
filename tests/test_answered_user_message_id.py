@@ -52,3 +52,42 @@ async def test_eou_and_reply_name_the_stored_user_message(preemptive: dict) -> N
     # the id the conversation history keeps, also when a preemptive reply is reused
     assert eou.user_message_id == user.id
     assert reply.metrics["answered_user_message_id"] == user.id
+
+
+@pytest.mark.parametrize(
+    "preemptive",
+    [
+        pytest.param({"enabled": False}, id="no_preemptive"),
+        pytest.param({"preemptive_tts": True}, id="preemptive_tts"),
+    ],
+)
+async def test_interrupting_turn_keeps_each_eou_on_its_own_user_message(
+    preemptive: dict,
+) -> None:
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.0, "Tell me a long story", stt_delay=0.1)
+    actions.add_llm("Once upon a time there was a very long story.")
+    actions.add_tts(8.0)
+    # B talks over A's reply
+    actions.add_user_speech(5.0, 6.5, "Actually, stop", stt_delay=0.1)
+    actions.add_llm("Okay, stopping.")
+    actions.add_tts(1.0)
+
+    items, eous = await _run(actions, turn_handling={"preemptive_generation": preemptive})
+
+    users = [m for m in items if m.role == "user"]
+    replies = [m for m in items if m.role == "assistant"]
+    assert len(users) == 2
+    user_ids = {m.id for m in users}
+    # every end of turn names a stored user message, and each message is named once
+    eou_ids = [e.user_message_id for e in eous]
+    assert None not in eou_ids
+    assert set(eou_ids) <= user_ids
+    assert len(set(eou_ids)) == len(eou_ids)
+    assert len(replies) == 2
+    assert replies[0].interrupted
+    # every reply points at a stored user message, never at a stale or foreign id
+    for reply in replies:
+        assert reply.metrics["answered_user_message_id"] in user_ids
+    # the last reply answers the last user message
+    assert replies[-1].metrics["answered_user_message_id"] == users[-1].id
