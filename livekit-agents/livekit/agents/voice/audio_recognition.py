@@ -364,6 +364,10 @@ class _STTPipeline:
 
 
 class AudioRecognition:
+    _vad_finalize_start: float | None = None
+    """Wall-clock onset of the VAD segment whose end is being dispatched to on_end_of_speech;
+    only set for the duration of that hook call, None otherwise."""
+
     # late-ack merge state; immutable class-level defaults keep instances that skip __init__ valid
     _last_agent_speech_interval: tuple[float, float] | None = None
     _active_vad_speech_started_at: float | None = None
@@ -1150,7 +1154,9 @@ class AudioRecognition:
             # stamp the wall-clock anchor on the first frame to reach the pipeline
             if self._stt_pipeline.input_started_at is None:
                 self._stt_pipeline.input_started_at = time.time() - frame.duration
-            self._stt_pipeline.audio_ch.send_nowait(stt_frame if stt_frame is not None else frame)
+            outgoing = stt_frame if stt_frame is not None else frame
+            outgoing.userdata["lk.audio_frame_start"] = time.time() - frame.duration
+            self._stt_pipeline.audio_ch.send_nowait(outgoing)
 
         if self._vad_ch is not None:
             self._vad_ch.send_nowait(frame)
@@ -1921,8 +1927,14 @@ class AudioRecognition:
 
         elif ev.type == vad.VADEventType.END_OF_SPEECH:
             vad_speech_started = self._vad_speech_started
-            with tracer.use_span(self._ensure_user_turn_span()):
-                self._hooks.on_end_of_speech(ev)
+            self._vad_finalize_start = (
+                self._active_vad_speech_started_at if vad_speech_started else None
+            )
+            try:
+                with tracer.use_span(self._ensure_user_turn_span()):
+                    self._hooks.on_end_of_speech(ev)
+            finally:
+                self._vad_finalize_start = None
 
             if self._vad_segment_overlaps_agent:
                 self._vad_segment_overlaps_agent = False
