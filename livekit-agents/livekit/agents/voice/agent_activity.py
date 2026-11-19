@@ -4298,6 +4298,11 @@ class AgentActivity(RecognitionHooks):
                     FunctionToolsExecutedEvent(
                         function_calls=interrupted_calls,
                         function_call_outputs=interrupted_fnc_outputs,
+                        function_call_exec_windows={
+                            o.fnc_call.call_id: o.exec_window
+                            for o in tool_output.output
+                            if o.exec_window is not None
+                        },
                     ),
                 )
                 self._agent._chat_ctx.insert(interrupted_tool_messages)
@@ -4343,6 +4348,10 @@ class AgentActivity(RecognitionHooks):
 
                 fnc_executed_ev.function_calls.append(sanitized_out.fnc_call)
                 fnc_executed_ev.function_call_outputs.append(sanitized_out.fnc_call_out)
+                if sanitized_out.exec_window is not None:
+                    fnc_executed_ev.function_call_exec_windows[sanitized_out.fnc_call.call_id] = (
+                        sanitized_out.exec_window
+                    )
 
                 if new_agent_task is not None and sanitized_out.agent_task is not None:
                     logger.error("expected to receive only one AgentTask from the tool executions")

@@ -64,6 +64,10 @@ class RunContext(Generic[Userdata_T]):
         # synthesized progress-update pairs, populated whether or not an executor is attached
         self._updates: list[tuple[FunctionCall, FunctionCallOutput]] = []
 
+        # wall-clock window of the tool callable itself, set by the executor
+        self._exec_started_at: float | None = None
+        self._exec_ended_at: float | None = None
+
         # set/cleared by the executor around the tool's lifetime
         self._executor: _ToolExecutor | None = None
         self._first_update_fut: asyncio.Future[Any] | None = None
@@ -454,6 +458,13 @@ class FunctionToolsExecutedEvent(BaseModel):
     type: Literal["function_tools_executed"] = "function_tools_executed"
     function_calls: list[FunctionCall]
     function_call_outputs: list[FunctionCallOutput]
+    function_call_exec_windows: dict[str, tuple[float, float]] = Field(default_factory=dict)
+    """Wall-clock ``(start, end)`` of each call's tool callable, keyed by ``call_id``.
+
+    Measured right before the callable is awaited and right after it returns, so it
+    excludes any wait for speech permission or between steps. A call whose callable never
+    ran (unknown tool, bad arguments, duplicate rejected) has no entry.
+    """
     created_at: float = Field(default_factory=time.time)
     _handoff_required: bool = PrivateAttr(default=False)
 

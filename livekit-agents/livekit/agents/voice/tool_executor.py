@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import weakref
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -350,12 +351,16 @@ class _ToolExecutor:
                 fnc_args, fnc_kwargs = prepare_function_arguments(
                     fnc=tool, json_arguments=raw_arguments, call_ctx=run_ctx
                 )
-                if mock is not None:
-                    from .run_result import _run_mock
+                run_ctx._exec_started_at = time.time()
+                try:
+                    if mock is not None:
+                        from .run_result import _run_mock
 
-                    output = await _run_mock(mock, *fnc_args, **fnc_kwargs)
-                else:
-                    output = await tool(*fnc_args, **fnc_kwargs)
+                        output = await _run_mock(mock, *fnc_args, **fnc_kwargs)
+                    else:
+                        output = await tool(*fnc_args, **fnc_kwargs)
+                finally:
+                    run_ctx._exec_ended_at = time.time()
             except asyncio.CancelledError:
                 logger.debug("tool cancelled", extra={"call_id": call_id, "function": fnc_name})
                 if not first_update_fut.done():
