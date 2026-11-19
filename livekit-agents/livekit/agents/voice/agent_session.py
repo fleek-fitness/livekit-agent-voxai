@@ -767,8 +767,9 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
         return super().on(event, callback)
 
     def emit(self, event: EventTypes, arg: AgentEvent) -> None:
-        if event in GATED_EVENTS and self._record_gate.active:
-            self._record_gate.push(event, arg)
+        gate = getattr(self, "_record_gate", None)
+        if gate is not None and event in GATED_EVENTS and gate.active:
+            gate.push(event, arg)
             return
         self._emit_now(event, arg)
 
@@ -1461,7 +1462,8 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
 
             self._started = False
 
-            self._record_gate.release_all()
+            if (gate := getattr(self, "_record_gate", None)) is not None:
+                gate.release_all()
             self.emit("close", CloseEvent(error=error, reason=reason))
 
             self._cancel_user_away_timer()
