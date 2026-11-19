@@ -399,14 +399,25 @@ class AudioRecognition:
     _last_confirmed_end: float | None = None
     # which VAD segment (by onset) set the speech clock / the agent-overlap flag
     _speech_clock_burst: float | None = None
-    _overlap_unfinalized_burst: float | None = None
+    _overlap_unfinalized_bursts: frozenset[float] = frozenset()
+
+    @property
+    def _agent_overlap_segment_unfinalized(self) -> bool:
+        return self._overlap_flag
+
+    @_agent_overlap_segment_unfinalized.setter
+    def _agent_overlap_segment_unfinalized(self, value: bool) -> None:
+        self._overlap_flag = value
+        if not value:
+            self._overlap_unfinalized_bursts = frozenset()
+
     _completed_vad_bursts: deque[tuple[float, float]] | None = None
 
     # late-ack merge state; immutable class-level defaults keep instances that skip __init__ valid
     _last_agent_speech_interval: tuple[float, float] | None = None
     _active_vad_speech_started_at: float | None = None
     _vad_segment_overlaps_agent: bool = False
-    _agent_overlap_segment_unfinalized: bool = False
+    _overlap_flag: bool = False
     _final_since_agent_overlap_segment: bool = False
     _post_agent_vad_segment_start: float | None = None
     _late_ack_wait_timer: asyncio.TimerHandle | None = None
@@ -2129,10 +2140,12 @@ class AudioRecognition:
             self._post_agent_vad_segment_start = next(
                 (b[0] for b in bursts if b[0] > start), self._active_vad_speech_started_at
             )
-        if self._agent_overlap_segment_unfinalized and self._overlap_unfinalized_burst == start:
-            # only the flag this very segment raised; another overlapped segment keeps its own
-            self._agent_overlap_segment_unfinalized = False
-            self._overlap_unfinalized_burst = None
+        if start in self._overlap_unfinalized_bursts:
+            # every overlapped segment still waiting for text keeps the flag up; only the
+            # last one to go takes it down
+            self._overlap_unfinalized_bursts -= {start}
+            if not self._overlap_unfinalized_bursts:
+                self._agent_overlap_segment_unfinalized = False
         self._hooks.on_empty_vad_segment_retired(start)
 
     def _anchor_turn_to_first_final(self, ev: stt.SpeechEvent) -> None:
@@ -2239,7 +2252,8 @@ class AudioRecognition:
                 self._vad_segment_overlaps_agent = False
                 if not self._final_since_agent_overlap_segment:
                     self._agent_overlap_segment_unfinalized = True
-                    self._overlap_unfinalized_burst = self._active_vad_speech_started_at
+                    if self._active_vad_speech_started_at is not None:
+                        self._overlap_unfinalized_bursts |= {self._active_vad_speech_started_at}
             speech_end_time = time.time() - ev.silence_duration - ev.inference_duration
             if (
                 self._stt is not None

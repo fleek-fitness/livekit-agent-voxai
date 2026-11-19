@@ -54,7 +54,11 @@ class RecordGate:
 
     @property
     def active(self) -> bool:
-        return bool(self._queue) or any(not t.released for t in self._turns.values())
+        # a released turn whose own message has not been added yet still owns a waiting late
+        # final: the message must come through the gate to take it along
+        return bool(self._queue) or any(
+            not t.released or t.pending_late for t in self._turns.values()
+        )
 
     def open_turn(self, turn_id: int) -> None:
         if turn_id in self._turns:

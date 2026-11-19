@@ -323,15 +323,24 @@ async def test_empty_segment_clears_the_clock_it_set_through_an_inference_event(
     assert ar._speech_start_time == 12.0
 
 
-async def test_retiring_one_empty_segment_keeps_the_overlap_flag_of_another() -> None:
+@pytest.mark.parametrize("first", [1.0, 2.0])
+async def test_overlap_flag_stays_up_until_every_waiting_segment_is_gone(first: float) -> None:
     ar = _recognition(aligned=False)
     ar._completed_vad_bursts = deque([(1.0, 1.3), (2.0, 3.0)])
     ar._agent_overlap_segment_unfinalized = True
-    ar._overlap_unfinalized_burst = 2.0
-    ar._retire_empty_vad_burst(1.0)
+    ar._overlap_unfinalized_bursts = frozenset({1.0, 2.0})
+    ar._retire_empty_vad_burst(first)
     assert ar._agent_overlap_segment_unfinalized is True
-    ar._retire_empty_vad_burst(2.0)
+    ar._retire_empty_vad_burst(3.0 - first)
     assert ar._agent_overlap_segment_unfinalized is False
+
+
+async def test_a_final_clears_the_overlap_flag_and_its_segments() -> None:
+    ar = _recognition(aligned=False)
+    ar._agent_overlap_segment_unfinalized = True
+    ar._overlap_unfinalized_bursts = frozenset({1.0})
+    ar._agent_overlap_segment_unfinalized = False
+    assert ar._overlap_unfinalized_bursts == frozenset()
 
 
 async def test_provider_without_spans_never_runs_the_span_corrections() -> None:
@@ -382,3 +391,24 @@ async def test_session_end_orders_first_then_second_once() -> None:
     gate.push("conversation_item_added", SimpleNamespace(item=message))
     gate.release_all()
     assert out == [message, "second"]
+
+
+async def test_the_session_emit_path_hands_the_waiting_first_message_to_the_gate() -> None:
+    gate, out, event = _gate()
+    gate.open_turn(1)
+    message = SimpleNamespace()
+    gate.bind_message(1, message)
+    gate.insert_late(1, "conversation_item_added", event("second"))
+    gate.release_turn(1)  # closed by the watermark before the first message exists
+
+    def emit(name: str, arg: Any) -> None:  # what AgentSession.emit does
+        if gate.active:
+            gate.push(name, arg)
+        else:
+            out.append(arg.item)
+
+    emit("conversation_item_added", SimpleNamespace(item=message))
+    emit("conversation_item_added", event("reply"))
+    assert out == [message, "second", "reply"]  # in order, before the session ends
+    gate.release_all()
+    assert out == [message, "second", "reply"]
