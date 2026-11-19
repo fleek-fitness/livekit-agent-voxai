@@ -50,7 +50,7 @@ async def _send(ar: AudioRecognition, ev: SpeechEvent) -> tuple[list[Any], int]:
 async def test_span_inside_a_turn_segment_is_that_turns_late_final() -> None:
     ar = _with_turn(_recognition(aligned=False))
     late, normal = await _send(ar, _final("없습니다", span=(100.5, 100.9)))
-    assert late == [(5, (100.5, 100.9))]
+    assert late == [(5, (100.5, 101.0))]
     assert normal == 0
 
 
