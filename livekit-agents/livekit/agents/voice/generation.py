@@ -1062,7 +1062,7 @@ async def _execute_tools_task(
                     if run_ctx._exec_started_at is not None:
                         output.exec_window = (
                             run_ctx._exec_started_at,
-                            run_ctx._exec_ended_at or time.time(),
+                            run_ctx._exec_ended_at or time.perf_counter(),
                         )
 
                     # TODO(theomonnom): Add the agent handoff inside the current_span
@@ -1152,7 +1152,7 @@ class ToolExecutionOutput:
     raw_output: Any
     raw_exception: BaseException | None
     exec_window: tuple[float, float] | None = None
-    """Wall-clock ``(start, end)`` of the tool callable, None when it never ran."""
+    """``(start, end)`` of the tool callable on ``time.perf_counter()``, None when it never ran."""
 
 
 def make_tool_output(
