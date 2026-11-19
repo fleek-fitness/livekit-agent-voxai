@@ -337,6 +337,9 @@ class FallbackRecognizeStream(RecognizeStream):
         self._fallback_adapter = stt
         self._recovering_streams: list[RecognizeStream] = []
 
+    def flush_vad(self, speech_start_time: float) -> None:
+        self._flush(self._FlushSentinel(speech_start_time))
+
     async def _run(self) -> None:
         start_time = time.time()
 
@@ -363,7 +366,10 @@ class FallbackRecognizeStream(RecognizeStream):
                         if isinstance(data, rtc.AudioFrame):
                             main_stream.push_frame(data)
                         elif isinstance(data, self._FlushSentinel):
-                            main_stream.flush()
+                            if data.vad_started_at is None:
+                                main_stream.flush()
+                            else:
+                                main_stream.flush_vad(data.vad_started_at)
                     except Exception:
                         logger.exception(
                             "error happened in forwarding input", extra={"streamed": True}
