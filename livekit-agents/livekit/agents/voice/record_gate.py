@@ -182,8 +182,12 @@ class RecordGate:
             return
         self._flushing = True
         try:
-            while self._queue and not isinstance(self._queue[0], _Marker):
-                name, arg = self._queue.pop(0)
+            while self._queue:
+                head = self._queue[0]
+                if isinstance(head, _Marker):
+                    break
+                self._queue.pop(0)
+                name, arg = head
                 try:
                     self._emit(name, arg)
                 except Exception:

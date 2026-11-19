@@ -2047,6 +2047,9 @@ class AudioRecognition:
         else:
             return False
 
+        if own_span is None:
+            return False
+
         # same end rule as a committed turn: the segments of its own turn, else the pending ones
         pool = owner.segments if owner is not None else list(self._completed_vad_bursts or ())
         own_span = _extend_span_end(own_span, pool)
