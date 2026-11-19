@@ -381,6 +381,7 @@ class AudioRecognition:
     _final_since_agent_overlap_segment: bool = False
     _post_agent_vad_segment_start: float | None = None
     _late_ack_wait_timer: asyncio.TimerHandle | None = None
+    _stt_aligned_transcript: bool = False
 
     @property
     def _late_ack_waiting(self) -> bool:
@@ -1756,6 +1757,14 @@ class AudioRecognition:
 
             if use_stt_speaking_time:
                 self._last_speaking_time = stt_last_speaking_time
+
+            if self._user_turn_start is None and self._stt_aligned_transcript:
+                # no onset opened this turn: the final's words carry when they were spoken
+                start = ev.speech_start_time
+                if start is None and has_stt_end_time and self._input_started_at is not None:
+                    start = self._input_started_at + ev.alternatives[0].start_time
+                if start is not None and start <= stt_last_speaking_time:
+                    self._ensure_user_turn_span(start_time=start)
 
             # check user turn limit after accumulating transcript
             self._check_user_turn_limit(transcript)
