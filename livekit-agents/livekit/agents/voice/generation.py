@@ -999,6 +999,7 @@ async def _execute_tools_task(
                     fnc_call: llm.FunctionCall,
                     tool_description: str | None,
                     agent_label: str,
+                    run_ctx: RunContext,
                 ) -> None:
                     current_span = trace.get_current_span()
                     current_span.set_attributes(
@@ -1056,6 +1057,14 @@ async def _execute_tools_task(
                         error=output.fnc_call_out.is_error,
                     )
 
+                    # an async tool answers at its first update while the callable goes on:
+                    # its window then ends here
+                    if run_ctx._exec_started_at is not None:
+                        output.exec_window = (
+                            run_ctx._exec_started_at,
+                            run_ctx._exec_ended_at or time.perf_counter(),
+                        )
+
                     # TODO(theomonnom): Add the agent handoff inside the current_span
                     _tool_completed(output)
 
@@ -1065,6 +1074,7 @@ async def _execute_tools_task(
                         fnc_call,
                         _tool_description(function_tool),
                         activity.agent.label,
+                        run_ctx,
                     ),
                     name=f"func_exec_{fnc_call.name}",  # task name is used for logging when the task is cancelled
                 )
@@ -1141,6 +1151,8 @@ class ToolExecutionOutput:
     agent_task: Agent | None
     raw_output: Any
     raw_exception: BaseException | None
+    exec_window: tuple[float, float] | None = None
+    """``(start, end)`` of the tool callable on ``time.perf_counter()``, None when it never ran."""
 
 
 def make_tool_output(

@@ -26,6 +26,16 @@ class RecognizeSentinel:
     pass
 
 
+class FakeFinal(BaseModel):
+    """One extra final of a speech, with its own audio span and arrival time (scripted)."""
+
+    text: str
+    start_time: float
+    end_time: float
+    arrive_at: float
+    finalize_onset: bool = False
+
+
 class FakeUserSpeech(BaseModel):
     type: Literal["user_speech"] = "user_speech"
     start_time: float
@@ -33,12 +43,30 @@ class FakeUserSpeech(BaseModel):
     transcript: str  # empty string fires VAD SOS/EOS only — no STT events
     stt_delay: float
     final: bool = True
+    # how the adapter reports the call-clock span of the final text:
+    # "not_given" = provider without spans, "given" = span of the speech, "none" = unprovable
+    span: Literal["not_given", "given", "none"] = "not_given"
+    # the final answers the finalize sent for this speech's VAD segment
+    finalize_onset: bool = False
+    # an empty speech: the finalize for this VAD segment ended without text
+    empty_finalize: bool = False
+    # when set, the main final covers [start_time, main_end] and arrives at its own time
+    main_end: float | None = None
+    main_arrive_at: float | None = None
+    extra_finals: list[FakeFinal] = []
 
     def speed_up(self, factor: float) -> FakeUserSpeech:
         obj = copy.deepcopy(self)
         obj.start_time /= factor
         obj.end_time /= factor
         obj.stt_delay /= factor
+        for attr in ("main_end", "main_arrive_at"):
+            if getattr(obj, attr) is not None:
+                setattr(obj, attr, getattr(obj, attr) / factor)
+        for extra in obj.extra_finals:
+            extra.start_time /= factor
+            extra.end_time /= factor
+            extra.arrive_at /= factor
         return obj
 
 
@@ -69,6 +97,7 @@ class FakeSTT(STT):
         self._fake_user_speeches = fake_user_speeches
         self._done_fut = asyncio.Future[None]()
 
+        self.streams: list[FakeRecognizeStream] = []
         self._recognize_ch = utils.aio.Chan[RecognizeSentinel]()
         self._stream_ch = utils.aio.Chan[FakeRecognizeStream]()
 
@@ -144,6 +173,7 @@ class FakeSTT(STT):
             stt=self,
             conn_options=conn_options,
         )
+        self.streams.append(stream)
         self._stream_ch.send_nowait(stream)
         return stream
 
@@ -159,18 +189,38 @@ class FakeRecognizeStream(RecognizeStream):
         self._attempt = 0
         self._start_fut = asyncio.Future[float]()
         self._stt: FakeSTT = stt
+        # onsets of the VAD segments the agent asked to finalize (flush_vad), in order
+        self.flushed_onsets: list[float] = []
+
+    def flush_vad(self, speech_start_time: float) -> None:
+        self.flushed_onsets.append(speech_start_time)
+        super().flush_vad(speech_start_time)
+
+    def _flushed_onset_near(self, epoch: float) -> float | None:
+        """The onset the agent flushed for the segment that started near `epoch`."""
+        near = [o for o in self.flushed_onsets if abs(o - epoch) < 1.0]
+        return min(near, key=lambda o: abs(o - epoch)) if near else None
 
     @property
     def attempt(self) -> int:
         return self._attempt
 
-    def send_fake_transcript(self, transcript: str, is_final: bool = True) -> None:
+    def send_fake_transcript(
+        self,
+        transcript: str,
+        is_final: bool = True,
+        *,
+        transcript_span: NotGivenOr[tuple[float, float] | None] = NOT_GIVEN,
+        finalize_onset: float | None = None,
+    ) -> None:
         self._event_ch.send_nowait(
             SpeechEvent(
                 type=SpeechEventType.FINAL_TRANSCRIPT
                 if is_final
                 else SpeechEventType.INTERIM_TRANSCRIPT,
                 alternatives=[SpeechData(text=transcript, language=LanguageCode(""))],
+                transcript_span=transcript_span,
+                finalize_onset=finalize_onset,
             )
         )
 
@@ -209,30 +259,76 @@ class FakeRecognizeStream(RecognizeStream):
         # start from when the first frame is pushed
         await self._input_ch.recv()
         start_time = time.perf_counter()
+        # the call clock (epoch seconds) of scripted time zero, as a provider adapter would map it
+        origin = time.time()
 
         def curr_time() -> float:
             return time.perf_counter() - start_time
 
+        async def wait_until(t: float) -> None:
+            if curr_time() < t:
+                await asyncio.sleep(t - curr_time())
+
+        def span_of(
+            speech: FakeUserSpeech, a: float, b: float
+        ) -> NotGivenOr[tuple[float, float] | None]:
+            if speech.span == "given":
+                return (origin + a, origin + b)
+            return None if speech.span == "none" else NOT_GIVEN
+
         for fake_speech in self._stt._fake_user_speeches:
             if not fake_speech.transcript:
-                # empty transcript: VAD SOS/EOS fire but STT emits nothing — still
+                # empty transcript: VAD SOS/EOS fire but STT emits no text — still
                 # advance the clock past this speech so subsequent speeches (and the
                 # done signal) are timed correctly relative to it.
-                final_transcript_time = fake_speech.end_time + fake_speech.stt_delay
-                if curr_time() < final_transcript_time:
-                    await asyncio.sleep(final_transcript_time - curr_time())
+                await wait_until(fake_speech.end_time + fake_speech.stt_delay)
+                if fake_speech.empty_finalize:
+                    self._event_ch.send_nowait(
+                        SpeechEvent(
+                            type=SpeechEventType.VAD_FINALIZE_EMPTY,
+                            finalize_onset=self._flushed_onset_near(
+                                origin + fake_speech.start_time
+                            ),
+                        )
+                    )
                 continue
-            interim_transcript_time = fake_speech.end_time + fake_speech.stt_delay * 0.5
-            if curr_time() < interim_transcript_time:
-                await asyncio.sleep(interim_transcript_time - curr_time())
+            main_end = (
+                fake_speech.main_end if fake_speech.main_end is not None else fake_speech.end_time
+            )
+            interim_transcript_time = main_end + fake_speech.stt_delay * 0.5
+            await wait_until(interim_transcript_time)
             self.send_fake_transcript(" ".join(fake_speech.transcript.split()[:2]), is_final=False)
 
-            final_transcript_time = fake_speech.end_time + fake_speech.stt_delay
-            if curr_time() < final_transcript_time:
-                await asyncio.sleep(final_transcript_time - curr_time())
-            if not fake_speech.final:
-                continue
-            self.send_fake_transcript(fake_speech.transcript, is_final=True)
+            final_transcript_time = (
+                fake_speech.main_arrive_at
+                if fake_speech.main_arrive_at is not None
+                else main_end + fake_speech.stt_delay
+            )
+            extras = sorted(fake_speech.extra_finals, key=lambda f: f.arrive_at)
+            if fake_speech.final:
+                await wait_until(final_transcript_time)
+                self.send_fake_transcript(
+                    fake_speech.transcript,
+                    is_final=True,
+                    transcript_span=span_of(fake_speech, fake_speech.start_time, main_end),
+                    finalize_onset=(
+                        self._flushed_onset_near(origin + fake_speech.start_time)
+                        if fake_speech.finalize_onset
+                        else None
+                    ),
+                )
+            for extra in extras:
+                await wait_until(extra.arrive_at)
+                self.send_fake_transcript(
+                    extra.text,
+                    is_final=True,
+                    transcript_span=span_of(fake_speech, extra.start_time, extra.end_time),
+                    finalize_onset=(
+                        self._flushed_onset_near(origin + fake_speech.start_time)
+                        if extra.finalize_onset
+                        else None
+                    ),
+                )
 
         with contextlib.suppress(asyncio.InvalidStateError):
             self._stt._done_fut.set_result(None)

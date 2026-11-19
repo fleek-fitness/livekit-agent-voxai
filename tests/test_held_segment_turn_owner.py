@@ -12,6 +12,7 @@ reach a turn keeps its start.
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -576,6 +577,29 @@ async def test_final_after_the_gate_closed_keeps_a_newer_onset_clock() -> None:
     await _play_text(ar, Text("두 개요", ANSWER, ANSWER + 0.5, ANSWER + 0.9))
 
     assert clocks == [(ANSWER, ANSWER)]
+
+
+@pytest.mark.parametrize("has_final", [False, True])
+async def test_empty_finalize_only_retires_a_held_burst_without_a_final(has_final: bool) -> None:
+    ar = _recognition(aligned=True)
+    first_start, first_end = 150.0, 150.39
+    next_start = 152.0
+    steps: list[Step] = [Sos(first_start), Eos(first_end)]
+    if has_final:
+        steps.append(Text("네.", first_start, first_end, 150.79))
+    steps.append(Sos(next_start))
+    await _play(ar, steps)
+    ar._completed_vad_bursts = deque([(first_start, first_end)], maxlen=64)
+
+    await ar._on_stt_event(
+        SpeechEvent(type=SpeechEventType.VAD_FINALIZE_EMPTY, finalize_onset=first_start)
+    )
+
+    assert ar._user_turn_start == (first_start if has_final else next_start)
+    assert ar._speech_start_time == (first_start if has_final else next_start)
+    assert [ev.alternatives[0].text for ev in ar._transcript_buffer] == (
+        ["네."] if has_final else []
+    )
 
 
 async def test_transcription_timeout_is_not_reported_for_a_retired_backchannel() -> None:

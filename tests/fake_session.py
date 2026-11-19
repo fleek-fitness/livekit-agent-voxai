@@ -161,7 +161,9 @@ class FakeActions:
         *,
         stt_delay: float = 0.2,
         final: bool = True,
+        **speech_options: Any,
     ) -> None:
+        """`speech_options` are the span fields of FakeUserSpeech (span, finalize_onset, ...)."""
         self._items.append(
             FakeUserSpeech(
                 start_time=start_time,
@@ -169,6 +171,7 @@ class FakeActions:
                 transcript=transcript,
                 stt_delay=stt_delay,
                 final=final,
+                **speech_options,
             )
         )
 

@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from livekit.agents import llm, stt
+from livekit.agents.types import TimedString
 from livekit.agents.vad import VADEvent, VADEventType
 from livekit.agents.voice.audio_recognition import AudioRecognition
 
@@ -83,3 +84,52 @@ async def test_second_final_of_one_burst_keeps_its_speech_time() -> None:
     assert second.metrics.stopped_speaking_at == pytest.approx(origin + 3.9, abs=0.001)
     assert second.metrics.end_of_turn_delay is not None
     assert second.metrics.transcription_delay is not None
+
+
+async def test_final_with_only_an_end_offset_does_not_start_the_turn_at_stream_start() -> None:
+    recognition, hooks = _recognition()
+    origin = time.time() - 5.0
+    recognition._stt_pipeline = MagicMock(input_started_at=origin)
+
+    # a provider that reports only when the words ended: start_time stays at its default 0
+    with patch("time.time", return_value=origin + 3.9):
+        await recognition._on_stt_event(_final("Hello there.", 0.0, 3.9))
+
+    assert recognition._user_turn_start is None or recognition._user_turn_start > origin + 1.0
+
+
+async def test_final_with_explicit_word_start_still_opens_the_turn_there() -> None:
+    recognition, _ = _recognition()
+    origin = time.time() - 5.0
+    recognition._stt_pipeline = MagicMock(input_started_at=origin)
+    ev = stt.SpeechEvent(
+        type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+        alternatives=[
+            stt.SpeechData(
+                text="Hello there.",
+                language="en",
+                end_time=3.9,
+                words=[TimedString("Hello", start_time=2.5, end_time=3.0)],
+            )
+        ],
+    )
+
+    with patch("time.time", return_value=origin + 3.9):
+        await recognition._on_stt_event(ev)
+
+    assert recognition._user_turn_start == pytest.approx(origin + 2.5, abs=0.001)
+
+
+async def test_held_final_with_only_an_end_offset_does_not_start_the_turn_at_stream_start() -> None:
+    recognition, _ = _recognition()
+    origin = time.time() - 20.0
+    recognition._stt_pipeline = MagicMock(input_started_at=origin)
+    recognition._interruption_enabled = True
+
+    # the final lands while the agent is speaking, so it is held and released afterwards
+    recognition._on_start_of_agent_speech(started_at=origin + 5.0)
+    with patch("time.time", return_value=origin + 12.0):
+        await recognition._on_stt_event(_final("Hello there.", 0.0, 11.0))
+        recognition._on_end_of_agent_speech(ended_at=origin + 12.0)
+
+    assert recognition._user_turn_start is None or recognition._user_turn_start > origin + 1.0

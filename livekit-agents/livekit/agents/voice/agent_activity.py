@@ -153,6 +153,10 @@ async def _aligned_transcript_or_text(
             yield chunk
 
 
+def _exec_windows(outputs: list[ToolExecutionOutput]) -> dict[str, tuple[float, float]]:
+    return {out.fnc_call.call_id: out.exec_window for out in outputs if out.exec_window is not None}
+
+
 def _transcripts_equivalent(first: str, second: str | None) -> bool:
     if first == second:
         return True
@@ -177,6 +181,10 @@ _DELAYED_ACK_MIN_USER_SPEECH_AFTER_AGENT_END = 0.3
 # ChatMessage.extra key set on a user message that a delayed-interruption turn recorded without
 # generating a reply, so consumers (e.g. an inactivity timer) can tell it from a committed turn
 DELAYED_INTERRUPTION_CONSUMED_EXTRA_KEY = "lk.delayed_interruption_consumed"
+
+# ChatMessage.extra key on a user message recorded from a final that reached the agent after the
+# turn its audio belongs to was committed
+LATE_FINAL_EXTRA_KEY = "lk.late_final"
 
 
 def _truncate_interruption_text(text: str | None, limit: int = 80) -> str | None:
@@ -310,6 +318,7 @@ class AgentActivity(RecognitionHooks):
         self._on_enter_task: asyncio.Task | None = None
         self._on_exit_task: asyncio.Task | None = None
         self._user_speech_started_during_interruptible_agent_speech = False
+        self._last_user_speech_started_at: float | None = None
         # the interruptible speech that was current when the delayed-interruption flag was set
         self._delayed_interruption_speech: SpeechHandle | None = None
         # the most recent speech that finished generating/playing out, with its wall-clock end
@@ -2449,6 +2458,7 @@ class AgentActivity(RecognitionHooks):
         self._user_silence_event.clear()
         self._stt_eos_received = False
         current_speech = self._current_speech
+        self._last_user_speech_started_at = speech_start_time
         self._user_speech_started_during_interruptible_agent_speech = (
             current_speech is not None and current_speech.allow_interruptions
         )
@@ -2817,6 +2827,62 @@ class AgentActivity(RecognitionHooks):
             )
         return True
 
+    def on_late_final(
+        self,
+        ev: stt.SpeechEvent,
+        *,
+        turn_id: int | None,
+        span: tuple[float, float],
+        restore_end: float | None = None,
+    ) -> None:
+        """Record a final that reached us after its turn was committed, as its own message.
+
+        No reply, no interruption and no end-of-turn work: the turn it belongs to was already
+        answered, and its text is recorded with its own audio span right after that turn.
+        """
+        alt = ev.alternatives[0]
+        transcript = alt.text.strip()
+        if not transcript:
+            return
+        self._session._user_input_transcribed(
+            UserInputTranscribedEvent(
+                language=alt.language,
+                transcript=transcript,
+                is_final=True,
+                speaker_id=alt.speaker_id,
+            ),
+        )
+        gate = self._session._record_gate
+        if turn_id is not None and restore_end is not None:
+            gate.lower_end(turn_id, restore_end)
+        anchor = gate.last_item(turn_id) if turn_id is not None else None
+        metrics: llm.MetricsReport = {
+            "started_speaking_at": span[0],
+            "stopped_speaking_at": span[1],
+        }
+        if self.stt:
+            metrics["stt_metadata"] = self.stt.metrics_metadata
+        # right after the turn's last item in the chat context, before any reply to it
+        created_at = anchor.created_at + 1e-6 if anchor is not None else time.time()
+        user_message = llm.ChatMessage(
+            role="user",
+            content=[transcript],
+            transcript_confidence=alt.confidence,
+            created_at=created_at,
+            metrics=metrics,
+        )
+        user_message.extra[LATE_FINAL_EXTRA_KEY] = True
+        self._agent._chat_ctx.insert(user_message)
+        self._session._late_final_item_added(user_message, turn_id=turn_id)
+
+    def on_turn_released(self, turn_id: int) -> None:
+        self._session._record_gate.release_turn(turn_id)
+
+    def on_empty_vad_segment_retired(self, start: float) -> None:
+        """An ended VAD segment turned out to have no text: its speech start leaves no mark."""
+        if self._last_user_speech_started_at == start:
+            self._clear_user_speech_interruption_context()
+
     def on_held_ignore_word_discarded(
         self,
         ev: stt.SpeechEvent,
@@ -2832,10 +2898,14 @@ class AgentActivity(RecognitionHooks):
         """
         alt = ev.alternatives[0]
         transcript = alt.text.strip()
-        metrics: llm.MetricsReport = {
-            "started_speaking_at": started_speaking_at,
-            "stopped_speaking_at": stopped_speaking_at,
-        }
+        metrics: llm.MetricsReport = {}
+        if is_given(ev.transcript_span):
+            if ev.transcript_span is not None:
+                metrics["started_speaking_at"] = ev.transcript_span[0]
+                metrics["stopped_speaking_at"] = ev.transcript_span[1]
+        else:
+            metrics["started_speaking_at"] = started_speaking_at
+            metrics["stopped_speaking_at"] = stopped_speaking_at
         if self.stt:
             metrics["stt_metadata"] = self.stt.metrics_metadata
         user_message = llm.ChatMessage(
@@ -2977,6 +3047,11 @@ class AgentActivity(RecognitionHooks):
         if not info.skip_reply and not self._rt_turn_detection_enabled:
             self._cancel_false_interruption_timer()
 
+        info.normal_turn = True
+        if info.turn_id is not None and is_given(info.transcript_span):
+            # a final of this turn's audio may still arrive: hold the recording order for it
+            self._session._record_gate.open_turn(info.turn_id)
+
         old_task = self._user_turn_completed_atask
         self._user_turn_completed_atask = self._create_speech_task(
             self._user_turn_completed_task(old_task, info),
@@ -3020,6 +3095,9 @@ class AgentActivity(RecognitionHooks):
 
         if user_message is not None:
             user_message.metrics = metrics_report
+            metrics_report["user_message_id"] = user_message.id
+            if info.turn_id is not None:
+                self._session._record_gate.bind_message(info.turn_id, user_message)
 
         if isinstance(self.llm, llm.RealtimeModel):
             if self._rt_turn_detection_enabled:
@@ -3113,9 +3191,15 @@ class AgentActivity(RecognitionHooks):
                 # The pipeline task retains the ChatMessage created for preemptive generation.
                 # Reconcile it with the finalized message before scheduling so conversation
                 # history keeps the final transcript and on_user_turn_completed edits.
+                if info.turn_id is not None:
+                    self._session._record_gate.bind_message(info.turn_id, preemptive.user_message)
                 preemptive.user_message.content = user_message.content.copy()
                 preemptive.user_message.transcript_confidence = user_message.transcript_confidence
                 preemptive.user_message.metrics = metrics_report
+                # the history keeps the preemptive message, so its id names the turn
+                metrics_report["user_message_id"] = preemptive.user_message.id
+                if info.turn_id is not None:
+                    self._session._record_gate.bind_message(info.turn_id, preemptive.user_message)
                 self._schedule_speech(speech_handle, priority=SpeechHandle.SPEECH_PRIORITY_NORMAL)
                 self._emit_preemptive_generation_outcome(
                     preemptive,
@@ -3172,6 +3256,7 @@ class AgentActivity(RecognitionHooks):
                 transcription_delay=info.metrics.transcription_delay or 0.0,
                 on_user_turn_completed_delay=on_user_turn_completed_delay,
                 speech_id=speech_handle.id,
+                user_message_id=metrics_report.get("user_message_id") if user_message else None,
                 metadata=metadata,
             )
             self._session.emit("metrics_collected", MetricsCollectedEvent(metrics=eou_metrics))
@@ -3603,6 +3688,8 @@ class AgentActivity(RecognitionHooks):
             ):
                 e2e_latency = started_speaking_at - _previous_user_metrics["stopped_speaking_at"]
                 assistant_metrics["e2e_latency"] = e2e_latency
+                if answered_id := _previous_user_metrics.get("user_message_id"):
+                    assistant_metrics["answered_user_message_id"] = answered_id
                 current_span.set_attribute(trace_types.ATTR_E2E_LATENCY, e2e_latency)
                 self._session._answered_user_metrics = _previous_user_metrics
 
@@ -4211,6 +4298,8 @@ class AgentActivity(RecognitionHooks):
             ):
                 e2e_latency = started_speaking_at - user_metrics["stopped_speaking_at"]
                 assistant_metrics["e2e_latency"] = e2e_latency
+                if answered_id := user_metrics.get("user_message_id"):
+                    assistant_metrics["answered_user_message_id"] = answered_id
                 current_span.set_attribute(trace_types.ATTR_E2E_LATENCY, e2e_latency)
                 self._session._answered_user_metrics = user_metrics
 
@@ -4298,6 +4387,8 @@ class AgentActivity(RecognitionHooks):
                     FunctionToolsExecutedEvent(
                         function_calls=interrupted_calls,
                         function_call_outputs=interrupted_fnc_outputs,
+                        function_call_exec_windows=_exec_windows(tool_output.output),
+                        speech_id=speech_handle.id,
                     ),
                 )
                 self._agent._chat_ctx.insert(interrupted_tool_messages)
@@ -4354,6 +4445,8 @@ class AgentActivity(RecognitionHooks):
             if new_agent_task and not ignore_task_switch:
                 fnc_executed_ev._handoff_required = True
 
+            fnc_executed_ev.function_call_exec_windows = _exec_windows(tool_output.output)
+            fnc_executed_ev.speech_id = speech_handle.id
             self._session.emit("function_tools_executed", fnc_executed_ev)
 
             draining = self.scheduling_paused
@@ -5022,6 +5115,8 @@ class AgentActivity(RecognitionHooks):
                     FunctionToolsExecutedEvent(
                         function_calls=interrupted_calls,
                         function_call_outputs=interrupted_fnc_outputs,
+                        function_call_exec_windows=_exec_windows(tool_output.output),
+                        speech_id=speech_handle.id,
                     ),
                 )
                 self._agent._chat_ctx.insert(interrupted_fnc_outputs)
@@ -5086,6 +5181,8 @@ class AgentActivity(RecognitionHooks):
             if new_agent_task and not ignore_task_switch:
                 fnc_executed_ev._handoff_required = True
 
+            fnc_executed_ev.function_call_exec_windows = _exec_windows(tool_output.output)
+            fnc_executed_ev.speech_id = speech_handle.id
             self._session.emit("function_tools_executed", fnc_executed_ev)
 
             draining = self.scheduling_paused
@@ -5438,11 +5535,14 @@ class AgentActivity(RecognitionHooks):
         metrics_report: llm.MetricsReport = {}
         if self.stt:
             metrics_report["stt_metadata"] = self.stt.metrics_metadata
-        if info.metrics.started_speaking_at is not None:
-            metrics_report["started_speaking_at"] = info.metrics.started_speaking_at
-
-        if info.metrics.stopped_speaking_at is not None:
-            metrics_report["stopped_speaking_at"] = info.metrics.stopped_speaking_at
+        start, end = info.metrics.started_speaking_at, info.metrics.stopped_speaking_at
+        if is_given(info.transcript_span):
+            # a provider that reports spans owns the message time: no span, no time
+            start, end = info.transcript_span or (None, None)
+        if start is not None:
+            metrics_report["started_speaking_at"] = start
+        if end is not None:
+            metrics_report["stopped_speaking_at"] = end
 
         if info.metrics.transcription_delay is not None:
             metrics_report["transcription_delay"] = info.metrics.transcription_delay
