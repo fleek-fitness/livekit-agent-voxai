@@ -64,6 +64,10 @@ class RunContext(Generic[Userdata_T]):
         # synthesized progress-update pairs, populated whether or not an executor is attached
         self._updates: list[tuple[FunctionCall, FunctionCallOutput]] = []
 
+        # monotonic-clock window of the tool callable itself, set by the executor
+        self._exec_started_at: float | None = None
+        self._exec_ended_at: float | None = None
+
         # set/cleared by the executor around the tool's lifetime
         self._executor: _ToolExecutor | None = None
         self._first_update_fut: asyncio.Future[Any] | None = None
@@ -454,6 +458,16 @@ class FunctionToolsExecutedEvent(BaseModel):
     type: Literal["function_tools_executed"] = "function_tools_executed"
     function_calls: list[FunctionCall]
     function_call_outputs: list[FunctionCallOutput]
+    function_call_exec_windows: dict[str, tuple[float, float]] = Field(default_factory=dict)
+    """``(start, end)`` of each call's tool callable in seconds on the process monotonic
+    clock (``time.perf_counter()``), keyed by ``call_id``.
+
+    Measured right before the callable is awaited and right after it returns, so it
+    excludes any wait for speech permission or between steps. A call whose callable never
+    ran (unknown tool, bad arguments, duplicate rejected) has no entry. For an async tool
+    that is still running at its first ``ctx.update()``, ``end`` is only the time of that
+    update; the real end follows in ``ToolCallEnded.exec_window`` under the original call id.
+    """
     created_at: float = Field(default_factory=time.time)
     _handoff_required: bool = PrivateAttr(default=False)
 
@@ -524,6 +538,9 @@ class ToolCallEnded(BaseModel):
     message: str | None = None
     """Result or error text; None when there is nothing to voice."""
     status: Literal["done", "error", "cancelled"]
+    exec_window: tuple[float, float] | None = None
+    """``(start, end)`` of the tool callable on ``time.perf_counter()``, ``end`` being when it
+    returned, failed or was cancelled. None when the callable never started."""
 
 
 class ToolReplyUpdated(BaseModel):

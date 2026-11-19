@@ -2166,7 +2166,9 @@ class TestToolCallEvents:
         items = _emitted_items(run_ctx.session)
         assert isinstance(items[0], ToolCallStarted)
         assert items[0].function_call.call_id == "c1"
-        assert items[1] == ToolCallEnded(id="c1", call_id="c1", message="ok", status="done")
+        assert items[1].model_copy(update={"exec_window": None}) == ToolCallEnded(
+            id="c1", call_id="c1", message="ok", status="done"
+        )
 
     @pytest.mark.asyncio
     async def test_error_before_update_uses_plain_call_id(self):
@@ -2186,7 +2188,9 @@ class TestToolCallEvents:
 
         items = _emitted_items(run_ctx.session)
         assert isinstance(items[0], ToolCallStarted)
-        assert items[1] == ToolCallEnded(id="c2", call_id="c2", message="nope", status="error")
+        assert items[1].model_copy(update={"exec_window": None}) == ToolCallEnded(
+            id="c2", call_id="c2", message="nope", status="error"
+        )
 
     @pytest.mark.asyncio
     async def test_cancelled_tool(self):
@@ -2214,7 +2218,9 @@ class TestToolCallEvents:
         assert await exec_task is None
 
         items = _emitted_items(run_ctx.session)
-        assert items[-1] == ToolCallEnded(id="c3", call_id="c3", message=None, status="cancelled")
+        assert items[-1].model_copy(update={"exec_window": None}) == ToolCallEnded(
+            id="c3", call_id="c3", message=None, status="cancelled"
+        )
 
     @pytest.mark.asyncio
     async def test_cancel_before_first_step_releases_dispatch(self):
@@ -2244,7 +2250,9 @@ class TestToolCallEvents:
         assert await _asyncio.wait_for(exec_task, timeout=5) is None
 
         items = _emitted_items(run_ctx.session)
-        assert items[-1] == ToolCallEnded(id="c3b", call_id="c3b", message=None, status="cancelled")
+        assert items[-1].model_copy(update={"exec_window": None}) == ToolCallEnded(
+            id="c3b", call_id="c3b", message=None, status="cancelled"
+        )
 
     @pytest.mark.asyncio
     async def test_internal_tools_tracked(self):
@@ -2263,7 +2271,9 @@ class TestToolCallEvents:
 
         items = _emitted_items(run_ctx.session)
         assert isinstance(items[0], ToolCallStarted)
-        assert items[1] == ToolCallEnded(id="c4", call_id="c4", message="ok", status="done")
+        assert items[1].model_copy(update={"exec_window": None}) == ToolCallEnded(
+            id="c4", call_id="c4", message="ok", status="done"
+        )
 
     @pytest.mark.asyncio
     async def test_updates_and_deferred_result_with_reply_lifecycle(self):
@@ -2315,7 +2325,7 @@ class TestToolCallEvents:
         assert items[1] == ToolCallUpdated(id="c5", call_id="c5", message="step one")
         assert items[2] == ToolCallUpdated(id="c5_update_1", call_id="c5", message="step two")
         # the final return is deferred through the coalescer
-        assert items[3] == ToolCallEnded(
+        assert items[3].model_copy(update={"exec_window": None}) == ToolCallEnded(
             id="c5_final", call_id="c5", message="all done", status="done"
         )
         # the deferred reply covering the buffered ids was scheduled
@@ -2389,7 +2399,7 @@ class TestToolCallEvents:
 
         items = _emitted_items(session)
         terminal = next(i for i in items if isinstance(i, ToolCallEnded))
-        assert terminal == ToolCallEnded(
+        assert terminal.model_copy(update={"exec_window": None}) == ToolCallEnded(
             id="c7_final", call_id="c7", message="late failure", status="error"
         )
 

@@ -153,6 +153,10 @@ async def _aligned_transcript_or_text(
             yield chunk
 
 
+def _exec_windows(outputs: list[ToolExecutionOutput]) -> dict[str, tuple[float, float]]:
+    return {out.fnc_call.call_id: out.exec_window for out in outputs if out.exec_window is not None}
+
+
 def _transcripts_equivalent(first: str, second: str | None) -> bool:
     if first == second:
         return True
@@ -4306,6 +4310,7 @@ class AgentActivity(RecognitionHooks):
                     FunctionToolsExecutedEvent(
                         function_calls=interrupted_calls,
                         function_call_outputs=interrupted_fnc_outputs,
+                        function_call_exec_windows=_exec_windows(tool_output.output),
                     ),
                 )
                 self._agent._chat_ctx.insert(interrupted_tool_messages)
@@ -4362,6 +4367,7 @@ class AgentActivity(RecognitionHooks):
             if new_agent_task and not ignore_task_switch:
                 fnc_executed_ev._handoff_required = True
 
+            fnc_executed_ev.function_call_exec_windows = _exec_windows(tool_output.output)
             self._session.emit("function_tools_executed", fnc_executed_ev)
 
             draining = self.scheduling_paused
@@ -5030,6 +5036,7 @@ class AgentActivity(RecognitionHooks):
                     FunctionToolsExecutedEvent(
                         function_calls=interrupted_calls,
                         function_call_outputs=interrupted_fnc_outputs,
+                        function_call_exec_windows=_exec_windows(tool_output.output),
                     ),
                 )
                 self._agent._chat_ctx.insert(interrupted_fnc_outputs)
@@ -5094,6 +5101,7 @@ class AgentActivity(RecognitionHooks):
             if new_agent_task and not ignore_task_switch:
                 fnc_executed_ev._handoff_required = True
 
+            fnc_executed_ev.function_call_exec_windows = _exec_windows(tool_output.output)
             self._session.emit("function_tools_executed", fnc_executed_ev)
 
             draining = self.scheduling_paused
