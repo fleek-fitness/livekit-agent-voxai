@@ -36,6 +36,8 @@ class _Turn:
     timer: asyncio.TimerHandle | None = None
     last_item: Any = None
     released: bool = False
+    message: Any = None
+    restore_end: float | None = None
 
 
 class _Marker:
@@ -76,6 +78,28 @@ class RecordGate:
         turn = self._turns.get(turn_id)
         if turn is not None:
             turn.message_ids.add(id(message))
+            turn.message = message
+            if turn.restore_end is not None:
+                self._lower_end(message, turn.restore_end)
+
+    @staticmethod
+    def _lower_end(message: Any, end: float) -> None:
+        metrics = getattr(message, "metrics", None)
+        if isinstance(metrics, dict) and metrics.get("stopped_speaking_at", end) > end:
+            metrics["stopped_speaking_at"] = end
+
+    def lower_end(self, turn_id: int, end: float) -> None:
+        """Bring a message end that was stretched over a late final's audio back down.
+
+        Only ever lowers the value on the same metrics object; if the message is not there yet
+        the value is applied when it is bound.
+        """
+        turn = self._turns.get(turn_id)
+        if turn is None:
+            return
+        turn.restore_end = end if turn.restore_end is None else min(turn.restore_end, end)
+        if turn.message is not None:
+            self._lower_end(turn.message, turn.restore_end)
 
     def is_open(self, turn_id: int) -> bool:
         turn = self._turns.get(turn_id)

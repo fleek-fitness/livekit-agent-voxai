@@ -444,3 +444,47 @@ async def test_late_final_end_follows_the_same_rule() -> None:
     ar._confirmed_turns[5].segments[0] = (100.0, 101.4)
     late, _ = await _send(ar, _final("없습니다", span=(100.5, 101.0)))
     assert late == [(5, (100.5, 101.4))]
+
+
+async def test_late_final_takes_back_a_stretched_end() -> None:
+    ar = _recognition(aligned=False)
+    ar._confirmed_turns = {
+        5: _ConfirmedTurn(5, [(100.0, 101.0)], 101.0, original_end=100.4, stretched_end=101.0)
+    }
+    ar._completed_vad_bursts = deque()
+    await ar._on_stt_event(_final("없습니다", span=(100.5, 101.0)))
+    kwargs = ar._hooks.on_late_final.call_args.kwargs
+    assert kwargs["restore_end"] == 100.5  # max(original end, late final start)
+    assert ar._confirmed_turns[5].stretched_end == 100.5
+
+
+async def test_late_final_before_the_stretched_end_is_untouched_when_not_stretched() -> None:
+    ar = _with_turn(_recognition(aligned=False))
+    await ar._on_stt_event(_final("없습니다", span=(100.5, 100.9)))
+    assert ar._hooks.on_late_final.call_args.kwargs["restore_end"] is None
+
+
+def test_gate_lowers_only_the_stretched_end_on_the_same_metrics_object() -> None:
+    gate = RecordGate(lambda *_: None)
+    gate.open_turn(1)
+    message = SimpleNamespace(metrics={"stopped_speaking_at": 9.65})
+    metrics = message.metrics
+    gate.bind_message(1, message)
+    gate.lower_end(1, 9.2)
+    assert message.metrics is metrics and metrics["stopped_speaking_at"] == 9.2
+    gate.lower_end(1, 9.5)  # never raises it back
+    assert metrics["stopped_speaking_at"] == 9.2
+
+
+def test_gate_applies_a_lowering_that_arrived_before_the_message() -> None:
+    gate = RecordGate(lambda *_: None)
+    gate.open_turn(1)
+    gate.lower_end(1, 9.2)
+    message = SimpleNamespace(metrics={"stopped_speaking_at": 9.65})
+    gate.bind_message(1, message)
+    assert message.metrics["stopped_speaking_at"] == 9.2
+    other = SimpleNamespace(metrics={"stopped_speaking_at": 9.1})
+    gate.open_turn(2)
+    gate.bind_message(2, other)
+    gate.lower_end(2, 9.2)
+    assert other.metrics["stopped_speaking_at"] == 9.1  # a value that was not stretched stays

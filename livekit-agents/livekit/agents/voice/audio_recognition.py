@@ -283,7 +283,12 @@ class RecognitionHooks(Protocol):
     ) -> None: ...
     def on_transcription_timeout(self, *, speech_duration: float, turn_start: float) -> None: ...
     def on_late_final(
-        self, ev: stt.SpeechEvent, *, turn_id: int | None, span: tuple[float, float]
+        self,
+        ev: stt.SpeechEvent,
+        *,
+        turn_id: int | None,
+        span: tuple[float, float],
+        restore_end: float | None = None,
     ) -> None: ...
     def on_turn_released(self, turn_id: int) -> None: ...
     def on_empty_vad_segment_retired(self, start: float) -> None: ...
@@ -302,6 +307,10 @@ class _ConfirmedTurn:
     turn_id: int
     segments: list[tuple[float, float]]
     end: float
+    original_end: float | None = None
+    """End of the turn's last final as the provider reported it, when the message end was stretched."""
+    stretched_end: float | None = None
+    """The stretched end the message was given (None when the end was not stretched)."""
 
 
 _MAX_CONFIRMED_TURNS = 16
@@ -2045,8 +2054,21 @@ class AudioRecognition:
             "late final recorded as its own message",
             extra={"turn_id": owner.turn_id if owner else None, "span": own_span},
         )
+        restore_end: float | None = None
+        if (
+            owner is not None
+            and owner.stretched_end is not None
+            and owner.original_end is not None
+            and owner.stretched_end > own_span[0]
+        ):
+            # the turn's message end was stretched over this late final's audio: take it back
+            restore_end = max(owner.original_end, own_span[0])
+            owner.stretched_end = restore_end if restore_end > owner.original_end else None
         self._hooks.on_late_final(
-            ev, turn_id=owner.turn_id if owner is not None else None, span=own_span
+            ev,
+            turn_id=owner.turn_id if owner is not None else None,
+            span=own_span,
+            restore_end=restore_end,
         )
         return True
 
@@ -2067,6 +2089,7 @@ class AudioRecognition:
         info: _EndOfTurnInfo,
         bursts: list[tuple[float, float]],
         final_spans: list[tuple[float, float]],
+        original_end: float | None = None,
     ) -> None:
         """Remember a committed reply turn while a final of its audio may still arrive."""
         turn_id = info.turn_id
@@ -2088,7 +2111,18 @@ class AudioRecognition:
             oldest = next(iter(self._confirmed_turns))
             logger.warning("dropping the oldest confirmed turn record", extra={"turn_id": oldest})
             self._close_confirmed_turn(oldest)
-        self._confirmed_turns[turn_id] = _ConfirmedTurn(turn_id, list(segments), end)
+        stretched = (
+            isinstance(info.transcript_span, tuple)
+            and original_end is not None
+            and info.transcript_span[1] > original_end
+        )
+        self._confirmed_turns[turn_id] = _ConfirmedTurn(
+            turn_id,
+            list(segments),
+            end,
+            original_end=original_end if stretched else None,
+            stretched_end=info.transcript_span[1] if stretched else None,  # type: ignore[index]
+        )
 
     # endregion
 
@@ -2688,6 +2722,7 @@ class AudioRecognition:
             turn_id = self._next_turn_id
             self._next_turn_id += 1
             turn_span = self._transcript_span
+            original_end = turn_span[1] if isinstance(turn_span, tuple) else None
             if isinstance(turn_span, tuple) and self._turn_final_spans:
                 # the turn's last final (latest end) decides how far its end can stretch
                 last = max(self._turn_final_spans, key=lambda sp: sp[1])
@@ -2710,6 +2745,7 @@ class AudioRecognition:
                     turn_info,
                     list(self._completed_vad_bursts or ()),
                     list(self._turn_final_spans or ()),
+                    original_end,
                 )
                 self._turn_final_spans = None
                 logger.debug(

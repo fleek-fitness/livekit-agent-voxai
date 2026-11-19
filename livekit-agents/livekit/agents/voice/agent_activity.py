@@ -2819,7 +2819,12 @@ class AgentActivity(RecognitionHooks):
         return True
 
     def on_late_final(
-        self, ev: stt.SpeechEvent, *, turn_id: int | None, span: tuple[float, float]
+        self,
+        ev: stt.SpeechEvent,
+        *,
+        turn_id: int | None,
+        span: tuple[float, float],
+        restore_end: float | None = None,
     ) -> None:
         """Record a final that reached us after its turn was committed, as its own message.
 
@@ -2839,6 +2844,8 @@ class AgentActivity(RecognitionHooks):
             ),
         )
         gate = self._session._record_gate
+        if turn_id is not None and restore_end is not None:
+            gate.lower_end(turn_id, restore_end)
         anchor = gate.last_item(turn_id) if turn_id is not None else None
         metrics: llm.MetricsReport = {
             "started_speaking_at": span[0],
@@ -3179,6 +3186,8 @@ class AgentActivity(RecognitionHooks):
                 preemptive.user_message.content = user_message.content.copy()
                 preemptive.user_message.transcript_confidence = user_message.transcript_confidence
                 preemptive.user_message.metrics = metrics_report
+                if info.turn_id is not None:
+                    self._session._record_gate.bind_message(info.turn_id, preemptive.user_message)
                 self._schedule_speech(speech_handle, priority=SpeechHandle.SPEECH_PRIORITY_NORMAL)
                 self._emit_preemptive_generation_outcome(
                     preemptive,

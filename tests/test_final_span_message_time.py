@@ -293,6 +293,12 @@ async def test_late_final_is_recorded_once_in_its_own_turn(shape: str) -> None:
         run.span(late[0]),
         (ANSWER_START + 0.41, ANSWER_START + 0.86),
     ), run.span(late[0])
+    # the first message's end was stretched to the segment end; it comes back to where the late
+    # final's audio starts instead of covering it
+    first = next(u for u in run.users() if u.text_content == "아니요")
+    first_span = run.span(first)
+    assert first_span is not None
+    assert ANSWER_START + 0.31 - 0.3 <= first_span[1] <= ANSWER_START + 0.41 + 0.3, first_span
     # one reply to the first final; the late final neither answered nor cut it off
     replies = [m for m in _assistants(run) if m.text_content == REPLY]
     assert len(replies) <= 1
