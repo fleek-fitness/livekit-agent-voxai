@@ -412,3 +412,35 @@ async def test_the_session_emit_path_hands_the_waiting_first_message_to_the_gate
     assert out == [message, "second", "reply"]  # in order, before the session ends
     gate.release_all()
     assert out == [message, "second", "reply"]
+
+
+# --- the end of a message stretches to the end of its VAD segment -------------------------------
+
+
+def test_end_stretches_to_the_one_overlapping_segment() -> None:
+    from livekit.agents.voice.audio_recognition import _extend_span_end
+
+    assert _extend_span_end((10.0, 12.0), [(9.9, 12.6)]) == (10.0, 12.6)
+
+
+def test_end_never_stretches_past_one_second_or_shrinks() -> None:
+    from livekit.agents.voice.audio_recognition import _extend_span_end
+
+    assert _extend_span_end((10.0, 12.0), [(9.9, 13.5)]) == (10.0, 12.0)  # trailing noise
+    assert _extend_span_end((10.0, 12.0), [(9.9, 12.0)]) == (10.0, 12.0)
+    assert _extend_span_end((10.0, 12.0), [(9.9, 11.5)]) == (10.0, 12.0)  # never shrinks
+    assert _extend_span_end((10.0, 12.0), [(9.9, 13.0)]) == (10.0, 13.0)  # exactly 1.0 allowed
+
+
+def test_end_is_kept_with_zero_or_several_overlapping_segments() -> None:
+    from livekit.agents.voice.audio_recognition import _extend_span_end
+
+    assert _extend_span_end((10.0, 12.0), [(20.0, 21.0)]) == (10.0, 12.0)
+    assert _extend_span_end((10.0, 12.0), [(9.9, 11.0), (11.2, 12.5)]) == (10.0, 12.0)
+
+
+async def test_late_final_end_follows_the_same_rule() -> None:
+    ar = _with_turn(_recognition(aligned=False))
+    ar._confirmed_turns[5].segments[0] = (100.0, 101.4)
+    late, _ = await _send(ar, _final("없습니다", span=(100.5, 101.0)))
+    assert late == [(5, (100.5, 101.4))]

@@ -5,7 +5,7 @@ import json
 import math
 import time
 from collections import deque
-from collections.abc import AsyncIterable, Callable
+from collections.abc import AsyncIterable, Callable, Iterable
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
@@ -305,6 +305,27 @@ class _ConfirmedTurn:
 
 
 _MAX_CONFIRMED_TURNS = 16
+# a message end may be extended to the end of its VAD segment by at most this much; a longer
+# tail is taken as trailing noise and the final's own end is kept
+_MAX_SPAN_END_EXTENSION = 1.0
+
+
+def _extend_span_end(
+    span: tuple[float, float], segments: Iterable[tuple[float, float]]
+) -> tuple[float, float]:
+    """Stretch a final's end to the end of the one VAD segment it overlaps.
+
+    Providers report the end of the last token, which can precede the acoustic end of the speech.
+    The end only grows, by at most _MAX_SPAN_END_EXTENSION, and only when exactly one ended
+    segment overlaps the span; the start is never touched.
+    """
+    overlapping = [seg for seg in segments if seg[0] <= span[1] and span[0] <= seg[1]]
+    if len(overlapping) != 1:
+        return span
+    seg_end = overlapping[0][1]
+    if span[1] < seg_end <= span[1] + _MAX_SPAN_END_EXTENSION:
+        return (span[0], seg_end)
+    return span
 
 
 class _STTPipeline:
@@ -2017,6 +2038,9 @@ class AudioRecognition:
         else:
             return False
 
+        # same end rule as a committed turn: the segments of its own turn, else the pending ones
+        pool = owner.segments if owner is not None else list(self._completed_vad_bursts or ())
+        own_span = _extend_span_end(own_span, pool)
         logger.info(
             "late final recorded as its own message",
             extra={"turn_id": owner.turn_id if owner else None, "span": own_span},
@@ -2663,11 +2687,18 @@ class AudioRecognition:
             )
             turn_id = self._next_turn_id
             self._next_turn_id += 1
+            turn_span = self._transcript_span
+            if isinstance(turn_span, tuple) and self._turn_final_spans:
+                # the turn's last final (latest end) decides how far its end can stretch
+                last = max(self._turn_final_spans, key=lambda sp: sp[1])
+                extended = _extend_span_end(last, self._completed_vad_bursts or ())
+                if extended[1] > turn_span[1]:
+                    turn_span = (turn_span[0], extended[1])
             turn_info = _EndOfTurnInfo(
                 skip_reply=skip_reply,
                 new_transcript=self._audio_transcript,
                 turn_id=turn_id,
-                transcript_span=self._transcript_span,
+                transcript_span=turn_span,
                 transcript_confidence=confidence_avg,
                 metrics=metrics,
                 transcript_clock_suppressed=transcript_clock_suppressed,

@@ -419,3 +419,37 @@ async def test_backchannel_over_question_keeps_place_and_span() -> None:
     assert _approx(run.span(ack), (ack_start, ack_end)), run.span(ack)
     assert _approx(run.span(answer), (ANSWER_START, ANSWER_END)), run.span(answer)
     assert run.messages()[1].interrupted is False
+
+
+# --- the message end stretches to the end of its VAD segment (never past one second) ----------
+
+
+@pytest.mark.parametrize(
+    ("short_by", "stretched"),
+    [(3.0, True), (7.0, False)],  # scripted seconds; one real second is SPEED scripted seconds
+)
+async def test_message_end_stretches_to_vad_segment_end_within_one_second(
+    short_by: float, stretched: bool
+) -> None:
+    start, end = ANSWER_START, ANSWER_START + 8.0
+    actions = FakeActions()
+    actions.add_user_speech(
+        start,
+        end,
+        ANSWER,
+        span="given",
+        main_end=end - short_by,  # the last token ends before the speech does (Soniox shape)
+        main_arrive_at=end + 1.0,
+        stt_delay=1.0,
+    )
+    actions.add_llm(REPLY, input=ANSWER)
+    actions.add_tts(1.0, input=REPLY)
+    actions.add_tts(QUESTION_DURATION, input=QUESTION)
+    run = await _run(actions, until=lambda r: len(_assistants(r)) >= 2, say_first=QUESTION)
+
+    (answer,) = run.users()
+    got = run.span(answer)
+    assert got is not None
+    assert abs(got[0] - start) <= TOLERANCE
+    expected_end = end if stretched else end - short_by
+    assert abs(got[1] - expected_end) <= TOLERANCE, (got, expected_end)
