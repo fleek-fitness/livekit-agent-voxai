@@ -468,6 +468,9 @@ class FunctionToolsExecutedEvent(BaseModel):
     that is still running at its first ``ctx.update()``, ``end`` is only the time of that
     update; the real end follows in ``ToolCallEnded.exec_window`` under the original call id.
     """
+    speech_id: str | None = None
+    """Id of the speech whose reply ran these tools. Listeners cannot read it from the running
+    context: the recording gate may emit this event later, from another task."""
     created_at: float = Field(default_factory=time.time)
     _handoff_required: bool = PrivateAttr(default=False)
 

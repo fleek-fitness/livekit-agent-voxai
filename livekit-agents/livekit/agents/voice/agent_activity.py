@@ -4388,6 +4388,7 @@ class AgentActivity(RecognitionHooks):
                         function_calls=interrupted_calls,
                         function_call_outputs=interrupted_fnc_outputs,
                         function_call_exec_windows=_exec_windows(tool_output.output),
+                        speech_id=speech_handle.id,
                     ),
                 )
                 self._agent._chat_ctx.insert(interrupted_tool_messages)
@@ -4445,6 +4446,7 @@ class AgentActivity(RecognitionHooks):
                 fnc_executed_ev._handoff_required = True
 
             fnc_executed_ev.function_call_exec_windows = _exec_windows(tool_output.output)
+            fnc_executed_ev.speech_id = speech_handle.id
             self._session.emit("function_tools_executed", fnc_executed_ev)
 
             draining = self.scheduling_paused
@@ -5114,6 +5116,7 @@ class AgentActivity(RecognitionHooks):
                         function_calls=interrupted_calls,
                         function_call_outputs=interrupted_fnc_outputs,
                         function_call_exec_windows=_exec_windows(tool_output.output),
+                        speech_id=speech_handle.id,
                     ),
                 )
                 self._agent._chat_ctx.insert(interrupted_fnc_outputs)
@@ -5179,6 +5182,7 @@ class AgentActivity(RecognitionHooks):
                 fnc_executed_ev._handoff_required = True
 
             fnc_executed_ev.function_call_exec_windows = _exec_windows(tool_output.output)
+            fnc_executed_ev.speech_id = speech_handle.id
             self._session.emit("function_tools_executed", fnc_executed_ev)
 
             draining = self.scheduling_paused

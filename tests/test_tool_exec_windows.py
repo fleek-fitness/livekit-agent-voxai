@@ -310,3 +310,24 @@ async def test_realtime_interrupted_path_carries_the_window() -> None:
     for ev in events:
         windows.update(ev.function_call_exec_windows)
     assert "1" in windows
+
+
+async def test_event_names_the_speech_that_ran_the_tools() -> None:
+    actions = FakeActions()
+    actions.add_user_speech(0.5, 2.5, "do it")
+    actions.add_llm(
+        content="Checking.",
+        tool_calls=[FunctionToolCall(name="slow", arguments="{}", call_id="1")],
+    )
+    actions.add_tts(1.0)
+    actions.add_llm(content="Done.", input="slow done")
+    actions.add_tts(1.0)
+
+    session = create_session(actions)
+    events = _collect(session)
+    speech_ids: list[str] = []
+    session.on("speech_created", lambda ev: speech_ids.append(ev.speech_handle.id))
+    await asyncio.wait_for(run_session(session, _SleepyAgent(), drain_delay=10), timeout=60)
+
+    assert events
+    assert all(ev.speech_id in speech_ids for ev in events)
