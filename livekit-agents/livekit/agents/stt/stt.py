@@ -50,6 +50,10 @@ class SpeechEventType(str, Enum):
     portion of speech will not change"""
     RECOGNITION_USAGE = "recognition_usage"
     """usage event, emitted periodically to indicate usage metrics"""
+    FINALIZED_UNTIL = "finalized_until"
+    """No further final will be emitted for audio before `speech_end_time` (call-clock epoch
+    seconds). Emitted only within one connection of the provider; a provider that cannot say so
+    never emits it."""
     VAD_FINALIZE_EMPTY = "vad_finalize_empty"
     """A VAD-triggered finalize ended without text; the segment onset is in finalize_onset."""
     END_OF_SPEECH = "end_of_speech"
