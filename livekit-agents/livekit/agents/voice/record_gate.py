@@ -25,6 +25,9 @@ RECORD_HOLD_MAX_SECONDS = 3.0
 
 GATED_EVENTS = ("conversation_item_added", "function_tools_executed")
 
+# longest time an agent message waits for a customer word that ended before the agent started
+SPEECH_ROW_HOLD_MAX_SECONDS = 1.0
+
 
 @dataclass
 class _Turn:
@@ -47,12 +50,78 @@ class _Marker:
         self.turn = turn
 
 
+class _Hold(_Marker):
+    """A position in the queue held for a customer row that belongs ahead of the entry behind it."""
+
+    def __init__(self, first_audio_at: float, on_timeout: Callable[[], None] | None = None) -> None:
+        self.turn = None  # type: ignore[assignment]
+        self.first_audio_at = first_audio_at
+        self.on_timeout = on_timeout
+        self.timer: asyncio.TimerHandle | None = None
+
+
 class RecordGate:
     def __init__(self, emit: Callable[[str, Any], None]) -> None:
         self._emit = emit
         self._queue: list[tuple[str, Any] | _Marker] = []
         self._turns: dict[int, _Turn] = {}
         self._flushing = False
+        self._hold: _Hold | None = None
+
+    @property
+    def hold_active(self) -> bool:
+        return self._hold is not None
+
+    @property
+    def hold_first_audio_at(self) -> float | None:
+        return self._hold.first_audio_at if self._hold is not None else None
+
+    def hold(
+        self,
+        name: str,
+        arg: Any,
+        first_audio_at: float,
+        seconds: float,
+        on_timeout: Callable[[], None] | None = None,
+    ) -> None:
+        """Queue an agent message behind a hold: a customer row may still come ahead of it.
+
+        The customer row goes in front with ``push(..., before_hold=True)``; when none comes the hold
+        is released after ``seconds`` and the message goes out as it is. Only the emission of
+        the recording event waits.
+        """
+        hold = _Hold(first_audio_at, on_timeout)
+        self._queue.append(hold)
+        self._queue.append((name, arg))
+        if self._hold is None:
+            self._hold = hold
+        try:
+            hold.timer = asyncio.get_running_loop().call_later(seconds, self._hold_timed_out, hold)
+        except RuntimeError:
+            hold.timer = None
+        self._flush()
+
+    def _hold_timed_out(self, hold: _Hold) -> None:
+        hold.timer = None
+        if hold.on_timeout is not None and hold in self._queue:
+            try:
+                hold.on_timeout()
+            except Exception:
+                logger.exception("error while expiring a record hold")
+        self.release_hold(hold)
+
+    def release_hold(self, hold: _Hold | None = None) -> None:
+        hold = hold or self._hold
+        if hold is None:
+            return
+        if hold.timer is not None:
+            hold.timer.cancel()
+            hold.timer = None
+        if hold in self._queue:
+            self._queue.remove(hold)
+        if self._hold is hold:
+            self._hold = next((e for e in self._queue if isinstance(e, _Hold)), None)
+        self._flush()
 
     @property
     def active(self) -> bool:
@@ -109,8 +178,12 @@ class RecordGate:
         turn = self._turns.get(turn_id)
         return turn.last_item if turn is not None else None
 
-    def push(self, name: str, arg: Any) -> None:
-        """Emit now, or queue behind an open turn."""
+    def push(self, name: str, arg: Any, *, before_hold: bool = False) -> None:
+        """Emit now, or queue behind an open turn.
+
+        ``before_hold`` puts the entry (and the late finals / turn marker that belong with it)
+        in front of the held agent message instead of at the end of the queue.
+        """
         item = getattr(arg, "item", None)
         owner = next(
             (
@@ -120,17 +193,25 @@ class RecordGate:
             ),
             None,
         )
-        self._queue.append((name, arg))
+        hold = self._hold
+        at = self._queue.index(hold) if before_hold and hold in self._queue else len(self._queue)
+
+        def put(entry: tuple[str, Any] | _Marker) -> None:
+            nonlocal at
+            self._queue.insert(at, entry)
+            at += 1
+
+        put((name, arg))
         if owner is not None:
             owner.message_pushed = True
             owner.last_item = item
             for late in owner.pending_late:
-                self._queue.append(late)
+                put(late)
                 owner.last_item = late[1].item
             owner.pending_late.clear()
             if not owner.released:
                 owner.marker = _Marker(owner)
-                self._queue.append(owner.marker)
+                put(owner.marker)
         self._flush()
 
     def insert_late(self, turn_id: int, name: str, arg: Any) -> None:
@@ -174,6 +255,11 @@ class RecordGate:
         for turn in self._turns.values():
             self._queue.extend(turn.pending_late)
             turn.pending_late.clear()
+        for entry in self._queue:
+            if isinstance(entry, _Hold) and entry.timer is not None:
+                entry.timer.cancel()
+                entry.timer = None
+        self._hold = None
         self._queue = [e for e in self._queue if not isinstance(e, _Marker)]
         self._flush()
 

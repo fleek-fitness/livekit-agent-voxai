@@ -2498,6 +2498,9 @@ class AgentActivity(RecognitionHooks):
             # just its arrival time, so it must not unlock `_delayed_ack_is_answer` (and it must
             # not erase a VAD end that was already recorded for this segment)
             self._last_user_speech_end_time = speech_end_time
+            self._session._note_user_word_ended(
+                speech_end_time - ev.speech_duration, speech_end_time
+            )
 
         if self._audio_recognition:
             self._audio_recognition._on_end_of_speech(
@@ -2813,7 +2816,19 @@ class AgentActivity(RecognitionHooks):
             user_message.metrics = self._init_metrics_from_end_of_turn(info)
             user_message.extra[DELAYED_INTERRUPTION_CONSUMED_EXTRA_KEY] = True
             self._agent._chat_ctx.items.append(user_message)
-            self._session._conversation_item_added(user_message)
+            spoken_end = (
+                info.transcript_span[1]
+                if during_agent_speech
+                and is_given(info.transcript_span)
+                and info.transcript_span is not None
+                else None
+            )
+            speech = self._session._speech_spoken_over(spoken_end) if during_agent_speech else None
+            if speech is not None:
+                # said over the agent's speech: recorded right behind that speech's message
+                self._session._conversation_item_added_after_speech(user_message, speech)
+            else:
+                self._session._conversation_item_added(user_message)
         if during_agent_speech:
             # fires on every backchannel over the agent: not a warning
             logger.info(
@@ -2882,6 +2897,7 @@ class AgentActivity(RecognitionHooks):
         """An ended VAD segment turned out to have no text: its speech start leaves no mark."""
         if self._last_user_speech_started_at == start:
             self._clear_user_speech_interruption_context()
+        self._session._clear_pending_user_word(start)
 
     def on_held_ignore_word_discarded(
         self,
@@ -2917,7 +2933,13 @@ class AgentActivity(RecognitionHooks):
         )
         user_message.extra[DELAYED_INTERRUPTION_CONSUMED_EXTRA_KEY] = True
         self._agent._chat_ctx.insert(user_message)
-        self._session._conversation_item_added(user_message)
+        # spoken over the agent's speech: recorded right behind that speech's own message
+        # (the same evidence as the consume path: the provider's span; unknown means "not proven")
+        span = ev.transcript_span
+        spoken_end = span[1] if is_given(span) and span is not None else None
+        self._session._conversation_item_added_after_speech(
+            user_message, self._session._speech_spoken_over(spoken_end)
+        )
         logger.info(
             "consuming ignored interruption transcript",
             extra={"user_input": transcript, "reason": "transcript_gate_trimmed"},
@@ -3558,6 +3580,8 @@ class AgentActivity(RecognitionHooks):
             except BaseException:
                 return
 
+            if speech_handle._first_audio_at is None:
+                speech_handle._first_audio_at = started_speaking_at
             self._session._update_agent_state(
                 "speaking",
                 start_time=started_speaking_at,
@@ -4133,6 +4157,8 @@ class AgentActivity(RecognitionHooks):
                 )
             self._session._early_assistant_metrics = early_metrics
 
+            if speech_handle._first_audio_at is None:
+                speech_handle._first_audio_at = started_speaking_at
             self._session._update_agent_state(
                 "speaking",
                 start_time=started_speaking_at,
@@ -4820,6 +4846,8 @@ class AgentActivity(RecognitionHooks):
             except BaseException:
                 return
 
+            if speech_handle._first_audio_at is None:
+                speech_handle._first_audio_at = started_speaking_at
             self._session._update_agent_state(
                 "speaking",
                 start_time=started_speaking_at,

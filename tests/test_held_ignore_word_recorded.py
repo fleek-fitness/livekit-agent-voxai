@@ -239,6 +239,11 @@ def _activity(chat_ctx: llm.ChatContext) -> tuple[AgentActivity, list[llm.ChatIt
     activity._session._text_only = False
     activity._session.stt = None
     activity._session._conversation_item_added.side_effect = added.append
+    # the word is recorded through whichever recording call the activity picks
+    activity._session._conversation_item_added_after_speech.side_effect = lambda m, _s: (
+        added.append(m)
+    )
+    activity._session._speech_spoken_over.return_value = None
     return activity, added
 
 
