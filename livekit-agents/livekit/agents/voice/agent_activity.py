@@ -2930,8 +2930,11 @@ class AgentActivity(RecognitionHooks):
         user_message.extra[DELAYED_INTERRUPTION_CONSUMED_EXTRA_KEY] = True
         self._agent._chat_ctx.insert(user_message)
         # spoken over the agent's speech: recorded right behind that speech's own message
+        # (the same evidence as the consume path: the provider's span; unknown means "not proven")
+        span = ev.transcript_span
+        spoken_end = span[1] if is_given(span) and span is not None else None
         self._session._conversation_item_added_after_speech(
-            user_message, self._session._speech_spoken_over(stopped_speaking_at)
+            user_message, self._session._speech_spoken_over(spoken_end)
         )
         logger.info(
             "consuming ignored interruption transcript",
