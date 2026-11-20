@@ -81,7 +81,12 @@ from .keyterm_detection import (
     _resolve_stt_context_options,
     _stt_context_from_keyterms_options,
 )
-from .record_gate import GATED_EVENTS, RecordGate
+from .record_gate import (
+    GATED_EVENTS,
+    SPEECH_ROW_HOLD_MAX_SECONDS,
+    SPEECH_ROW_HOLD_WINDOW_SECONDS,
+    RecordGate,
+)
 from .recorder_io import RecorderIO
 from .remote_session import RoomSessionTransport, SessionHost, SessionTransport
 from .run_result import RunOutputOptions, RunResult
@@ -748,6 +753,8 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
         # backchannel messages spoken over an agent speech, recorded right behind that speech's
         # own message (it is recorded when the speech ends or is interrupted)
         self._deferred_backchannels: list[tuple[SpeechHandle, _ChatMessage]] = []
+        # when the last customer audio ended while no row for it has been recorded yet
+        self._pending_user_word_end: float | None = None
         self._started_at: float | None = None
         self._usage_collector = ModelUsageCollector()
         self._redaction_enabled = False
@@ -773,10 +780,59 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
 
     def emit(self, event: EventTypes, arg: AgentEvent) -> None:
         gate = getattr(self, "_record_gate", None)
+        if gate is not None and event == "conversation_item_added":
+            if self._route_around_speech_row_hold(gate, event, arg):
+                return
         if gate is not None and event in GATED_EVENTS and gate.active:
             gate.push(event, arg)
             return
         self._emit_now(event, arg)
+
+    def _route_around_speech_row_hold(self, gate: RecordGate, event: str, arg: Any) -> bool:
+        """Keep a customer word that ended before the agent spoke ahead of the agent's row.
+
+        The agent's row is recorded when its speech ends; a word the customer finished just
+        before the agent started can be confirmed after that, which would put it behind the
+        agent's row. While such a word is unconfirmed the agent's row waits for it, at most
+        ``SPEECH_ROW_HOLD_MAX_SECONDS``; only the recording event waits.
+        """
+        item = getattr(arg, "item", None)
+        role = getattr(item, "role", None)
+        if role == "user":
+            self._pending_user_word_end = None
+            if gate.hold_active:
+                first_audio = gate.hold_first_audio_at
+                stopped = (getattr(item, "metrics", None) or {}).get("stopped_speaking_at")
+                if first_audio is None or stopped is None or stopped < first_audio:
+                    gate.push_before_hold(event, arg)
+                    return True
+            return False
+        if role != "assistant":
+            return False
+        speech = self.current_speech
+        pending_end = getattr(self, "_pending_user_word_end", None)
+        if (
+            speech is None
+            or speech.done()
+            or pending_end is None
+            or speech._first_audio_at is None
+            or pending_end > speech._first_audio_at
+            or speech._first_audio_at - pending_end > SPEECH_ROW_HOLD_WINDOW_SECONDS
+        ):
+            return False
+        # one hold per word
+        self._pending_user_word_end = None
+        gate.hold(event, arg, speech._first_audio_at, SPEECH_ROW_HOLD_MAX_SECONDS)
+        return True
+
+    def _note_user_word_ended(self, ended_at: float) -> None:
+        self._pending_user_word_end = ended_at
+
+    def _clear_pending_user_word(self) -> None:
+        self._pending_user_word_end = None
+        gate = getattr(self, "_record_gate", None)
+        if gate is not None and gate.hold_active:
+            gate.release_hold()
 
     def _emit_now(self, event: str, arg: AgentEvent) -> None:
         self._recorded_events.append(arg)

@@ -25,6 +25,11 @@ RECORD_HOLD_MAX_SECONDS = 3.0
 
 GATED_EVENTS = ("conversation_item_added", "function_tools_executed")
 
+# longest time an agent message waits for a customer word that ended before the agent started
+SPEECH_ROW_HOLD_MAX_SECONDS = 1.0
+# a word that ended longer than this before the agent's first audio is not waited for
+SPEECH_ROW_HOLD_WINDOW_SECONDS = 3.0
+
 
 @dataclass
 class _Turn:
@@ -47,12 +52,71 @@ class _Marker:
         self.turn = turn
 
 
+class _Hold(_Marker):
+    """A position in the queue held for a customer row that belongs ahead of the entry behind it."""
+
+    def __init__(self, first_audio_at: float) -> None:
+        self.turn = None  # type: ignore[assignment]
+        self.first_audio_at = first_audio_at
+        self.timer: asyncio.TimerHandle | None = None
+
+
 class RecordGate:
     def __init__(self, emit: Callable[[str, Any], None]) -> None:
         self._emit = emit
         self._queue: list[tuple[str, Any] | _Marker] = []
         self._turns: dict[int, _Turn] = {}
         self._flushing = False
+        self._hold: _Hold | None = None
+
+    @property
+    def hold_active(self) -> bool:
+        return self._hold is not None
+
+    @property
+    def hold_first_audio_at(self) -> float | None:
+        return self._hold.first_audio_at if self._hold is not None else None
+
+    def hold(self, name: str, arg: Any, first_audio_at: float, seconds: float) -> None:
+        """Queue an agent message behind a hold: a customer row may still come ahead of it.
+
+        The customer row goes in front with ``push_before_hold``; when none comes the hold
+        is released after ``seconds`` and the message goes out as it is. Only the emission of
+        the recording event waits.
+        """
+        hold = _Hold(first_audio_at)
+        self._queue.append(hold)
+        self._queue.append((name, arg))
+        if self._hold is None:
+            self._hold = hold
+        try:
+            hold.timer = asyncio.get_running_loop().call_later(seconds, self.release_hold, hold)
+        except RuntimeError:
+            hold.timer = None
+        self._flush()
+
+    def push_before_hold(self, name: str, arg: Any) -> None:
+        """Record a customer row ahead of the held agent message, then release the hold."""
+        hold = self._hold
+        if hold is None or hold not in self._queue:
+            self._queue.append((name, arg))
+            self._flush()
+            return
+        self._queue.insert(self._queue.index(hold), (name, arg))
+        self.release_hold(hold)
+
+    def release_hold(self, hold: _Hold | None = None) -> None:
+        hold = hold or self._hold
+        if hold is None:
+            return
+        if hold.timer is not None:
+            hold.timer.cancel()
+            hold.timer = None
+        if hold in self._queue:
+            self._queue.remove(hold)
+        if self._hold is hold:
+            self._hold = next((e for e in self._queue if isinstance(e, _Hold)), None)
+        self._flush()
 
     @property
     def active(self) -> bool:
@@ -174,6 +238,11 @@ class RecordGate:
         for turn in self._turns.values():
             self._queue.extend(turn.pending_late)
             turn.pending_late.clear()
+        for entry in self._queue:
+            if isinstance(entry, _Hold) and entry.timer is not None:
+                entry.timer.cancel()
+                entry.timer = None
+        self._hold = None
         self._queue = [e for e in self._queue if not isinstance(e, _Marker)]
         self._flush()
 
