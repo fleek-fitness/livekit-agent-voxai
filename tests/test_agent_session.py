@@ -217,6 +217,7 @@ def _create_closing_test_session(activity: object) -> AgentSession:
     session._agent_state = "initializing"
     session._llm_error_counts = 0
     session._tts_error_counts = 0
+    session._deferred_backchannels = []
     return session
 
 
