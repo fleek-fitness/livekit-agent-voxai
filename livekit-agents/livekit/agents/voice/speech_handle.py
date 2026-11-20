@@ -51,6 +51,8 @@ class SpeechHandle:
         self._chat_items: list[llm.ChatItem] = []
         self._num_steps = 1
         self._agent_turn_context: otel_context.Context | None = None
+        # when this speech's first audio frame played (it stays the same across pause/resume)
+        self._first_audio_at: float | None = None
 
         self._interrupt_timeout_handle: asyncio.TimerHandle | None = None
 

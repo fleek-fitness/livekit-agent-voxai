@@ -35,6 +35,7 @@ from ..llm import (
     LLM,
     AgentHandoff,
     ChatContext,
+    ChatMessage as _ChatMessage,
     DuplexModel,
     DuplexRealtimeAdapter,
     MetricsReport,
@@ -746,7 +747,7 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
         self._record_gate = RecordGate(self._emit_now)
         # backchannel messages spoken over an agent speech, recorded right behind that speech's
         # own message (it is recorded when the speech ends or is interrupted)
-        self._deferred_backchannels: list[tuple[SpeechHandle, llm.ChatMessage]] = []
+        self._deferred_backchannels: list[tuple[SpeechHandle, _ChatMessage]] = []
         self._started_at: float | None = None
         self._usage_collector = ModelUsageCollector()
         self._redaction_enabled = False
@@ -2274,8 +2275,23 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
             )
         self.emit("conversation_item_added", ConversationItemAddedEvent(item=message))
 
+    def _speech_spoken_over(self, spoken_end: float | None) -> SpeechHandle | None:
+        """The running speech a word that ended at ``spoken_end`` was said over, if any.
+
+        None when no speech is playing, when its audio has not started, when the end of the word
+        is unknown, or when the word ended before the speech's first audio (it was said before the
+        agent spoke, so it belongs ahead of the agent's message).
+        """
+        speech = self.current_speech
+        if speech is None or speech.done() or spoken_end is None:
+            return None
+        first_audio = speech._first_audio_at
+        if first_audio is None or spoken_end < first_audio:
+            return None
+        return speech
+
     def _conversation_item_added_after_speech(
-        self, message: llm.ChatMessage, speech: SpeechHandle | None
+        self, message: _ChatMessage, speech: SpeechHandle | None
     ) -> None:
         """Record a backchannel spoken while ``speech`` was playing, right behind that speech.
 
@@ -2288,12 +2304,14 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
             self._conversation_item_added(message)
             return
         self._chat_ctx.insert(message)
+        if getattr(self, "_deferred_backchannels", None) is None:
+            self._deferred_backchannels = []
         self._deferred_backchannels.append((speech, message))
         speech.add_done_callback(self._flush_deferred_backchannels)
 
     def _flush_deferred_backchannels(self, speech: SpeechHandle | None = None) -> None:
         """Record the deferred backchannels of ``speech`` (all of them when it is None)."""
-        if not self._deferred_backchannels:
+        if not getattr(self, "_deferred_backchannels", None):
             return
         ready = [m for s, m in self._deferred_backchannels if speech is None or s is speech]
         self._deferred_backchannels = [
