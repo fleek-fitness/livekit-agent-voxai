@@ -744,6 +744,9 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
 
         self._recorded_events: list[AgentEvent] = []
         self._record_gate = RecordGate(self._emit_now)
+        # backchannel messages spoken over an agent speech, recorded right behind that speech's
+        # own message (it is recorded when the speech ends or is interrupted)
+        self._deferred_backchannels: list[tuple[SpeechHandle, llm.ChatMessage]] = []
         self._started_at: float | None = None
         self._usage_collector = ModelUsageCollector()
         self._redaction_enabled = False
@@ -1463,6 +1466,8 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
 
             self._started = False
 
+            # a backchannel waiting for its speech is recorded, not dropped, when the session ends
+            self._flush_deferred_backchannels()
             if (gate := getattr(self, "_record_gate", None)) is not None:
                 gate.release_all()
             self.emit("close", CloseEvent(error=error, reason=reason))
@@ -2268,6 +2273,39 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
                 extra={"role": message.role, "lk.pii.text": text},
             )
         self.emit("conversation_item_added", ConversationItemAddedEvent(item=message))
+
+    def _conversation_item_added_after_speech(
+        self, message: llm.ChatMessage, speech: SpeechHandle | None
+    ) -> None:
+        """Record a backchannel spoken while ``speech`` was playing, right behind that speech.
+
+        The agent's own message is recorded when its speech ends or is interrupted, so a
+        backchannel spoken over it would otherwise be recorded ahead of it. The chat context is
+        updated now; only the recording event waits for the speech (a paused speech that resumes
+        is the same speech). Without a running speech it is recorded at once.
+        """
+        if speech is None or speech.done():
+            self._conversation_item_added(message)
+            return
+        self._chat_ctx.insert(message)
+        self._deferred_backchannels.append((speech, message))
+        speech.add_done_callback(self._flush_deferred_backchannels)
+
+    def _flush_deferred_backchannels(self, speech: SpeechHandle | None = None) -> None:
+        """Record the deferred backchannels of ``speech`` (all of them when it is None)."""
+        if not self._deferred_backchannels:
+            return
+        ready = [m for s, m in self._deferred_backchannels if speech is None or s is speech]
+        self._deferred_backchannels = [
+            (s, m) for s, m in self._deferred_backchannels if not (speech is None or s is speech)
+        ]
+        for message in ready:
+            if text := message.raw_text_content:
+                logger.debug(
+                    "conversation_item_added",
+                    extra={"role": message.role, "lk.pii.text": text},
+                )
+            self.emit("conversation_item_added", ConversationItemAddedEvent(item=message))
 
     def _late_final_item_added(self, message: llm.ChatMessage, *, turn_id: int | None) -> None:
         """Record a user message made from a final that arrived after its turn was committed.
