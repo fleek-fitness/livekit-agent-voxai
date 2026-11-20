@@ -46,6 +46,7 @@ class _FakeStream:
         self._text_buffer = ""
         self._start_times_ms: list[int] = []
         self._durations_ms: list[int] = []
+        self._alignment_offset_ms = 0
 
 
 class _FakeConnection:
@@ -342,7 +343,7 @@ async def test_interrupted_stream_unregisters_before_ending_the_segment(
     assert "close_context" in calls
 
 
-# -- eleven_v3 / eleven_v3_conversational (text-to-dialogue) --------------------------
+# -- eleven_v3 / eleven_v4 (text-to-dialogue) ----------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -350,6 +351,8 @@ async def test_interrupted_stream_unregisters_before_ending_the_segment(
     [
         ("eleven_v3", True),
         ("eleven_v3_conversational", True),
+        ("eleven_v4", True),
+        ("eleven_v4_turbo", True),
         ("eleven_turbo_v2_5", False),
         ("eleven_flash_v2_5", False),
     ],

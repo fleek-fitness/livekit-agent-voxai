@@ -61,6 +61,12 @@ class TestSTTCredentials:
         )
 
     async def test_clear_error_when_project_unresolvable(self, monkeypatch) -> None:
+        from google.auth.exceptions import DefaultCredentialsError
+
+        def unavailable_adc():
+            raise DefaultCredentialsError("ADC disabled for this unit test")
+
+        monkeypatch.setattr("google.auth.default", unavailable_adc)
         # no project on the credentials and no ADC available: the error must
         # say what is wrong instead of a confusing "default credentials not
         # found" at transcription time (Devin finding on #6618)

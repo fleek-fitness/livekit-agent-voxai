@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import weakref
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -350,12 +351,16 @@ class _ToolExecutor:
                 fnc_args, fnc_kwargs = prepare_function_arguments(
                     fnc=tool, json_arguments=raw_arguments, call_ctx=run_ctx
                 )
-                if mock is not None:
-                    from .run_result import _run_mock
+                run_ctx._exec_started_at = time.perf_counter()
+                try:
+                    if mock is not None:
+                        from .run_result import _run_mock
 
-                    output = await _run_mock(mock, *fnc_args, **fnc_kwargs)
-                else:
-                    output = await tool(*fnc_args, **fnc_kwargs)
+                        output = await _run_mock(mock, *fnc_args, **fnc_kwargs)
+                    else:
+                        output = await tool(*fnc_args, **fnc_kwargs)
+                finally:
+                    run_ctx._exec_ended_at = time.perf_counter()
             except asyncio.CancelledError:
                 logger.debug("tool cancelled", extra={"call_id": call_id, "function": fnc_name})
                 if not first_update_fut.done():
@@ -372,22 +377,7 @@ class _ToolExecutor:
                     first_update_fut.set_result(output)
                 return output
 
-            if output is None or isinstance(output, StopResponse):
-                return output
-
-            # the first update has already been returned to dispatch, so an Agent
-            # return now has no surface to carry an agent_task back
-            from .agent import Agent
-
-            if isinstance(output, Agent):
-                logger.error(
-                    f"tool `{fnc_name}` returned an Agent after ctx.update(); "
-                    "agent handoff after a progress update is not supported",
-                    extra={"call_id": call_id, "function": fnc_name},
-                )
-                raise RuntimeError("agent handoff after a progress update is not supported")
-
-            if isinstance(output, BaseException):
+            if isinstance(output, BaseException) and not isinstance(output, StopResponse):
                 if isinstance(output, ToolError):
                     logger.warning(
                         "ToolError while executing tool: %s",
@@ -401,8 +391,20 @@ class _ToolExecutor:
                         exc_info=output,
                     )
 
-            # final return goes through the coalescer as a synthetic output
-            pair = run_ctx._make_update_pair(output, call_id_suffix="_final")
+            # every final return, None included, goes through the coalescer as a synthetic
+            # output, so the model never waits on a result that won't come
+            final = run_ctx._make_update_output(output, call_id_suffix="_final")
+            if final.agent_task is not None:
+                # the first update already answered dispatch, so a returned handoff cannot apply
+                logger.error(
+                    f"tool `{fnc_name}` returned an Agent after ctx.update(); "
+                    "agent handoff after a progress update is not supported",
+                    extra={"call_id": call_id, "function": fnc_name},
+                )
+                output = ToolError("the agent handoff did not happen")
+                final = run_ctx._make_update_output(output, call_id_suffix="_final")
+
+            pair = (final.fnc_call, final.fnc_call_out)
             run_ctx._updates.append(pair)
             await self._enqueue_reply(run_ctx, [pair[0], pair[1]])
             return output
@@ -459,10 +461,19 @@ class _ToolExecutor:
                 status, message = "done", str(output)
 
             entry_id = call_id + "_final" if run_ctx._updates else call_id
+            exec_window = (
+                (run_ctx._exec_started_at, run_ctx._exec_ended_at or time.perf_counter())
+                if run_ctx._exec_started_at is not None
+                else None
+            )
             session._tool_execution_updated(
                 ToolExecutionUpdatedEvent(
                     update=ToolCallEnded(
-                        id=entry_id, call_id=call_id, message=message, status=status
+                        id=entry_id,
+                        call_id=call_id,
+                        message=message,
+                        status=status,
+                        exec_window=exec_window,
                     )
                 ),
             )
@@ -527,6 +538,9 @@ class _ToolExecutor:
         chat_ctx.insert(items)
         await target.update_chat_ctx(chat_ctx)
         ctx.session.history.insert(items)
+
+        if not any(item.type == "function_call_output" and item.reply_required for item in items):
+            return
 
         self._pending_updates.append(_PendingUpdate(ctx=ctx, items=items, target=target))
 

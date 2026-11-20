@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import time
 from collections.abc import Awaitable, Callable
 from multiprocessing.context import BaseContext
 from typing import Any, Literal
@@ -13,6 +14,7 @@ from ..utils import aio
 from ..utils.hw.cpu import get_cpu_monitor
 from . import inference_executor, job_proc_executor, job_thread_executor
 from .job_executor import JobExecutor
+from .startup_timing import startup_timing
 
 EventTypes = Literal[
     "process_created",
@@ -23,6 +25,12 @@ EventTypes = Literal[
 ]
 
 MAX_CONCURRENT_INITIALIZATIONS = min(math.ceil(get_cpu_monitor().cpu_count()), 4)
+
+# A job assigned by the LiveKit server that waited longer than this for a process is not launched:
+# LiveKit re-sends an unanswered job to another worker after roughly 16s, and nothing tells this
+# worker it lost it. Normal waits are around 1s, and the margin leaves time to connect to the room
+# before then.
+MAX_JOB_PROCESS_WAIT_S = 10.0
 
 
 class ProcPool(utils.EventEmitter[EventTypes]):
@@ -161,21 +169,60 @@ class ProcPool(utils.EventEmitter[EventTypes]):
         )
         raise RuntimeError(f"no process became available after {MAX_ACQUIRE_ATTEMPTS} attempts")
 
-    async def launch_job(self, info: RunningJobInfo) -> None:
+    async def launch_job(self, info: RunningJobInfo, *, reassignable: bool = False) -> None:
+        """Run a job on a warm process.
+
+        Set ``reassignable`` for a job assigned by the LiveKit server, which may be handed to
+        another worker while this one waits for a process. Such a job is dropped, not launched,
+        once the wait exceeds ``MAX_JOB_PROCESS_WAIT_S``. Jobs started locally (simulated,
+        reloaded or connected by hand) are never reassigned and always launched.
+        """
         MAX_LAUNCH_ATTEMPTS = 3
+        launch_requested_at = time.monotonic()
 
         for attempt in range(MAX_LAUNCH_ATTEMPTS):
             self._jobs_waiting_for_process += 1
             try:
-                proc = await self._acquire_proc(info.job.id)
+                with startup_timing(
+                    "pool_acquire",
+                    job_id=info.job.id,
+                    attempt=attempt + 1,
+                    warm_at_request=not self._warmed_proc_queue.empty(),
+                ) as timing:
+                    proc = await self._acquire_proc(info.job.id)
+                    timing["process_id"] = proc.id
             finally:
                 self._jobs_waiting_for_process -= 1
 
+            waited = time.monotonic() - launch_requested_at
+            if reassignable and waited > MAX_JOB_PROCESS_WAIT_S:
+                # LiveKit has most likely handed this job to another worker by now, and launching
+                # it here would run the same job twice. Give the idle process back and drop it.
+                self._warmed_proc_queue.put_nowait(proc)
+                logger.warning(
+                    "dropping job: waited too long for a process, "
+                    "LiveKit has likely reassigned it to another worker",
+                    extra={
+                        "job_id": info.job.id,
+                        "waited_s": round(waited, 3),
+                        "max_wait_s": MAX_JOB_PROCESS_WAIT_S,
+                        "attempt": attempt + 1,
+                    },
+                )
+                return
+
             try:
-                await proc.launch_job(info)
+                with startup_timing(
+                    "job_launch", job_id=info.job.id, process_id=proc.id, attempt=attempt + 1
+                ):
+                    await proc.launch_job(info)
                 self.emit("process_job_launched", proc)
                 return
             except Exception:
+                logger.warning(
+                    "closing job process: launch failed",
+                    extra=proc.logging_extra(),
+                )
                 close_task = asyncio.create_task(proc.aclose())
                 self._close_tasks.add(close_task)
                 close_task.add_done_callback(self._close_tasks.discard)
@@ -241,18 +288,29 @@ class ProcPool(utils.EventEmitter[EventTypes]):
         self._executors.append(proc)
         initialized = False
         try:
-            async with self._init_sem:
+            with startup_timing("initialize_slot_wait", process_id=proc.id):
+                await self._init_sem.acquire()
+            try:
                 if not self._closed:
                     self.emit("process_created", proc)
-                    await proc.start()
+                    with startup_timing("process_start", process_id=proc.id) as timing:
+                        await proc.start()
+                        timing["child_pid"] = getattr(proc, "pid", None)
                     self.emit("process_started", proc)
-                    await proc.initialize()
+                    with startup_timing(
+                        "process_initialize",
+                        process_id=proc.id,
+                        child_pid=getattr(proc, "pid", None),
+                    ):
+                        await proc.initialize()
                     self.emit("process_ready", proc)
                     self._warmed_proc_queue.put_nowait(proc)
                     if self._warmed_proc_queue.qsize() >= self._default_num_idle_processes:
                         self._idle_ready.set()
 
                     initialized = True
+            finally:
+                self._init_sem.release()
         except Exception:
             logger.exception("error initializing process", extra=proc.logging_extra())
         except asyncio.CancelledError:
@@ -295,6 +353,10 @@ class ProcPool(utils.EventEmitter[EventTypes]):
                 await asyncio.sleep(0.1)
         except asyncio.CancelledError:
             await aio.cancel_and_wait(*self._spawn_tasks)
+            logger.info(
+                "draining job process pool: closing %d process(es)",
+                len(self._executors),
+            )
             await asyncio.gather(*[proc.aclose() for proc in self._executors])
             await asyncio.gather(*self._close_tasks)
             await asyncio.gather(*self._monitor_tasks)

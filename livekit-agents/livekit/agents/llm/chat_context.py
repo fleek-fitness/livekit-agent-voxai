@@ -233,6 +233,20 @@ class MetricsReport(TypedDict, total=False):
     started_speaking_at: float
     stopped_speaking_at: float
 
+    user_message_id: str
+    """Id of the user `ChatMessage` these metrics belong to, as the conversation history
+    keeps it. Replies read it to name the message they answer.
+
+    User `ChatMessage` only
+    """
+
+    answered_user_message_id: str
+    """Id of the user `ChatMessage` this reply answers, set together with `e2e_latency`.
+    Chained replies and `say()` speeches carry the id of the original user message.
+
+    Assistant `ChatMessage` only
+    """
+
     transcription_delay: float
     """Time taken to obtain the transcript after the end of the user's speech
 

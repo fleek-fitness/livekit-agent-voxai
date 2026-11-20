@@ -36,6 +36,7 @@ from .speech_handle import SpeechHandle
 if TYPE_CHECKING:
     from .agent_activity import AgentActivity
     from .agent_session import AgentSession
+    from .generation import ToolExecutionOutput
     from .tool_executor import UpdatePromptArgs, _ToolExecutor
 
 
@@ -62,6 +63,10 @@ class RunContext(Generic[Userdata_T]):
 
         # synthesized progress-update pairs, populated whether or not an executor is attached
         self._updates: list[tuple[FunctionCall, FunctionCallOutput]] = []
+
+        # monotonic-clock window of the tool callable itself, set by the executor
+        self._exec_started_at: float | None = None
+        self._exec_ended_at: float | None = None
 
         # set/cleared by the executor around the tool's lifetime
         self._executor: _ToolExecutor | None = None
@@ -218,9 +223,10 @@ class RunContext(Generic[Userdata_T]):
 
         # first update keeps the original call_id
         update_step = len(self._updates)
-        pair = self._make_update_pair(
+        out = self._make_update_output(
             message, call_id_suffix=f"_update_{update_step}" if update_step > 0 else ""
         )
+        pair = (out.fnc_call, out.fnc_call_out)
         self._updates.append(pair)
 
         if self._executor is None:
@@ -268,10 +274,8 @@ class RunContext(Generic[Userdata_T]):
         except Exception:
             pass  # reply task's own errors aren't our concern
 
-    def _make_update_pair(
-        self, message: Any, *, call_id_suffix: str = ""
-    ) -> tuple[FunctionCall, FunctionCallOutput]:
-        """Synthesize a (FunctionCall, FunctionCallOutput) pair for a progress update.
+    def _make_update_output(self, message: Any, *, call_id_suffix: str = "") -> ToolExecutionOutput:
+        """Synthesize the tool output of a progress update, with a FunctionCall of its own.
 
         The new FunctionCall carries ``{call_id}{call_id_suffix}``; name/arguments/extra
         are copied. ``make_tool_output`` is reused so error handling matches dispatch.
@@ -284,8 +288,7 @@ class RunContext(Generic[Userdata_T]):
             arguments=self.function_call.arguments,
             extra=dict(self.function_call.extra),
         )
-        tool_output = make_tool_output(fnc_call=fnc_call, output=message, exception=None)
-        return (fnc_call, tool_output.fnc_call_out)
+        return make_tool_output(fnc_call=fnc_call, output=message, exception=None)
 
 
 EventTypes = Literal[
@@ -296,6 +299,7 @@ EventTypes = Literal[
     "conversation_item_added",
     "agent_false_interruption",
     "overlapping_speech",
+    "preemptive_generation_outcome",
     "function_tools_executed",
     "metrics_collected",
     "session_usage_updated",
@@ -410,6 +414,28 @@ class SessionUsageUpdatedEvent(BaseModel):
     created_at: float = Field(default_factory=time.time)
 
 
+class PreemptiveGenerationOutcomeEvent(BaseModel):
+    type: Literal["preemptive_generation_outcome"] = "preemptive_generation_outcome"
+    outcome: Literal["reused", "discarded"]
+    """Whether a speculative generation was scheduled or thrown away."""
+
+    reason: str
+    """Stable machine-readable reason for the outcome."""
+
+    preemptive_lead_time: float
+    """Seconds elapsed since the preemptive generation was created."""
+
+    trigger_source: Literal["preflight", "final_transcript", "unknown"] = "unknown"
+    """Transcript source that created the speculative generation."""
+
+    speech_id: str | None = None
+    transcript_match: bool | None = None
+    chat_ctx_match: bool | None = None
+    tools_match: bool | None = None
+    tool_choice_match: bool | None = None
+    created_at: float = Field(default_factory=time.time)
+
+
 class _TypeDiscriminator(BaseModel):
     type: Literal["unknown"] = "unknown"  # force user to use the type discriminator
 
@@ -432,6 +458,19 @@ class FunctionToolsExecutedEvent(BaseModel):
     type: Literal["function_tools_executed"] = "function_tools_executed"
     function_calls: list[FunctionCall]
     function_call_outputs: list[FunctionCallOutput]
+    function_call_exec_windows: dict[str, tuple[float, float]] = Field(default_factory=dict)
+    """``(start, end)`` of each call's tool callable in seconds on the process monotonic
+    clock (``time.perf_counter()``), keyed by ``call_id``.
+
+    Measured right before the callable is awaited and right after it returns, so it
+    excludes any wait for speech permission or between steps. A call whose callable never
+    ran (unknown tool, bad arguments, duplicate rejected) has no entry. For an async tool
+    that is still running at its first ``ctx.update()``, ``end`` is only the time of that
+    update; the real end follows in ``ToolCallEnded.exec_window`` under the original call id.
+    """
+    speech_id: str | None = None
+    """Id of the speech whose reply ran these tools. Listeners cannot read it from the running
+    context: the recording gate may emit this event later, from another task."""
     created_at: float = Field(default_factory=time.time)
     _handoff_required: bool = PrivateAttr(default=False)
 
@@ -502,6 +541,9 @@ class ToolCallEnded(BaseModel):
     message: str | None = None
     """Result or error text; None when there is nothing to voice."""
     status: Literal["done", "error", "cancelled"]
+    exec_window: tuple[float, float] | None = None
+    """``(start, end)`` of the tool callable on ``time.perf_counter()``, ``end`` being when it
+    returned, failed or was cancelled. None when the callable never started."""
 
 
 class ToolReplyUpdated(BaseModel):
@@ -591,6 +633,7 @@ AgentEvent = Annotated[
     | AgentFalseInterruptionEvent
     | MetricsCollectedEvent
     | SessionUsageUpdatedEvent
+    | PreemptiveGenerationOutcomeEvent
     | ConversationItemAddedEvent
     | FunctionToolsExecutedEvent
     | SpeechCreatedEvent

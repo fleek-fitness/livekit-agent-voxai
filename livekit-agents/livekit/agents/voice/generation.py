@@ -35,7 +35,7 @@ from ..utils import aio
 from ..utils.aio import itertools
 from . import io
 from .speech_handle import SpeechHandle
-from .tool_executor import _build_executor_map
+from .tool_executor import _build_executor_map, _RunningTasks
 from .transcription.text_transforms import _apply_text_transforms
 
 if TYPE_CHECKING:
@@ -68,6 +68,13 @@ class _LLMGenerationData:
 _RUNNING_TOOL_PLACEHOLDER = "The tool call is still in progress."
 # extra flag marking an injected pair so it can be stripped before the ctx is forwarded.
 _RUNNING_PLACEHOLDER_KEY = "__lk_running_placeholder__"
+# first update of a tool an interrupted turn stopped waiting for; a model that can still call
+# tools, such as GPT-Live's backend, otherwise calls the tool again
+_RELEASED_TOOL_TEMPLATE = (
+    "{message} It keeps running in the background, and its result will be delivered to you "
+    "automatically when it finishes. Do not call `{function_name}` again, and do not guess its "
+    "result."
+)
 
 
 def _inject_running_tool_calls(
@@ -154,12 +161,15 @@ def perform_llm_inference(
     model_settings: ModelSettings,
     model: str | None = None,
     provider: str | None = None,
+    session: AgentSession | None = None,
 ) -> tuple[asyncio.Task[bool], _LLMGenerationData]:
     text_ch = aio.Chan[str | FlushSentinel]()
     function_ch = aio.Chan[llm.FunctionCall]()
     data = _LLMGenerationData(text_ch=text_ch, function_ch=function_ch)
     llm_task = asyncio.create_task(
-        _llm_inference_task(node, chat_ctx, tool_ctx, model_settings, data, model, provider)
+        _llm_inference_task(
+            node, chat_ctx, tool_ctx, model_settings, data, model, provider, session
+        )
     )
     llm_task.add_done_callback(lambda _: text_ch.close())
     llm_task.add_done_callback(lambda _: function_ch.close())
@@ -183,9 +193,11 @@ async def _llm_inference_task(
     data: _LLMGenerationData,
     model: str | None = None,
     provider: str | None = None,
+    session: AgentSession | None = None,
 ) -> bool:
     start_time = time.perf_counter()
     data.started_at = start_time
+
     current_span = trace.get_current_span()
     data.started_fut.set_result(None)
 
@@ -227,7 +239,6 @@ async def _llm_inference_task(
     # (e.g. tool_ctx.toolsets stays intact for executor routing on handoff).
     tool_ctx._sync_flattened(tools)
     tools_snapshot = tools.copy()
-
     if isinstance(llm_node, str):
         data.generated_text = llm_node
         text_ch.send_nowait(llm_node)
@@ -988,6 +999,7 @@ async def _execute_tools_task(
                     fnc_call: llm.FunctionCall,
                     tool_description: str | None,
                     agent_label: str,
+                    run_ctx: RunContext,
                 ) -> None:
                     current_span = trace.get_current_span()
                     current_span.set_attributes(
@@ -1045,6 +1057,14 @@ async def _execute_tools_task(
                         error=output.fnc_call_out.is_error,
                     )
 
+                    # an async tool answers at its first update while the callable goes on:
+                    # its window then ends here
+                    if run_ctx._exec_started_at is not None:
+                        output.exec_window = (
+                            run_ctx._exec_started_at,
+                            run_ctx._exec_ended_at or time.perf_counter(),
+                        )
+
                     # TODO(theomonnom): Add the agent handoff inside the current_span
                     _tool_completed(output)
 
@@ -1054,9 +1074,11 @@ async def _execute_tools_task(
                         fnc_call,
                         _tool_description(function_tool),
                         activity.agent.label,
+                        run_ctx,
                     ),
                     name=f"func_exec_{fnc_call.name}",  # task name is used for logging when the task is cancelled
                 )
+
                 _set_activity_task_info(
                     task, speech_handle=speech_handle, function_call=fnc_call, inline_task=True
                 )
@@ -1129,6 +1151,8 @@ class ToolExecutionOutput:
     agent_task: Agent | None
     raw_output: Any
     raw_exception: BaseException | None
+    exec_window: tuple[float, float] | None = None
+    """``(start, end)`` of the tool callable on ``time.perf_counter()``, None when it never ran."""
 
 
 def make_tool_output(
@@ -1222,6 +1246,31 @@ def _interrupted_tool_output(out: ToolExecutionOutput) -> llm.FunctionCallOutput
 
     fnc_call_out.reply_required = False
     return fnc_call_out
+
+
+async def _release_running_tools(
+    session: AgentSession, started_calls: list[llm.FunctionCall], speech_handle: SpeechHandle
+) -> None:
+    """Hand the tools an interrupted turn stopped waiting for to their executor.
+
+    Each one answers with the running placeholder as its first ``ctx.update()``, so its final
+    result arrives later as a deferred reply, like any async tool's.
+    """
+    running = _RunningTasks.get(session, {})
+    released: list[str] = []
+    for fnc_call in started_calls:
+        task = running.get(fnc_call.call_id)
+        if task is None or task.ctx._first_update_fut is None or task.ctx._first_update_fut.done():
+            continue
+        await task.ctx.update(_RUNNING_TOOL_PLACEHOLDER, template=_RELEASED_TOOL_TEMPLATE)
+        released.append(fnc_call.name)
+
+    if released:
+        logger.warning(
+            "tools still running when the interrupted speech timed out, their results will "
+            "arrive as a deferred reply; a long-running tool should call `ctx.update()`",
+            extra={"functions": released, "speech_id": speech_handle.id},
+        )
 
 
 INSTRUCTIONS_MESSAGE_ID = "lk.agent_task.instructions"  #  value must not change
