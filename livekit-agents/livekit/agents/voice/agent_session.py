@@ -827,10 +827,17 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
         if not targets:
             return False
         self._hold_targets = targets
-        gate.hold(event, arg, first_audio, SPEECH_ROW_HOLD_MAX_SECONDS)
+        gate.hold(
+            event,
+            arg,
+            first_audio,
+            SPEECH_ROW_HOLD_MAX_SECONDS,
+            on_timeout=self._expire_hold_targets,
+        )
         return True
 
     _WORD_MATCH_TOLERANCE_SECONDS = 0.5
+    _WORD_EXACT_TOLERANCE_SECONDS = 0.15
 
     @staticmethod
     def _row_span(item: Any) -> tuple[float, float] | None:
@@ -841,13 +848,34 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
         return (metrics.get("started_speaking_at", end), end)
 
     def _take_pending_word(self, span: tuple[float, float]) -> tuple[float, float] | None:
-        """Remove and return the pending segment the row with ``span`` is the text of."""
+        """Remove and return the pending segment the row with ``span`` is the text of.
+
+        The segment the span matches exactly wins; when several segments only overlap it
+        loosely, the attribution is ambiguous and none is consumed.
+        """
         tol = self._WORD_MATCH_TOLERANCE_SECONDS
-        for word in self._pending_user_words:
-            if span[0] <= word[1] + tol and span[1] >= word[0] - tol:
-                self._pending_user_words.remove(word)
-                return word
-        return None
+        near = [
+            w for w in self._pending_user_words if span[0] <= w[1] + tol and span[1] >= w[0] - tol
+        ]
+        if len(near) > 1:
+            tight = [
+                w
+                for w in near
+                if abs(w[0] - span[0]) <= self._WORD_EXACT_TOLERANCE_SECONDS
+                and abs(w[1] - span[1]) <= self._WORD_EXACT_TOLERANCE_SECONDS
+            ]
+            near = tight if len(tight) == 1 else []
+        if not near:
+            return None
+        self._pending_user_words.remove(near[0])
+        return near[0]
+
+    def _expire_hold_targets(self) -> None:
+        """The hold ran out: do not wait for these segments again for the next row."""
+        self._pending_user_words = [
+            w for w in self._pending_user_words if w not in self._hold_targets
+        ]
+        self._hold_targets = []
 
     def _note_user_word_ended(self, started_at: float, ended_at: float) -> None:
         self._pending_user_words.append((started_at, ended_at))
@@ -855,12 +883,17 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
 
     def _clear_pending_user_word(self, started_at: float | None = None) -> None:
         """A segment turned out to have no text: forget it and stop waiting for it."""
-        tol = self._WORD_MATCH_TOLERANCE_SECONDS
-        gone = [
-            w
-            for w in self._pending_user_words
-            if started_at is None or abs(w[0] - started_at) <= tol
-        ]
+        gone = list(self._pending_user_words)
+        if started_at is not None:
+            near = [
+                w
+                for w in self._pending_user_words
+                if abs(w[0] - started_at) <= self._WORD_MATCH_TOLERANCE_SECONDS
+            ]
+            exact = [
+                w for w in near if abs(w[0] - started_at) <= self._WORD_EXACT_TOLERANCE_SECONDS
+            ]
+            gone = exact if len(exact) == 1 else (near if len(near) == 1 else [])
         self._pending_user_words = [w for w in self._pending_user_words if w not in gone]
         self._hold_targets = [w for w in self._hold_targets if w not in gone]
         gate = getattr(self, "_record_gate", None)
