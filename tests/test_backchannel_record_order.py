@@ -8,6 +8,7 @@ the chat context is updated at once, and nothing is dropped when the session end
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 
 import pytest
 
@@ -133,7 +134,15 @@ def _real_chain(speech: SpeechHandle):
     return session, activity, ar, seen, MagicMock
 
 
-async def _backchannel_over(ar, *, start: float, end: float, arrived: float, text: str) -> None:
+async def _backchannel_over(
+    ar,
+    *,
+    start: float,
+    end: float,
+    arrived: float,
+    text: str,
+    span: tuple[float, float] | None = None,
+) -> None:
     from .test_held_ignore_word_recorded import (
         _backchannel_verdict,
         _final,
@@ -142,7 +151,10 @@ async def _backchannel_over(ar, *, start: float, end: float, arrived: float, tex
 
     _open_overlap(ar)
     _backchannel_verdict(ar)
-    await ar._on_stt_event(_final(text, start=start, end=end, created_at=arrived))
+    ev = _final(text, start=start, end=end, created_at=arrived)
+    if span is not None:
+        ev = replace(ev, transcript_span=span)
+    await ar._on_stt_event(ev)
 
 
 async def test_trimmed_backchannel_over_a_playing_speech_is_recorded_behind_its_message() -> None:
@@ -158,7 +170,14 @@ async def test_trimmed_backchannel_over_a_playing_speech_is_recorded_behind_its_
     speech._first_audio_at = AGENT_START
     session, _activity, ar, seen, _ = _real_chain(speech)
 
-    await _backchannel_over(ar, start=ACK_START, end=ACK_END, arrived=ACK_ARRIVED, text=" 예.")
+    await _backchannel_over(
+        ar,
+        start=ACK_START,
+        end=ACK_END,
+        arrived=ACK_ARRIVED,
+        text=" 예.",
+        span=(ACK_START, ACK_END),
+    )
     ar._on_end_of_agent_speech(ended_at=AGENT_END)  # the trim records the word
 
     assert seen == []  # the speech is still not done, so its message is not recorded yet
@@ -183,13 +202,25 @@ async def test_two_backchannels_over_one_paused_and_resumed_speech_are_recorded_
     speech._first_audio_at = AGENT_START  # the first audio; a resume does not change it
     session, _activity, ar, seen, _ = _real_chain(speech)
 
-    await _backchannel_over(ar, start=ACK_START, end=ACK_END, arrived=ACK_ARRIVED, text=" 예.")
+    await _backchannel_over(
+        ar,
+        start=ACK_START,
+        end=ACK_END,
+        arrived=ACK_ARRIVED,
+        text=" 예.",
+        span=(ACK_START, ACK_END),
+    )
     ar._on_end_of_agent_speech(ended_at=AGENT_END)
     # the same speech resumes and the customer says it again
     ar2 = _real_chain(speech)[2]
     ar2._hooks.on_held_ignore_word_discarded = _activity.on_held_ignore_word_discarded
     await _backchannel_over(
-        ar2, start=ACK_START + 1, end=ACK_END + 1, arrived=ACK_ARRIVED + 1, text=" 네."
+        ar2,
+        start=ACK_START + 1,
+        end=ACK_END + 1,
+        arrived=ACK_ARRIVED + 1,
+        span=(ACK_START + 1, ACK_END + 1),
+        text=" 네.",
     )
     ar2._on_end_of_agent_speech(ended_at=AGENT_END)
     assert seen == []
@@ -210,7 +241,14 @@ async def test_a_word_said_before_the_speech_audio_is_not_deferred() -> None:
     speech._first_audio_at = ACK_END + 1.0  # the audio started after the word ended
     session, _activity, ar, seen, _ = _real_chain(speech)
 
-    await _backchannel_over(ar, start=ACK_START, end=ACK_END, arrived=ACK_ARRIVED, text=" 네.")
+    await _backchannel_over(
+        ar,
+        start=ACK_START,
+        end=ACK_END,
+        arrived=ACK_ARRIVED,
+        text=" 네.",
+        span=(ACK_START, ACK_END),
+    )
     ar._on_end_of_agent_speech(ended_at=AGENT_END)
 
     assert seen == [("user", "네.")]  # recorded at once, ahead of the speech's message
@@ -332,3 +370,56 @@ async def test_ignored_turn_said_before_the_audio_or_without_a_span_is_recorded_
     )
 
     assert seen == [("user", "네")]
+
+
+async def test_trim_judges_by_the_span_not_by_the_arrival_time() -> None:
+    from .test_held_ignore_word_recorded import ACK_ARRIVED, ACK_END, ACK_START, AGENT_END
+
+    # the word ended (span end) before the speech's first audio, but its final arrived after it
+    speech = SpeechHandle.create()
+    speech._first_audio_at = ACK_ARRIVED - 0.5
+    assert ACK_END < speech._first_audio_at < ACK_ARRIVED
+    session, _activity, ar, seen, _ = _real_chain(speech)
+
+    await _backchannel_over(
+        ar,
+        start=ACK_START,
+        end=ACK_END,
+        arrived=ACK_ARRIVED,
+        text=" 네.",
+        span=(ACK_START, ACK_END),
+    )
+    ar._on_end_of_agent_speech(ended_at=AGENT_END)
+
+    assert seen == [("user", "네.")]
+
+
+@pytest.mark.parametrize("unknown", ["not_given", "none"])
+async def test_trim_without_a_proven_span_is_recorded_at_once(unknown: str) -> None:
+    from livekit.agents.types import NOT_GIVEN
+
+    from .test_held_ignore_word_recorded import (
+        ACK_ARRIVED,
+        ACK_END,
+        ACK_START,
+        AGENT_END,
+        AGENT_START,
+        _backchannel_verdict,
+        _final,
+        _open_overlap,
+    )
+
+    speech = SpeechHandle.create()
+    speech._first_audio_at = AGENT_START
+    session, _activity, ar, seen, _ = _real_chain(speech)
+    _open_overlap(ar)
+    _backchannel_verdict(ar)
+    ev = _final(" 네.", start=ACK_START, end=ACK_END, created_at=ACK_ARRIVED)
+    ev = replace(ev, transcript_span=NOT_GIVEN if unknown == "not_given" else None)
+    await ar._on_stt_event(ev)
+
+    ar._on_end_of_agent_speech(ended_at=AGENT_END)
+
+    assert seen == [
+        ("user", "네.")
+    ]  # the arrival time is after the first audio, but proves nothing
