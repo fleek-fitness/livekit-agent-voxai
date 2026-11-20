@@ -729,6 +729,7 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
         self._early_assistant_metrics: MetricsReport | None = None
         # the latest user turn no agent speech has reported e2e_latency for yet
         self._unanswered_user_metrics: MetricsReport | None = None
+        self._answered_user_metrics: MetricsReport | None = None
 
         # trace
         self._user_speaking_span: trace.Span | None = None

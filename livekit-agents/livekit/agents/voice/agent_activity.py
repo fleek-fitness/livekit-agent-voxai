@@ -124,6 +124,10 @@ if TYPE_CHECKING:
 _AgentActivityContextVar = contextvars.ContextVar["AgentActivity"]("agents_activity")
 _SpeechHandleContextVar = contextvars.ContextVar["SpeechHandle"]("agents_speech_handle")
 _IdleHoldContextVar = contextvars.ContextVar[bool]("agents_idle_hold", default=False)
+# the user turn the running pipeline reply answers, for speeches its llm_node or tools create
+_ReplyUserMetricsContextVar = contextvars.ContextVar["llm.MetricsReport | None"](
+    "agents_reply_user_metrics", default=None
+)
 
 
 async def _aligned_transcript_or_text(
@@ -147,6 +151,10 @@ async def _aligned_transcript_or_text(
         )
         async for chunk in text:
             yield chunk
+
+
+def _exec_windows(outputs: list[ToolExecutionOutput]) -> dict[str, tuple[float, float]]:
+    return {out.fnc_call.call_id: out.exec_window for out in outputs if out.exec_window is not None}
 
 
 def _transcripts_equivalent(first: str, second: str | None) -> bool:
@@ -959,6 +967,7 @@ class AgentActivity(RecognitionHooks):
                     entered_on = self._session._unanswered_user_metrics
                     try:
                         tk = _OnEnterContextVar.set(data)
+                        _ReplyUserMetricsContextVar.set(None)
                         await self._agent.on_enter()
                     finally:
                         _OnEnterContextVar.reset(tk)
@@ -3086,6 +3095,7 @@ class AgentActivity(RecognitionHooks):
 
         if user_message is not None:
             user_message.metrics = metrics_report
+            metrics_report["user_message_id"] = user_message.id
             if info.turn_id is not None:
                 self._session._record_gate.bind_message(info.turn_id, user_message)
 
@@ -3186,6 +3196,8 @@ class AgentActivity(RecognitionHooks):
                 preemptive.user_message.content = user_message.content.copy()
                 preemptive.user_message.transcript_confidence = user_message.transcript_confidence
                 preemptive.user_message.metrics = metrics_report
+                # the history keeps the preemptive message, so its id names the turn
+                metrics_report["user_message_id"] = preemptive.user_message.id
                 if info.turn_id is not None:
                     self._session._record_gate.bind_message(info.turn_id, preemptive.user_message)
                 self._schedule_speech(speech_handle, priority=SpeechHandle.SPEECH_PRIORITY_NORMAL)
@@ -3244,6 +3256,7 @@ class AgentActivity(RecognitionHooks):
                 transcription_delay=info.metrics.transcription_delay or 0.0,
                 on_user_turn_completed_delay=on_user_turn_completed_delay,
                 speech_id=speech_handle.id,
+                user_message_id=metrics_report.get("user_message_id") if user_message else None,
                 metadata=metadata,
             )
             self._session.emit("metrics_collected", MetricsCollectedEvent(metrics=eou_metrics))
@@ -3668,10 +3681,17 @@ class AgentActivity(RecognitionHooks):
                 assistant_metrics["playback_latency"] = started_speaking_at - started_forwarding_at
 
             # the audio answers the user turn, stored message or not
-            if _previous_user_metrics and "stopped_speaking_at" in _previous_user_metrics:
+            if (
+                _previous_user_metrics
+                and "stopped_speaking_at" in _previous_user_metrics
+                and _previous_user_metrics is not self._session._answered_user_metrics
+            ):
                 e2e_latency = started_speaking_at - _previous_user_metrics["stopped_speaking_at"]
                 assistant_metrics["e2e_latency"] = e2e_latency
+                if answered_id := _previous_user_metrics.get("user_message_id"):
+                    assistant_metrics["answered_user_message_id"] = answered_id
                 current_span.set_attribute(trace_types.ATTR_E2E_LATENCY, e2e_latency)
+                self._session._answered_user_metrics = _previous_user_metrics
 
         if forwarded_text and add_to_chat_ctx:
             msg = self._agent._chat_ctx.add_message(
@@ -3712,7 +3732,16 @@ class AgentActivity(RecognitionHooks):
         ]
 
     def _take_on_enter_user_metrics(self) -> llm.MetricsReport | None:
-        """Claim the unanswered user turn for a speech created inside on_enter."""
+        """Claim the user turn for a speech created inside on_enter or a running reply."""
+        parent = _SpeechHandleContextVar.get(None)
+        reply_metrics = _ReplyUserMetricsContextVar.get()
+        if (
+            reply_metrics is not None
+            and parent is not None
+            and not parent.done()
+            and _AgentActivityContextVar.get(None) is self
+        ):
+            return reply_metrics
         on_enter_data = _OnEnterContextVar.get(None)
         if (
             on_enter_data is None
@@ -3810,6 +3839,9 @@ class AgentActivity(RecognitionHooks):
 
         self._agent._reply_chat_ctx = None
         self._agent._reply_messages = []
+        _ReplyUserMetricsContextVar.set(
+            new_message.metrics if new_message is not None else _previous_user_metrics
+        )
 
         if new_message is not None:
             chat_ctx.insert(new_message)
@@ -4021,6 +4053,7 @@ class AgentActivity(RecognitionHooks):
             self._session._conversation_item_added(new_message)
             user_metrics = new_message.metrics
             self._session._unanswered_user_metrics = user_metrics
+            _ReplyUserMetricsContextVar.set(user_metrics)
 
         if speech_handle.interrupted:
             current_span.set_attribute(trace_types.ATTR_SPEECH_INTERRUPTED, True)
@@ -4258,10 +4291,17 @@ class AgentActivity(RecognitionHooks):
             if started_forwarding_at is not None:
                 assistant_metrics["playback_latency"] = started_speaking_at - started_forwarding_at
 
-            if user_metrics and "stopped_speaking_at" in user_metrics:
+            if (
+                user_metrics
+                and "stopped_speaking_at" in user_metrics
+                and user_metrics is not self._session._answered_user_metrics
+            ):
                 e2e_latency = started_speaking_at - user_metrics["stopped_speaking_at"]
                 assistant_metrics["e2e_latency"] = e2e_latency
+                if answered_id := user_metrics.get("user_message_id"):
+                    assistant_metrics["answered_user_message_id"] = answered_id
                 current_span.set_attribute(trace_types.ATTR_E2E_LATENCY, e2e_latency)
+                self._session._answered_user_metrics = user_metrics
 
             if self._session._unanswered_user_metrics is user_metrics:
                 self._session._unanswered_user_metrics = None
@@ -4347,6 +4387,8 @@ class AgentActivity(RecognitionHooks):
                     FunctionToolsExecutedEvent(
                         function_calls=interrupted_calls,
                         function_call_outputs=interrupted_fnc_outputs,
+                        function_call_exec_windows=_exec_windows(tool_output.output),
+                        speech_id=speech_handle.id,
                     ),
                 )
                 self._agent._chat_ctx.insert(interrupted_tool_messages)
@@ -4366,7 +4408,7 @@ class AgentActivity(RecognitionHooks):
 
         # the reply chain goes on through a tool reply, a handoff, or an inline task handing
         # back to the tool that awaited it; otherwise it ends here and nothing answers the turn
-        chain_continues = False
+        chain_continues = self._session._agent is not self._agent
         if len(tool_output.output) > 0:
             max_steps_reached = speech_handle.num_steps >= self._session.options.max_tool_steps + 1
 
@@ -4403,6 +4445,8 @@ class AgentActivity(RecognitionHooks):
             if new_agent_task and not ignore_task_switch:
                 fnc_executed_ev._handoff_required = True
 
+            fnc_executed_ev.function_call_exec_windows = _exec_windows(tool_output.output)
+            fnc_executed_ev.speech_id = speech_handle.id
             self._session.emit("function_tools_executed", fnc_executed_ev)
 
             draining = self.scheduling_paused
@@ -5071,6 +5115,8 @@ class AgentActivity(RecognitionHooks):
                     FunctionToolsExecutedEvent(
                         function_calls=interrupted_calls,
                         function_call_outputs=interrupted_fnc_outputs,
+                        function_call_exec_windows=_exec_windows(tool_output.output),
+                        speech_id=speech_handle.id,
                     ),
                 )
                 self._agent._chat_ctx.insert(interrupted_fnc_outputs)
@@ -5135,6 +5181,8 @@ class AgentActivity(RecognitionHooks):
             if new_agent_task and not ignore_task_switch:
                 fnc_executed_ev._handoff_required = True
 
+            fnc_executed_ev.function_call_exec_windows = _exec_windows(tool_output.output)
+            fnc_executed_ev.speech_id = speech_handle.id
             self._session.emit("function_tools_executed", fnc_executed_ev)
 
             draining = self.scheduling_paused

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import weakref
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -350,12 +351,16 @@ class _ToolExecutor:
                 fnc_args, fnc_kwargs = prepare_function_arguments(
                     fnc=tool, json_arguments=raw_arguments, call_ctx=run_ctx
                 )
-                if mock is not None:
-                    from .run_result import _run_mock
+                run_ctx._exec_started_at = time.perf_counter()
+                try:
+                    if mock is not None:
+                        from .run_result import _run_mock
 
-                    output = await _run_mock(mock, *fnc_args, **fnc_kwargs)
-                else:
-                    output = await tool(*fnc_args, **fnc_kwargs)
+                        output = await _run_mock(mock, *fnc_args, **fnc_kwargs)
+                    else:
+                        output = await tool(*fnc_args, **fnc_kwargs)
+                finally:
+                    run_ctx._exec_ended_at = time.perf_counter()
             except asyncio.CancelledError:
                 logger.debug("tool cancelled", extra={"call_id": call_id, "function": fnc_name})
                 if not first_update_fut.done():
@@ -456,10 +461,19 @@ class _ToolExecutor:
                 status, message = "done", str(output)
 
             entry_id = call_id + "_final" if run_ctx._updates else call_id
+            exec_window = (
+                (run_ctx._exec_started_at, run_ctx._exec_ended_at or time.perf_counter())
+                if run_ctx._exec_started_at is not None
+                else None
+            )
             session._tool_execution_updated(
                 ToolExecutionUpdatedEvent(
                     update=ToolCallEnded(
-                        id=entry_id, call_id=call_id, message=message, status=status
+                        id=entry_id,
+                        call_id=call_id,
+                        message=message,
+                        status=status,
+                        exec_window=exec_window,
                     )
                 ),
             )
