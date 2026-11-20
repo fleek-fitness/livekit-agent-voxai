@@ -2917,7 +2917,10 @@ class AgentActivity(RecognitionHooks):
         )
         user_message.extra[DELAYED_INTERRUPTION_CONSUMED_EXTRA_KEY] = True
         self._agent._chat_ctx.insert(user_message)
-        self._session._conversation_item_added(user_message)
+        # spoken over the agent's speech: recorded right behind that speech's own message
+        self._session._conversation_item_added_after_speech(
+            user_message, self._session.current_speech
+        )
         logger.info(
             "consuming ignored interruption transcript",
             extra={"user_input": transcript, "reason": "transcript_gate_trimmed"},
