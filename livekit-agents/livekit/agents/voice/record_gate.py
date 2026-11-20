@@ -53,9 +53,10 @@ class _Marker:
 class _Hold(_Marker):
     """A position in the queue held for a customer row that belongs ahead of the entry behind it."""
 
-    def __init__(self, first_audio_at: float) -> None:
+    def __init__(self, first_audio_at: float, on_timeout: Callable[[], None] | None = None) -> None:
         self.turn = None  # type: ignore[assignment]
         self.first_audio_at = first_audio_at
+        self.on_timeout = on_timeout
         self.timer: asyncio.TimerHandle | None = None
 
 
@@ -75,23 +76,39 @@ class RecordGate:
     def hold_first_audio_at(self) -> float | None:
         return self._hold.first_audio_at if self._hold is not None else None
 
-    def hold(self, name: str, arg: Any, first_audio_at: float, seconds: float) -> None:
+    def hold(
+        self,
+        name: str,
+        arg: Any,
+        first_audio_at: float,
+        seconds: float,
+        on_timeout: Callable[[], None] | None = None,
+    ) -> None:
         """Queue an agent message behind a hold: a customer row may still come ahead of it.
 
         The customer row goes in front with ``push(..., before_hold=True)``; when none comes the hold
         is released after ``seconds`` and the message goes out as it is. Only the emission of
         the recording event waits.
         """
-        hold = _Hold(first_audio_at)
+        hold = _Hold(first_audio_at, on_timeout)
         self._queue.append(hold)
         self._queue.append((name, arg))
         if self._hold is None:
             self._hold = hold
         try:
-            hold.timer = asyncio.get_running_loop().call_later(seconds, self.release_hold, hold)
+            hold.timer = asyncio.get_running_loop().call_later(seconds, self._hold_timed_out, hold)
         except RuntimeError:
             hold.timer = None
         self._flush()
+
+    def _hold_timed_out(self, hold: _Hold) -> None:
+        hold.timer = None
+        if hold.on_timeout is not None and hold in self._queue:
+            try:
+                hold.on_timeout()
+            except Exception:
+                logger.exception("error while expiring a record hold")
+        self.release_hold(hold)
 
     def release_hold(self, hold: _Hold | None = None) -> None:
         hold = hold or self._hold

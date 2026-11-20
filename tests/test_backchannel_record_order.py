@@ -564,3 +564,44 @@ async def test_a_late_final_of_the_same_turn_follows_its_row_ahead_of_the_held_r
     await asyncio.sleep(1.1)
     session._record_gate.release_all()
     assert seen == [("user", "네"), ("user", "그리고"), ("assistant", "안내")]  # once each
+
+
+def _two_segments() -> tuple[AgentSession, list[tuple[str, str]]]:
+    session = AgentSession()
+    seen = _recorder(session)
+    _speaking(session, first_audio=10.0)
+    session._note_user_word_ended(9.0, 9.2)  # A
+    session._note_user_word_ended(9.4, 9.6)  # B
+    session._conversation_item_added(_msg("assistant", "안내"))
+    return session, seen
+
+
+async def test_the_exactly_matching_segment_is_the_one_consumed() -> None:
+    session, seen = _two_segments()
+    session._conversation_item_added(_user("B", (9.4, 9.6)))
+    assert seen == [("user", "B")]  # B went ahead; the agent row still waits for A
+    assert session._pending_user_words == [(9.0, 9.2)]
+    session._conversation_item_added(_user("A", (9.0, 9.2)))
+    assert seen == [("user", "B"), ("user", "A"), ("assistant", "안내")]
+
+
+async def test_an_ambiguous_row_consumes_no_segment() -> None:
+    session, seen = _two_segments()
+    session._conversation_item_added(_user("?", (9.15, 9.45)))  # loosely overlaps both
+    assert session._pending_user_words == [(9.0, 9.2), (9.4, 9.6)]
+    assert seen == []
+
+
+async def test_an_empty_segment_removes_only_its_own_segment() -> None:
+    session, seen = _two_segments()
+    session._clear_pending_user_word(9.4)  # B had no text
+    assert session._pending_user_words == [(9.0, 9.2)]
+    assert seen == []  # A is still awaited
+
+
+async def test_an_expired_hold_does_not_hold_the_next_row() -> None:
+    session, seen = _two_segments()
+    await asyncio.sleep(1.1)
+    assert seen == [("assistant", "안내")]
+    session._conversation_item_added(_msg("assistant", "다음"))
+    assert seen == [("assistant", "안내"), ("assistant", "다음")]  # not held again
