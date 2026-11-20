@@ -84,7 +84,6 @@ from .keyterm_detection import (
 from .record_gate import (
     GATED_EVENTS,
     SPEECH_ROW_HOLD_MAX_SECONDS,
-    SPEECH_ROW_HOLD_WINDOW_SECONDS,
     RecordGate,
 )
 from .recorder_io import RecorderIO
@@ -753,8 +752,10 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
         # backchannel messages spoken over an agent speech, recorded right behind that speech's
         # own message (it is recorded when the speech ends or is interrupted)
         self._deferred_backchannels: list[tuple[SpeechHandle, _ChatMessage]] = []
-        # when the last customer audio ended while no row for it has been recorded yet
-        self._pending_user_word_end: float | None = None
+        # customer speech segments (start, end) that have ended and have no recorded row yet
+        self._pending_user_words: list[tuple[float, float]] = []
+        # the segments the held agent row waits for
+        self._hold_targets: list[tuple[float, float]] = []
         self._started_at: float | None = None
         self._usage_collector = ModelUsageCollector()
         self._redaction_enabled = False
@@ -793,45 +794,77 @@ class AgentSession(rtc.EventEmitter[EventTypes], Generic[Userdata_T]):
 
         The agent's row is recorded when its speech ends; a word the customer finished just
         before the agent started can be confirmed after that, which would put it behind the
-        agent's row. While such a word is unconfirmed the agent's row waits for it, at most
-        ``SPEECH_ROW_HOLD_MAX_SECONDS``; only the recording event waits.
+        agent's row. While such a segment is unconfirmed the agent's row waits for it, at most
+        ``SPEECH_ROW_HOLD_MAX_SECONDS`` after the row is due; only the recording event waits.
+        A customer row is matched to a waiting segment by its own span; a row whose span is
+        unknown or does not cover the segment neither goes ahead nor lets the hold go.
         """
         item = getattr(arg, "item", None)
         role = getattr(item, "role", None)
         if role == "user":
-            self._pending_user_word_end = None
-            if gate.hold_active:
-                first_audio = gate.hold_first_audio_at
-                stopped = (getattr(item, "metrics", None) or {}).get("stopped_speaking_at")
-                if first_audio is None or stopped is None or stopped < first_audio:
-                    gate.push_before_hold(event, arg)
-                    return True
-            return False
-        if role != "assistant":
+            span = self._row_span(item)
+            if span is None:
+                return False
+            matched = self._take_pending_word(span)
+            if not gate.hold_active:
+                return False
+            first_audio = gate.hold_first_audio_at
+            if matched is None or first_audio is None or not span[1] < first_audio:
+                return False
+            if matched in self._hold_targets:
+                self._hold_targets.remove(matched)
+            gate.push(event, arg, before_hold=True)
+            if not self._hold_targets:
+                gate.release_hold()
+            return True
+        if role != "assistant" or gate.hold_active:
             return False
         speech = self.current_speech
-        pending_end = getattr(self, "_pending_user_word_end", None)
-        if (
-            speech is None
-            or speech.done()
-            or pending_end is None
-            or speech._first_audio_at is None
-            or pending_end > speech._first_audio_at
-            or speech._first_audio_at - pending_end > SPEECH_ROW_HOLD_WINDOW_SECONDS
-        ):
+        first_audio = speech._first_audio_at if speech is not None else None
+        if speech is None or speech.done() or first_audio is None:
             return False
-        # one hold per word
-        self._pending_user_word_end = None
-        gate.hold(event, arg, speech._first_audio_at, SPEECH_ROW_HOLD_MAX_SECONDS)
+        targets = [w for w in self._pending_user_words if w[1] < first_audio]
+        if not targets:
+            return False
+        self._hold_targets = targets
+        gate.hold(event, arg, first_audio, SPEECH_ROW_HOLD_MAX_SECONDS)
         return True
 
-    def _note_user_word_ended(self, ended_at: float) -> None:
-        self._pending_user_word_end = ended_at
+    _WORD_MATCH_TOLERANCE_SECONDS = 0.5
 
-    def _clear_pending_user_word(self) -> None:
-        self._pending_user_word_end = None
+    @staticmethod
+    def _row_span(item: Any) -> tuple[float, float] | None:
+        metrics = getattr(item, "metrics", None) or {}
+        end = metrics.get("stopped_speaking_at")
+        if end is None:
+            return None
+        return (metrics.get("started_speaking_at", end), end)
+
+    def _take_pending_word(self, span: tuple[float, float]) -> tuple[float, float] | None:
+        """Remove and return the pending segment the row with ``span`` is the text of."""
+        tol = self._WORD_MATCH_TOLERANCE_SECONDS
+        for word in self._pending_user_words:
+            if span[0] <= word[1] + tol and span[1] >= word[0] - tol:
+                self._pending_user_words.remove(word)
+                return word
+        return None
+
+    def _note_user_word_ended(self, started_at: float, ended_at: float) -> None:
+        self._pending_user_words.append((started_at, ended_at))
+        del self._pending_user_words[:-8]
+
+    def _clear_pending_user_word(self, started_at: float | None = None) -> None:
+        """A segment turned out to have no text: forget it and stop waiting for it."""
+        tol = self._WORD_MATCH_TOLERANCE_SECONDS
+        gone = [
+            w
+            for w in self._pending_user_words
+            if started_at is None or abs(w[0] - started_at) <= tol
+        ]
+        self._pending_user_words = [w for w in self._pending_user_words if w not in gone]
+        self._hold_targets = [w for w in self._hold_targets if w not in gone]
         gate = getattr(self, "_record_gate", None)
-        if gate is not None and gate.hold_active:
+        if gate is not None and gate.hold_active and not self._hold_targets:
             gate.release_hold()
 
     def _emit_now(self, event: str, arg: AgentEvent) -> None:

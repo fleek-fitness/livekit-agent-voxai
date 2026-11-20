@@ -435,79 +435,132 @@ def _speaking(session: AgentSession, first_audio: float) -> SpeechHandle:
     return speech
 
 
-def _user(text: str, stopped: float | None) -> llm.ChatMessage:
+def _user(text: str, span: tuple[float, float] | None) -> llm.ChatMessage:
     msg = _msg("user", text)
-    msg.metrics = {} if stopped is None else {"stopped_speaking_at": stopped}  # type: ignore[typeddict-item]
+    msg.metrics = (  # type: ignore[typeddict-item]
+        {} if span is None else {"started_speaking_at": span[0], "stopped_speaking_at": span[1]}
+    )
     return msg
 
 
-async def test_agent_row_waits_for_a_word_that_ended_before_its_first_audio() -> None:
+def _held(first_audio: float = 10.0, word: tuple[float, float] = (9.4, 9.7)):
     session = AgentSession()
     seen = _recorder(session)
-    _speaking(session, first_audio=10.0)
-    session._note_user_word_ended(9.7)
-
+    _speaking(session, first_audio=first_audio)
+    session._note_user_word_ended(*word)
     session._conversation_item_added(_msg("assistant", "안내"))
+    return session, seen
+
+
+async def test_agent_row_waits_for_a_word_that_ended_before_its_first_audio() -> None:
+    session, seen = _held()
     assert seen == []  # held, not recorded
-    session._conversation_item_added(_user("네", 9.7))
+    session._conversation_item_added(_user("네", (9.4, 9.7)))
 
     assert seen == [("user", "네"), ("assistant", "안내")]
     assert not session._record_gate.hold_active
 
 
 async def test_agent_row_goes_out_after_the_hold_when_no_word_is_confirmed() -> None:
-    session = AgentSession()
-    seen = _recorder(session)
-    _speaking(session, first_audio=10.0)
-    session._note_user_word_ended(9.7)
-
-    session._conversation_item_added(_msg("assistant", "안내"))
+    session, seen = _held()
     await asyncio.sleep(1.1)
     assert seen == [("assistant", "안내")]  # once, after at most 1 s
-    session._conversation_item_added(_user("네", 9.7))
+    session._conversation_item_added(_user("네", (9.4, 9.7)))
     assert seen == [("assistant", "안내"), ("user", "네")]
 
 
-async def test_an_empty_segment_releases_the_hold() -> None:
+async def test_the_hold_is_for_the_segment_not_for_any_row() -> None:
+    session, seen = _held()
+    session._conversation_item_added(_user("다른 말", None))  # span unknown
+    session._conversation_item_added(_user("먼 말", (3.0, 3.5)))  # another, earlier segment
+    assert seen == []  # still waiting for the segment
+    session._conversation_item_added(_user("네", (9.4, 9.7)))
+    assert seen == [
+        ("user", "네"),
+        ("assistant", "안내"),
+        ("user", "다른 말"),
+        ("user", "먼 말"),
+    ]
+
+
+async def test_a_newer_segment_does_not_replace_the_waiting_one() -> None:
     session = AgentSession()
     seen = _recorder(session)
     _speaking(session, first_audio=10.0)
-    session._note_user_word_ended(9.7)
+    session._note_user_word_ended(9.4, 9.7)
+    session._note_user_word_ended(11.0, 11.2)  # after the agent started
     session._conversation_item_added(_msg("assistant", "안내"))
+    session._conversation_item_added(_user("네", (9.4, 9.7)))
+    assert seen == [("user", "네"), ("assistant", "안내")]
 
-    session._clear_pending_user_word()
+
+async def test_an_empty_segment_of_another_start_does_not_release_the_hold() -> None:
+    session, seen = _held()
+    session._clear_pending_user_word(2.0)  # some other segment had no text
+    assert seen == []
+    session._clear_pending_user_word(9.4)  # the waited-for segment had no text
     assert seen == [("assistant", "안내")]
 
 
-async def test_no_hold_without_a_pending_word_or_for_a_word_after_the_first_audio() -> None:
+async def test_a_segment_ending_when_the_agent_starts_is_not_waited_for() -> None:
     session = AgentSession()
     seen = _recorder(session)
     _speaking(session, first_audio=10.0)
-    session._conversation_item_added(_msg("assistant", "하나"))  # nothing pending
-    session._note_user_word_ended(10.5)  # ended after the agent started
-    session._conversation_item_added(_msg("assistant", "둘"))
-    assert seen == [("assistant", "하나"), ("assistant", "둘")]
+    session._note_user_word_ended(9.8, 10.0)  # same instant: said over the agent, not before
+    session._conversation_item_added(_msg("assistant", "안내"))
+    assert seen == [("assistant", "안내")]
+
+
+async def test_a_segment_long_before_the_agent_is_still_waited_for() -> None:
+    session = AgentSession()
+    seen = _recorder(session)
+    _speaking(session, first_audio=20.0)
+    session._note_user_word_ended(9.4, 9.7)  # confirmation is late, the agent started 10 s later
+    session._conversation_item_added(_msg("assistant", "안내"))
+    assert seen == []
+    session._conversation_item_added(_user("네", (9.4, 9.7)))
+    assert seen == [("user", "네"), ("assistant", "안내")]
+
+
+async def test_no_hold_without_a_pending_word() -> None:
+    session = AgentSession()
+    seen = _recorder(session)
+    _speaking(session, first_audio=10.0)
+    session._conversation_item_added(_msg("assistant", "하나"))
+    assert seen == [("assistant", "하나")]
 
 
 async def test_a_word_said_over_the_agent_does_not_jump_ahead_of_the_held_row() -> None:
-    session = AgentSession()
-    seen = _recorder(session)
-    _speaking(session, first_audio=10.0)
-    session._note_user_word_ended(9.7)
-    session._conversation_item_added(_msg("assistant", "안내"))
-
-    session._conversation_item_added(_user("네", 10.4))  # said while the agent talked
+    session, seen = _held()
+    session._conversation_item_added(_user("네", (10.2, 10.4)))  # said while the agent talked
     await asyncio.sleep(1.1)
     assert seen == [("assistant", "안내"), ("user", "네")]
 
 
 async def test_close_records_a_held_row_once() -> None:
-    session = AgentSession()
-    seen = _recorder(session)
-    _speaking(session, first_audio=10.0)
-    session._note_user_word_ended(9.7)
-    session._conversation_item_added(_msg("assistant", "안내"))
-
+    session, seen = _held()
     session._record_gate.release_all()
     await asyncio.sleep(1.1)
     assert seen == [("assistant", "안내")]
+
+
+async def test_a_late_final_of_the_same_turn_follows_its_row_ahead_of_the_held_row() -> None:
+    session = AgentSession()
+    seen = _recorder(session)
+    gate = session._record_gate
+    _speaking(session, first_audio=10.0)
+    session._note_user_word_ended(9.4, 9.7)
+    first = _user("네", (9.4, 9.7))
+    gate.open_turn(1)
+    gate.bind_message(1, first)
+    session._conversation_item_added(_msg("assistant", "안내"))  # held
+    session._conversation_item_added(first)  # the turn's own row, ahead of the held one
+    late = _user("그리고", (9.7, 9.9))
+    session._chat_ctx.insert(late)
+    session._late_final_item_added(late, turn_id=1)
+    gate.release_turn(1)
+
+    assert seen == [("user", "네"), ("user", "그리고"), ("assistant", "안내")]
+    await asyncio.sleep(1.1)
+    session._record_gate.release_all()
+    assert seen == [("user", "네"), ("user", "그리고"), ("assistant", "안내")]  # once each
