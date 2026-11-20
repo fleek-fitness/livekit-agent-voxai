@@ -2498,7 +2498,9 @@ class AgentActivity(RecognitionHooks):
             # just its arrival time, so it must not unlock `_delayed_ack_is_answer` (and it must
             # not erase a VAD end that was already recorded for this segment)
             self._last_user_speech_end_time = speech_end_time
-            self._session._note_user_word_ended(speech_end_time)
+            self._session._note_user_word_ended(
+                speech_end_time - ev.speech_duration, speech_end_time
+            )
 
         if self._audio_recognition:
             self._audio_recognition._on_end_of_speech(
@@ -2895,7 +2897,7 @@ class AgentActivity(RecognitionHooks):
         """An ended VAD segment turned out to have no text: its speech start leaves no mark."""
         if self._last_user_speech_started_at == start:
             self._clear_user_speech_interruption_context()
-        self._session._clear_pending_user_word()
+        self._session._clear_pending_user_word(start)
 
     def on_held_ignore_word_discarded(
         self,

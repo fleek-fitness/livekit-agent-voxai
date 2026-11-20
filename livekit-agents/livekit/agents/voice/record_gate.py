@@ -27,8 +27,6 @@ GATED_EVENTS = ("conversation_item_added", "function_tools_executed")
 
 # longest time an agent message waits for a customer word that ended before the agent started
 SPEECH_ROW_HOLD_MAX_SECONDS = 1.0
-# a word that ended longer than this before the agent's first audio is not waited for
-SPEECH_ROW_HOLD_WINDOW_SECONDS = 3.0
 
 
 @dataclass
@@ -80,7 +78,7 @@ class RecordGate:
     def hold(self, name: str, arg: Any, first_audio_at: float, seconds: float) -> None:
         """Queue an agent message behind a hold: a customer row may still come ahead of it.
 
-        The customer row goes in front with ``push_before_hold``; when none comes the hold
+        The customer row goes in front with ``push(..., before_hold=True)``; when none comes the hold
         is released after ``seconds`` and the message goes out as it is. Only the emission of
         the recording event waits.
         """
@@ -94,16 +92,6 @@ class RecordGate:
         except RuntimeError:
             hold.timer = None
         self._flush()
-
-    def push_before_hold(self, name: str, arg: Any) -> None:
-        """Record a customer row ahead of the held agent message, then release the hold."""
-        hold = self._hold
-        if hold is None or hold not in self._queue:
-            self._queue.append((name, arg))
-            self._flush()
-            return
-        self._queue.insert(self._queue.index(hold), (name, arg))
-        self.release_hold(hold)
 
     def release_hold(self, hold: _Hold | None = None) -> None:
         hold = hold or self._hold
@@ -173,8 +161,12 @@ class RecordGate:
         turn = self._turns.get(turn_id)
         return turn.last_item if turn is not None else None
 
-    def push(self, name: str, arg: Any) -> None:
-        """Emit now, or queue behind an open turn."""
+    def push(self, name: str, arg: Any, *, before_hold: bool = False) -> None:
+        """Emit now, or queue behind an open turn.
+
+        ``before_hold`` puts the entry (and the late finals / turn marker that belong with it)
+        in front of the held agent message instead of at the end of the queue.
+        """
         item = getattr(arg, "item", None)
         owner = next(
             (
@@ -184,17 +176,25 @@ class RecordGate:
             ),
             None,
         )
-        self._queue.append((name, arg))
+        hold = self._hold
+        at = self._queue.index(hold) if before_hold and hold in self._queue else len(self._queue)
+
+        def put(entry: tuple[str, Any] | _Marker) -> None:
+            nonlocal at
+            self._queue.insert(at, entry)
+            at += 1
+
+        put((name, arg))
         if owner is not None:
             owner.message_pushed = True
             owner.last_item = item
             for late in owner.pending_late:
-                self._queue.append(late)
+                put(late)
                 owner.last_item = late[1].item
             owner.pending_late.clear()
             if not owner.released:
                 owner.marker = _Marker(owner)
-                self._queue.append(owner.marker)
+                put(owner.marker)
         self._flush()
 
     def insert_late(self, turn_id: int, name: str, arg: Any) -> None:
