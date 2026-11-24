@@ -224,3 +224,31 @@ async def test_clear_and_flush_during_hold_then_next_answer_is_clean(monkeypatch
     await _settle()
     assert _played(source) == pytest.approx(0.15, abs=0.001)
     await _stop(out, task)
+
+
+async def test_pause_flush_clear_then_immediate_resume_drops_old_frame(monkeypatch) -> None:
+    out, source = _make(monkeypatch)
+    finished = []
+    out.on("playback_finished", finished.append)
+    task = asyncio.create_task(out._forward_audio())
+    await out.capture_frame(_frame())
+    await _settle()  # the frame is being held, then pause arrives during the hold
+    out.pause()
+    await _settle()
+    # flush releases the hold; the forwarder now waits for resume. clear and resume then
+    # arrive back to back, before the playout task has moved the interruption generation.
+    out.flush()
+    await _settle()
+    out.clear_buffer()
+    out.resume()
+    await _settle(0.05)
+    assert source.captured == []  # nothing of the old answer reaches the source
+    assert len(finished) == 1 and finished[0].interrupted
+
+    await out.capture_frame(_frame())
+    await out.capture_frame(_frame())
+    await out.capture_frame(_frame())
+    out.flush()
+    await _settle()
+    assert _played(source) == pytest.approx(0.15, abs=0.001)  # next answer plays whole
+    await _stop(out, task)
