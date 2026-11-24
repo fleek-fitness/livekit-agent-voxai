@@ -2070,20 +2070,21 @@ class AudioRecognition:
 
         overflow: float | None = None
         if owner is not None:
-            # sounds that began after this turn closed and are still waiting for a turn; the turn
-            # record is left open so later records of the same turn keep their reference
-            new_sounds = [b[0] for b in self._completed_vad_bursts or ()]
-            if active is not None:
+            # only sounds that began after this turn ended count as new: a burst that was open
+            # when the turn was committed and closed afterwards still carries its old start.
+            # The turn record stays open so later records of the same turn keep their reference.
+            new_sounds = [b[0] for b in self._completed_vad_bursts or () if b[0] >= owner.end]
+            if active is not None and active >= owner.end:
                 new_sounds.append(active)
             if new_sounds:
-                overflow = round(own_span[1] - min(new_sounds), 3)
+                overflow = own_span[1] - min(new_sounds)
                 if overflow > LATE_FINAL_NEW_SOUND_MARGIN:
                     logger.info(
                         "late final routed as new turn",
                         extra={
                             "turn_id": owner.turn_id,
                             "span": own_span,
-                            "overflow": overflow,
+                            "overflow": round(overflow, 3),
                         },
                     )
                     return False
@@ -2096,7 +2097,7 @@ class AudioRecognition:
             extra={
                 "turn_id": owner.turn_id if owner else None,
                 "span": own_span,
-                "overflow": overflow,
+                "overflow": round(overflow, 3) if overflow is not None else None,
             },
         )
         restore_end: float | None = None
