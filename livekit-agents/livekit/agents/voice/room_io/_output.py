@@ -211,11 +211,13 @@ class _ParticipantAudioOutput(io.AudioOutput):
     def pause(self) -> None:
         super().pause()
         self._playback_enabled.clear()
+        self._prebuffer_wakeup.set()
         # self._audio_source.clear_queue()
 
     def resume(self) -> None:
         super().resume()
         self._playback_enabled.set()
+        self._prebuffer_wakeup.set()
 
     def _report_run(
         self, *, offset: float, ended_at: float, resumes_at: float | None = None
@@ -392,27 +394,33 @@ class _ParticipantAudioOutput(io.AudioOutput):
         return n / self._sample_rate_hz
 
     async def _wait_for_prebuffer(self, held_duration: float) -> None:
-        """Hold playback until `prebuffer_ms` of audio is collected.
+        """Hold playback until `prebuffer_ms` of audio *length* has arrived.
 
-        `held_duration` is the frame already taken off the channel. Ends early on flush
-        (short answers), interruption, a pause, or after a bounded wait so a stalled
-        provider cannot hold the output forever.
+        `held_duration` is the frame already taken off the channel. Returns on flush (short
+        answers), interruption, enough audio, or after a bounded wait so a stalled provider
+        cannot hold the output forever. While paused nothing is played: the wait (and its
+        time limit) resumes after resume(), and the amount held is judged again then.
         """
         deadline = time.monotonic() + self._prebuffer_max_wait_s
-        while (
-            held_duration + self._buffered_duration < self._prebuffer_s
-            and not self._flush_requested
-            and not self._interrupted_event.is_set()
-            and self._playback_enabled.is_set()
-        ):
+        while True:
+            if self._flush_requested or self._interrupted_event.is_set():
+                return
+            if not self._playback_enabled.is_set():
+                # paused: wait for resume/flush/clear, then judge again with a fresh limit
+                self._prebuffer_wakeup.clear()
+                await self._prebuffer_wakeup.wait()
+                deadline = time.monotonic() + self._prebuffer_max_wait_s
+                continue
+            if held_duration + self._buffered_duration >= self._prebuffer_s:
+                return
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                break
+                return
             self._prebuffer_wakeup.clear()
             try:
                 await asyncio.wait_for(self._prebuffer_wakeup.wait(), timeout=remaining)
             except asyncio.TimeoutError:
-                break
+                return
 
     async def _forward_audio(self) -> None:
         async for frame in self._audio_buf:
@@ -420,10 +428,6 @@ class _ParticipantAudioOutput(io.AudioOutput):
             self._forwarding_idle.clear()
             self._buffered_duration = max(self._buffered_duration - frame.duration, 0.0)
             try:
-                if self._prebuffer_s > 0 and self._audio_source.queued_duration <= 0:
-                    # a new answer, or the source ran dry mid-answer: collect before playing
-                    await self._wait_for_prebuffer(frame.duration)
-
                 if not self._playback_enabled.is_set():
                     queued = self._audio_source.queued_duration
                     fade_duration = 0.0
@@ -454,6 +458,21 @@ class _ParticipantAudioOutput(io.AudioOutput):
 
                     # ignore frames if interrupted
                     continue
+
+                if self._prebuffer_s > 0 and self._audio_source.queued_duration <= 0:
+                    # a new answer, or the source ran dry mid-answer: collect before playing
+                    await self._wait_for_prebuffer(frame.duration)
+                    if interruption_generation != self._interruption_generation:
+                        continue
+                    if self._interrupted_event.is_set() or self._pushed_duration == 0:
+                        if self._interrupted_event.is_set() and self._flush_task:
+                            await self._flush_task
+                        continue
+                    if not self._playback_enabled.is_set():
+                        # released by a flush while paused: the queue is empty, so just wait
+                        await self._playback_enabled.wait()
+                        if interruption_generation != self._interruption_generation:
+                            continue
 
                 if not self._first_frame_event.is_set():
                     self._first_frame_event.set()
