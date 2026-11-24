@@ -488,3 +488,51 @@ def test_gate_applies_a_lowering_that_arrived_before_the_message() -> None:
     gate.bind_message(2, other)
     gate.lower_end(2, 9.2)
     assert other.metrics["stopped_speaking_at"] == 9.1  # a value that was not stretched stays
+
+
+def _turn_with_new_sound(
+    ar: AudioRecognition, *, burst: tuple[float, float] | None, active: float | None = None
+) -> AudioRecognition:
+    ar._confirmed_turns = {4: _ConfirmedTurn(4, [(15.6, 17.45), (19.26, 20.90)], 20.90)}
+    ar._completed_vad_bursts = deque([burst] if burst else [])
+    ar._active_vad_speech_started_at = active
+    ar._last_confirmed_end = 20.90
+    return ar
+
+
+async def test_final_running_far_into_a_new_sound_goes_to_the_normal_path() -> None:
+    ar = _turn_with_new_sound(_recognition(aligned=False), burst=(22.1, 23.35))
+    late, normal = await _send(ar, _final("번호", span=(19.42, 22.90)))
+    assert late == []
+    assert normal == 1
+    # the turn record stays open for its later records
+    assert 4 in ar._confirmed_turns
+    ar._hooks.on_turn_released.assert_not_called()
+
+
+async def test_a_small_overflow_stays_a_late_final() -> None:
+    ar = _turn_with_new_sound(_recognition(aligned=False), burst=(22.1, 23.35))
+    late, normal = await _send(ar, _final("번호", span=(19.42, 22.15)))
+    assert [t for t, _ in late] == [4]
+    assert normal == 0
+
+
+async def test_an_overflow_past_the_margin_is_new_speech() -> None:
+    ar = _turn_with_new_sound(_recognition(aligned=False), burst=(22.1, 23.35))
+    late, normal = await _send(ar, _final("번호", span=(19.42, 22.28)))
+    assert late == []
+    assert normal == 1
+
+
+async def test_no_new_sound_keeps_the_late_final() -> None:
+    ar = _turn_with_new_sound(_recognition(aligned=False), burst=None)
+    late, normal = await _send(ar, _final("번호", span=(19.42, 22.90)))
+    assert [t for t, _ in late] == [4]
+    assert normal == 0
+
+
+async def test_an_open_new_sound_counts_like_a_finished_one() -> None:
+    ar = _turn_with_new_sound(_recognition(aligned=False), burst=None, active=22.1)
+    late, normal = await _send(ar, _final("번호", span=(19.42, 22.90)))
+    assert late == []
+    assert normal == 1
