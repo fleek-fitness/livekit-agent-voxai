@@ -146,6 +146,7 @@ class RoomIO:
                     else "roomio_audio"
                 ),
                 fade_out_ms=output_audio_options.fade_out_ms,
+                prebuffer_ms=output_audio_options.prebuffer_ms,
             )
 
         output_text_options = self._options.get_text_output_options()
