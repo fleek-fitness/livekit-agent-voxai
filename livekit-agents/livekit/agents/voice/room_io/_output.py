@@ -471,7 +471,14 @@ class _ParticipantAudioOutput(io.AudioOutput):
                     if not self._playback_enabled.is_set():
                         # released by a flush while paused: the queue is empty, so just wait
                         await self._playback_enabled.wait()
-                        if interruption_generation != self._interruption_generation:
+                        # clear_buffer() sets the interrupt flag at once; the generation only
+                        # moves later, in the playout task, so check both
+                        if (
+                            interruption_generation != self._interruption_generation
+                            or self._interrupted_event.is_set()
+                        ):
+                            if self._interrupted_event.is_set() and self._flush_task:
+                                await self._flush_task
                             continue
 
                 if not self._first_frame_event.is_set():
