@@ -51,6 +51,7 @@ class _ParticipantAudioOutput(io.AudioOutput):
         track_publish_options: rtc.TrackPublishOptions,
         track_name: str = "roomio_audio",
         fade_out_ms: int = 0,
+        prebuffer_ms: int = 0,
     ) -> None:
         super().__init__(
             label="RoomIO",
@@ -87,6 +88,17 @@ class _ParticipantAudioOutput(io.AudioOutput):
         self._fade_ring_duration = 0.0
         self._fade_in_remaining = 0  # samples left to ramp in after resume
         self._fade_tail_active = False
+
+        # voxai: playout prebuffer. 0 keeps the stock behavior (every frame goes to the
+        # source as soon as it arrives). When >0, the first `prebuffer_ms` of each answer
+        # are collected before playback starts, and again after the source runs dry, so a
+        # provider that streams audio unevenly (e.g. a speech-to-speech model) does not
+        # leave audible gaps. A flush releases whatever is collected; clear_buffer drops it.
+        self._prebuffer_s = max(0, int(prebuffer_ms)) / 1000
+        self._prebuffer_max_wait_s = max(1.0, self._prebuffer_s * 3)
+        self._buffered_duration = 0.0  # audio sitting in _audio_buf, not yet forwarded
+        self._prebuffer_wakeup = asyncio.Event()
+        self._flush_requested = False
 
         self._pushed_duration: float = 0.0
         self._source_pushed_duration: float = 0.0
@@ -144,6 +156,8 @@ class _ParticipantAudioOutput(io.AudioOutput):
         for f in self._audio_bstream.push(frame.data):
             self._audio_buf.send_nowait(f)
             self._pushed_duration += f.duration
+            self._buffered_duration += f.duration
+        self._prebuffer_wakeup.set()
 
     def flush(self) -> None:
         super().flush()
@@ -151,9 +165,14 @@ class _ParticipantAudioOutput(io.AudioOutput):
         for f in self._audio_bstream.flush():
             self._audio_buf.send_nowait(f)
             self._pushed_duration += f.duration
+            self._buffered_duration += f.duration
 
         if not self._pushed_duration:
             return
+
+        # the answer is complete: release whatever the prebuffer is holding
+        self._flush_requested = True
+        self._prebuffer_wakeup.set()
 
         if self._flush_task and not self._flush_task.done():
             # shouldn't happen if only one active speech handle at a time
@@ -174,6 +193,7 @@ class _ParticipantAudioOutput(io.AudioOutput):
             ended_at=time.time(),
         )
         self._interrupted_event.set()
+        self._prebuffer_wakeup.set()  # a held prebuffer is dropped, not played
 
     def playback_state(self) -> PlaybackState:
         """Public read of the playhead for consumers that pace work against playback.
@@ -249,6 +269,7 @@ class _ParticipantAudioOutput(io.AudioOutput):
             queued_duration = self._audio_source.queued_duration
             while not self._audio_buf.empty():
                 self._audio_buf.recv_nowait()
+            self._buffered_duration = 0.0
 
             pushed_duration = max(pushed_duration - queued_duration, 0)
             fade_duration = 0.0
@@ -270,6 +291,7 @@ class _ParticipantAudioOutput(io.AudioOutput):
 
         self._run_offset = 0.0
 
+        self._flush_requested = False
         self._pushed_duration = 0
         self._source_pushed_duration = 0
         self._source_discarded_duration = 0
@@ -369,11 +391,39 @@ class _ParticipantAudioOutput(io.AudioOutput):
             self._fade_tail_active = False
         return n / self._sample_rate_hz
 
+    async def _wait_for_prebuffer(self, held_duration: float) -> None:
+        """Hold playback until `prebuffer_ms` of audio is collected.
+
+        `held_duration` is the frame already taken off the channel. Ends early on flush
+        (short answers), interruption, a pause, or after a bounded wait so a stalled
+        provider cannot hold the output forever.
+        """
+        deadline = time.monotonic() + self._prebuffer_max_wait_s
+        while (
+            held_duration + self._buffered_duration < self._prebuffer_s
+            and not self._flush_requested
+            and not self._interrupted_event.is_set()
+            and self._playback_enabled.is_set()
+        ):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            self._prebuffer_wakeup.clear()
+            try:
+                await asyncio.wait_for(self._prebuffer_wakeup.wait(), timeout=remaining)
+            except asyncio.TimeoutError:
+                break
+
     async def _forward_audio(self) -> None:
         async for frame in self._audio_buf:
             interruption_generation = self._interruption_generation
             self._forwarding_idle.clear()
+            self._buffered_duration = max(self._buffered_duration - frame.duration, 0.0)
             try:
+                if self._prebuffer_s > 0 and self._audio_source.queued_duration <= 0:
+                    # a new answer, or the source ran dry mid-answer: collect before playing
+                    await self._wait_for_prebuffer(frame.duration)
+
                 if not self._playback_enabled.is_set():
                     queued = self._audio_source.queued_duration
                     fade_duration = 0.0
