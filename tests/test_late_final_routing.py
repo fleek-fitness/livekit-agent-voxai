@@ -582,3 +582,11 @@ async def test_real_path_gives_the_new_sound_one_pending_transcript_and_later_ta
     assert [c.kwargs["turn_id"] for c in ar._hooks.on_late_final.call_args_list] == [4]
     assert ar._audio_transcript.strip() == "번호는"
     ar._run_eou_detection.assert_called_once()
+
+
+async def test_exactly_the_margin_survives_float_subtraction_error() -> None:
+    # 22.35 - 22.2 is 0.15000000000000213 in floats
+    ar = _turn_with_new_sound(_recognition(aligned=False), burst=(22.2, 23.35))
+    late, normal = await _send(ar, _final("번호", span=(19.42, 22.35)))
+    assert [t for t, _ in late] == [4]
+    assert normal == 0

@@ -319,6 +319,8 @@ _MAX_CONFIRMED_TURNS = 16
 _MAX_SPAN_END_EXTENSION = 1.0
 # a late final that runs this far (seconds) into a sound that began after its turn closed is new speech
 LATE_FINAL_NEW_SOUND_MARGIN = 0.15
+# float slack so a span ending exactly one margin past the sound start is not pushed over by rounding
+_LATE_FINAL_MARGIN_EPSILON = 1e-6
 
 
 def _extend_span_end(
@@ -2078,7 +2080,7 @@ class AudioRecognition:
                 new_sounds.append(active)
             if new_sounds:
                 overflow = own_span[1] - min(new_sounds)
-                if overflow > LATE_FINAL_NEW_SOUND_MARGIN:
+                if overflow > LATE_FINAL_NEW_SOUND_MARGIN + _LATE_FINAL_MARGIN_EPSILON:
                     logger.info(
                         "late final routed as new turn",
                         extra={
