@@ -133,6 +133,19 @@ async def test_short_answer_flush_is_prompt_and_complete(monkeypatch) -> None:
 
 
 async def test_mid_answer_exhaustion_collects_again_without_loss(monkeypatch) -> None:
+    import logging
+
+    from livekit.agents.log import logger as lk_logger
+
+    records: list[str] = []
+
+    class _H(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    handler = _H(level=logging.INFO)
+    lk_logger.addHandler(handler)
+    lk_logger.setLevel(logging.INFO)
     out, source = _make(monkeypatch)
     task = asyncio.create_task(out._forward_audio())
     for _ in range(4):
@@ -152,6 +165,10 @@ async def test_mid_answer_exhaustion_collects_again_without_loss(monkeypatch) ->
     out.flush()
     await _settle()
     assert _played(source) == pytest.approx(0.35, abs=0.001)  # 200ms + 150ms, none lost
+    lk_logger.removeHandler(handler)
+    waits = [m for m in records if "playout_prebuffer_wait" in m]
+    assert len(waits) == 2  # the first collect and the mid-answer refill
+    assert "since_dry_ms=-1" in waits[0] and "since_dry_ms=-1" not in waits[1]
     await _stop(out, task)
 
 

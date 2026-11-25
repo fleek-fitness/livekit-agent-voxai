@@ -461,7 +461,14 @@ class _ParticipantAudioOutput(io.AudioOutput):
 
                 if self._prebuffer_s > 0 and self._audio_source.queued_duration <= 0:
                     # a new answer, or the source ran dry mid-answer: collect before playing
+                    _wait_started = time.monotonic()
                     await self._wait_for_prebuffer(frame.duration)
+                    # one line per collect; a mid-answer refill shows a small since_dry_ms
+                    logger.info(
+                        "playout_prebuffer_wait waited_ms=%d since_dry_ms=%d",
+                        int((time.monotonic() - _wait_started) * 1000),
+                        int(max(time.time() - self._dry_at, 0.0) * 1000) if self._dry_at else -1,
+                    )
                     if interruption_generation != self._interruption_generation:
                         continue
                     if self._interrupted_event.is_set() or self._pushed_duration == 0:
