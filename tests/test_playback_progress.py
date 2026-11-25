@@ -35,7 +35,9 @@ class _FakeSource:
         self.queued_duration = 0.0
 
     async def wait_for_playout(self) -> None:
-        self.queued_duration = 0.0
+        # The test drives the clock; a real source takes as long as its queued audio.
+        while self.queued_duration:
+            await asyncio.sleep(0)
 
 
 def _frame(seconds: float) -> rtc.AudioFrame:
@@ -92,6 +94,8 @@ async def test_uninterrupted_playback_is_reported_once() -> None:
         assert h.progress == []  # nothing to report while playback is continuous
 
         h.sink.flush()
+        await h.settle()
+        h.source.queued_duration = 0.0  # the backlog plays out
         for _ in range(50):
             await asyncio.sleep(0)
 
@@ -123,8 +127,8 @@ async def test_a_drained_source_ends_its_run_when_it_ran_dry() -> None:
 async def test_a_flush_after_the_source_drained_ends_the_run_when_it_ran_dry() -> None:
     """A segment whose flush trails its own playout still sits where it played."""
     async with _Harness() as h:
-        # 60ms is the progressive ramp, 20ms then 40ms, so the byte stream holds nothing back
-        await h.push(0.06)
+        # 100ms is two full 50ms frames, so the byte stream holds nothing back.
+        await h.push(0.1)
         played, dry_at = h.sink._source_pushed_duration, h.sink._dry_at
         assert dry_at is not None
 
@@ -139,6 +143,31 @@ async def test_a_flush_after_the_source_drained_ends_the_run_when_it_ran_dry() -
     assert ev.offset == 0.0
     assert ev.duration == pytest.approx(played)
     assert ev.started_at == pytest.approx(dry_at - played)
+
+
+async def test_a_stalled_capture_still_ends_the_run_when_it_ran_dry() -> None:
+    """The loop may resume from capture_frame after the submitted frame has played out."""
+    async with _Harness() as h:
+        capture = h.source.capture_frame
+
+        async def stalled(frame: rtc.AudioFrame) -> None:
+            await capture(frame)
+            h.now += 0.3
+            h.source.queued_duration = 0.0
+
+        submitted_at = h.now
+        h.source.capture_frame = stalled  # type: ignore[method-assign]
+        await h.push(0.05)
+        h.source.capture_frame = capture  # type: ignore[method-assign]
+        played = h.sink._source_pushed_duration
+
+        h.now += 0.5
+        await h.push(0.1)
+
+    assert len(h.progress) == 1
+    ev = h.progress[0]
+    assert ev.duration == pytest.approx(played)
+    assert ev.started_at == pytest.approx(submitted_at)
 
 
 async def test_a_cleared_buffer_reports_the_playhead_without_waiting() -> None:
@@ -197,6 +226,8 @@ async def test_a_pause_and_resume_report_two_runs_around_the_hole() -> None:
 
         h.now += 1.0  # the resumed audio plays out
         h.sink.flush()
+        await h.settle()
+        h.source.queued_duration = 0.0
         for _ in range(50):
             await asyncio.sleep(0)
 
@@ -268,12 +299,100 @@ async def test_the_playout_wait_reports_what_plays_after_a_clear() -> None:
     ]
 
 
+async def test_the_tail_follows_before_the_source_runs_dry() -> None:
+    async with _Harness() as h:
+        loop = asyncio.get_running_loop()
+        await h.push(0.08)  # 50ms out; 30ms tail waits
+        assert h.source.queued_duration == pytest.approx(0.05)
+        assert h.sink._bstream_flush_timer is not None
+        assert h.sink._bstream_flush_timer.when() - loop.time() == pytest.approx(0.03, abs=0.01)
+        await asyncio.sleep(0.04)
+        await h.settle()
+        assert h.source.queued_duration == pytest.approx(0.08)
+
+
+async def test_the_tail_waits_to_fill_a_frame_while_enough_is_queued() -> None:
+    async with _Harness() as h:
+        loop = asyncio.get_running_loop()
+        h.source.queued_duration = 0.5
+        await h.push(0.08)
+        assert h.source.queued_duration == pytest.approx(0.55)
+        assert h.sink._bstream_flush_timer is not None
+        assert h.sink._bstream_flush_timer.when() - loop.time() == pytest.approx(0.53, abs=0.01)
+
+        await h.push(0.08)
+        assert h.source.queued_duration == pytest.approx(0.65)
+        assert h.sink._bstream_flush_timer is not None
+        assert h.sink._bstream_flush_timer.when() - loop.time() == pytest.approx(0.63, abs=0.01)
+
+        h.sink._flush_bstream()
+        await h.settle()
+        assert h.source.queued_duration == pytest.approx(0.66)
+        assert h.sink._bstream_flush_timer is None
+
+
+async def test_a_small_first_frame_waits_for_more() -> None:
+    async with _Harness() as h:
+        await h.push(0.01)
+        for _ in range(3):
+            await asyncio.sleep(0)
+        assert h.sink._bstream_flush_timer is None
+        assert h.source.queued_duration == 0.0
+        await h.push(0.04)
+        assert h.source.queued_duration == pytest.approx(0.05)
+
+
+async def test_a_segment_flush_releases_a_small_first_frame() -> None:
+    async with _Harness() as h:
+        await h.push(0.01)
+        h.sink.flush()
+        await h.settle()
+        assert h.source.queued_duration == pytest.approx(0.01)
+        h.source.queued_duration = 0.0
+        for _ in range(50):
+            await asyncio.sleep(0)
+
+
+async def test_a_clear_disarms_the_bstream_flush_timer() -> None:
+    async with _Harness() as h:
+        h.source.queued_duration = 0.5
+        await h.push(0.08)
+        h.sink.clear_buffer()
+        assert h.sink._bstream_flush_timer is None
+        assert h.sink._audio_bstream.flush() == []
+
+
+async def test_no_tail_timer_runs_while_paused_and_resume_arms_one() -> None:
+    async with _Harness() as h:
+        loop = asyncio.get_running_loop()
+        await h.push(0.08)
+        assert h.sink._bstream_flush_timer is not None
+        h.sink.pause()
+        assert h.sink._bstream_flush_timer is None
+
+        await h.sink.capture_frame(_frame(0.08))
+        assert h.sink._bstream_flush_timer is None
+        await h.settle()
+        assert h.source.queued_duration == 0.0
+
+        h.sink.resume()
+        assert h.sink._bstream_flush_timer is not None
+        assert h.sink._bstream_flush_timer.when() - loop.time() == pytest.approx(0.08, abs=0.01)
+        await h.settle()
+        assert h.source.queued_duration == pytest.approx(0.1)
+        h.sink._flush_bstream()
+        await h.settle()
+        assert h.source.queued_duration == pytest.approx(0.11)
+
+
 async def test_offsets_restart_with_each_segment() -> None:
     async with _Harness() as h:
         for _ in range(2):
             h.source.queued_duration = 0.5
             await h.push(0.2)
             h.sink.flush()
+            await h.settle()
+            h.source.queued_duration = 0.0
             for _ in range(50):
                 await asyncio.sleep(0)
             h.now += 1.0

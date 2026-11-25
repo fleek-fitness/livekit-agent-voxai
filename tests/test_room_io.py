@@ -979,7 +979,8 @@ async def test_audio_output_finishes_playout_when_paused_after_forwarding_drains
 
 @pytest.mark.asyncio
 async def test_audio_output_drops_a_paused_frame_from_an_interrupted_segment() -> None:
-    old_frame = rtc.AudioFrame(b"\x01\x00" * 960, 48000, 1, 960)  # 20ms
+    # A partial frame stays in the byte stream while paused, because no timer runs.
+    old_frame = rtc.AudioFrame(b"\x01\x00" * 2400, 48000, 1, 2400)  # 50ms
     new_frame = rtc.AudioFrame(b"\x02\x00" * 1920, 48000, 1, 1920)  # 40ms
 
     with patch("livekit.rtc.AudioSource", _QueuedAudioSource):
@@ -1025,7 +1026,7 @@ async def test_audio_output_drops_a_paused_frame_from_an_interrupted_segment() -
 
 @pytest.mark.asyncio
 async def test_audio_output_waits_for_active_submission_and_source_playout() -> None:
-    # One progressive chunk leaves no buffered remainder after the forwarder dequeues it.
+    # A 20ms chunk is released to the empty source at once.
     frame = rtc.AudioFrame(bytes(960 * 2), 48000, 1, 960)  # 20ms
 
     with patch("livekit.rtc.AudioSource", _BlockingAudioSource):

@@ -1,10 +1,9 @@
 """Playout prebuffer of _ParticipantAudioOutput.
 
-Opt-in: prebuffer_ms=0 forwards every frame immediately. With it on, the first prebuffer_ms
-of audio *length* is collected before playback starts (so the wait is short when audio
-arrives in a burst and as long as the provider's pacing when it trickles in, capped by a
-bounded wait). The source here drains on the real clock like rtc.AudioSource, so "dry
-mid-answer" happens by time passing, not by editing a value.
+The first prebuffer_ms of each answer is collected before playback starts. After the source
+runs dry mid-answer, reprime_ms controls whether the next audio is also collected. The source
+here drains on the real clock like rtc.AudioSource, so "dry mid-answer" happens by time
+passing, not by editing a value.
 """
 
 from __future__ import annotations
@@ -49,7 +48,7 @@ class _ClockAudioSource:
         await asyncio.sleep(self.queued_duration)
 
 
-def _make(monkeypatch, *, prebuffer_ms: int = PRE_MS):
+def _make(monkeypatch, *, prebuffer_ms: int = PRE_MS, reprime_ms: int = 0):
     monkeypatch.setattr(output_module.rtc, "AudioSource", _ClockAudioSource)
     out = _ParticipantAudioOutput(
         room=object(),
@@ -57,6 +56,7 @@ def _make(monkeypatch, *, prebuffer_ms: int = PRE_MS):
         num_channels=1,
         track_publish_options=None,
         prebuffer_ms=prebuffer_ms,
+        reprime_ms=reprime_ms,
     )
     out._subscribed_fut.set_result(None)
     return out, out._audio_source
@@ -146,7 +146,7 @@ async def test_mid_answer_exhaustion_collects_again_without_loss(monkeypatch) ->
     handler = _H(level=logging.INFO)
     lk_logger.addHandler(handler)
     lk_logger.setLevel(logging.INFO)
-    out, source = _make(monkeypatch)
+    out, source = _make(monkeypatch, reprime_ms=PRE_MS)
     task = asyncio.create_task(out._forward_audio())
     for _ in range(4):
         await out.capture_frame(_frame())
@@ -170,6 +170,46 @@ async def test_mid_answer_exhaustion_collects_again_without_loss(monkeypatch) ->
     assert len(waits) == 2  # the first collect and the mid-answer refill
     assert "since_dry_ms=-1" in waits[0] and "since_dry_ms=-1" not in waits[1]
     await _stop(out, task)
+
+
+async def test_mid_answer_dry_plays_first_frame_immediately_by_default(monkeypatch) -> None:
+    import logging
+
+    from livekit.agents.log import logger as lk_logger
+
+    records: list[str] = []
+
+    class _Handler(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    handler = _Handler(level=logging.INFO)
+    previous_level = lk_logger.level
+    lk_logger.addHandler(handler)
+    lk_logger.setLevel(logging.INFO)
+    out, source = _make(monkeypatch)
+    task = asyncio.create_task(out._forward_audio())
+    try:
+        for _ in range(4):
+            await out.capture_frame(_frame())
+        await _settle()
+        first = _played(source)
+        assert first >= PRE_MS / 1000
+
+        await asyncio.sleep(source.queued_duration + 0.05)
+        assert source.queued_duration == 0.0
+        await out.capture_frame(_frame())
+        await _settle()
+        assert _played(source) == pytest.approx(first + 0.05, abs=0.001)
+    finally:
+        await _stop(out, task)
+        lk_logger.removeHandler(handler)
+        lk_logger.setLevel(previous_level)
+
+    waits = [message for message in records if "playout_prebuffer_wait" in message]
+    assert len(waits) == 2
+    assert "since_dry_ms=-1" in waits[0]
+    assert "since_dry_ms=-1" not in waits[1]
 
 
 async def test_stalled_provider_is_released_after_bounded_wait(monkeypatch) -> None:

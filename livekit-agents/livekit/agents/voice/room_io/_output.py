@@ -52,6 +52,7 @@ class _ParticipantAudioOutput(io.AudioOutput):
         track_name: str = "roomio_audio",
         fade_out_ms: int = 0,
         prebuffer_ms: int = 0,
+        reprime_ms: int = 0,
     ) -> None:
         super().__init__(
             label="RoomIO",
@@ -69,8 +70,10 @@ class _ParticipantAudioOutput(io.AudioOutput):
 
         self._audio_buf = utils.aio.Chan[rtc.AudioFrame]()
         self._audio_bstream = utils.audio.AudioByteStream(
-            sample_rate, num_channels, samples_per_channel=sample_rate // 20, progressive=True
+            sample_rate, num_channels, samples_per_channel=sample_rate // 20
         )
+        # Flush a partial frame before the output runs dry.
+        self._bstream_flush_timer: asyncio.TimerHandle | None = None
 
         self._flush_task: asyncio.Task[None] | None = None
         self._interrupted_event = asyncio.Event()
@@ -89,13 +92,12 @@ class _ParticipantAudioOutput(io.AudioOutput):
         self._fade_in_remaining = 0  # samples left to ramp in after resume
         self._fade_tail_active = False
 
-        # voxai: playout prebuffer. 0 keeps the stock behavior (every frame goes to the
-        # source as soon as it arrives). When >0, the first `prebuffer_ms` of each answer
-        # are collected before playback starts, and again after the source runs dry, so a
-        # provider that streams audio unevenly (e.g. a speech-to-speech model) does not
-        # leave audible gaps. A flush releases whatever is collected; clear_buffer drops it.
+        # voxai: collect the start of each answer, then optionally collect again after a dry
+        # queue. A flush releases whatever is collected; clear_buffer drops it.
         self._prebuffer_s = max(0, int(prebuffer_ms)) / 1000
         self._prebuffer_max_wait_s = max(1.0, self._prebuffer_s * 3)
+        self._reprime_s = max(0, int(reprime_ms)) / 1000
+        self._reprime_max_wait_s = max(1.0, self._reprime_s * 3)
         self._buffered_duration = 0.0  # audio sitting in _audio_buf, not yet forwarded
         self._prebuffer_wakeup = asyncio.Event()
         self._flush_requested = False
@@ -137,6 +139,8 @@ class _ParticipantAudioOutput(io.AudioOutput):
         await self._publish_track()
 
     async def aclose(self) -> None:
+        if self._bstream_flush_timer:
+            self._bstream_flush_timer.cancel()
         if self._flush_task:
             await utils.aio.cancel_and_wait(self._flush_task)
         if self._forwarding_task:
@@ -157,15 +161,12 @@ class _ParticipantAudioOutput(io.AudioOutput):
             self._audio_buf.send_nowait(f)
             self._pushed_duration += f.duration
             self._buffered_duration += f.duration
+        self._arm_bstream_flush()
         self._prebuffer_wakeup.set()
 
     def flush(self) -> None:
         super().flush()
-
-        for f in self._audio_bstream.flush():
-            self._audio_buf.send_nowait(f)
-            self._pushed_duration += f.duration
-            self._buffered_duration += f.duration
+        self._flush_bstream(force=True)
 
         if not self._pushed_duration:
             return
@@ -182,6 +183,9 @@ class _ParticipantAudioOutput(io.AudioOutput):
         self._flush_task = asyncio.create_task(self._wait_for_playout())
 
     def clear_buffer(self) -> None:
+        if self._bstream_flush_timer:
+            self._bstream_flush_timer.cancel()
+            self._bstream_flush_timer = None
         self._audio_bstream.clear()
 
         if not self._pushed_duration:
@@ -211,12 +215,43 @@ class _ParticipantAudioOutput(io.AudioOutput):
     def pause(self) -> None:
         super().pause()
         self._playback_enabled.clear()
+        if self._bstream_flush_timer:
+            self._bstream_flush_timer.cancel()
+            self._bstream_flush_timer = None
         self._prebuffer_wakeup.set()
         # self._audio_source.clear_queue()
 
     def resume(self) -> None:
         super().resume()
         self._playback_enabled.set()
+        self._arm_bstream_flush()
+        self._prebuffer_wakeup.set()
+
+    def _arm_bstream_flush(self, *, margin: float = 0.02) -> None:
+        if self._bstream_flush_timer:
+            self._bstream_flush_timer.cancel()
+            self._bstream_flush_timer = None
+        if not self._playback_enabled.is_set():
+            return
+        queued = (
+            self._audio_source.queued_duration
+            + self._pushed_duration
+            - self._source_pushed_duration
+        )
+        self._bstream_flush_timer = asyncio.get_running_loop().call_later(
+            max(queued - margin, 0.0), self._flush_bstream
+        )
+
+    def _flush_bstream(self, *, force: bool = False) -> None:
+        if self._bstream_flush_timer:
+            self._bstream_flush_timer.cancel()
+            self._bstream_flush_timer = None
+        if not force and not self._pushed_duration and self._audio_bstream.buffered_duration < 0.02:
+            return
+        for frame in self._audio_bstream.flush():
+            self._audio_buf.send_nowait(frame)
+            self._pushed_duration += frame.duration
+            self._buffered_duration += frame.duration
         self._prebuffer_wakeup.set()
 
     def _report_run(
@@ -393,15 +428,17 @@ class _ParticipantAudioOutput(io.AudioOutput):
             self._fade_tail_active = False
         return n / self._sample_rate_hz
 
-    async def _wait_for_prebuffer(self, held_duration: float) -> None:
-        """Hold playback until `prebuffer_ms` of audio *length* has arrived.
+    async def _wait_for_prebuffer(
+        self, held_duration: float, *, target_s: float, max_wait_s: float
+    ) -> None:
+        """Hold playback until the requested audio length has arrived.
 
         `held_duration` is the frame already taken off the channel. Returns on flush (short
         answers), interruption, enough audio, or after a bounded wait so a stalled provider
         cannot hold the output forever. While paused nothing is played: the wait (and its
         time limit) resumes after resume(), and the amount held is judged again then.
         """
-        deadline = time.monotonic() + self._prebuffer_max_wait_s
+        deadline = time.monotonic() + max_wait_s
         while True:
             if self._flush_requested or self._interrupted_event.is_set():
                 return
@@ -409,9 +446,9 @@ class _ParticipantAudioOutput(io.AudioOutput):
                 # paused: wait for resume/flush/clear, then judge again with a fresh limit
                 self._prebuffer_wakeup.clear()
                 await self._prebuffer_wakeup.wait()
-                deadline = time.monotonic() + self._prebuffer_max_wait_s
+                deadline = time.monotonic() + max_wait_s
                 continue
-            if held_duration + self._buffered_duration >= self._prebuffer_s:
+            if held_duration + self._buffered_duration >= target_s:
                 return
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -459,16 +496,29 @@ class _ParticipantAudioOutput(io.AudioOutput):
                     # ignore frames if interrupted
                     continue
 
-                if self._prebuffer_s > 0 and self._audio_source.queued_duration <= 0:
-                    # a new answer, or the source ran dry mid-answer: collect before playing
-                    _wait_started = time.monotonic()
-                    await self._wait_for_prebuffer(frame.duration)
-                    # one line per collect; a mid-answer refill shows a small since_dry_ms
-                    logger.info(
-                        "playout_prebuffer_wait waited_ms=%d since_dry_ms=%d",
-                        int((time.monotonic() - _wait_started) * 1000),
-                        int(max(time.time() - self._dry_at, 0.0) * 1000) if self._dry_at else -1,
-                    )
+                if self._audio_source.queued_duration <= 0:
+                    # Keep the initial answer prebuffer; a dry mid-answer uses its own threshold.
+                    is_reprime = self._first_frame_event.is_set()
+                    target_s = self._reprime_s if is_reprime else self._prebuffer_s
+                    if target_s > 0 or is_reprime:
+                        _wait_started = time.monotonic()
+                        if target_s > 0:
+                            await self._wait_for_prebuffer(
+                                frame.duration,
+                                target_s=target_s,
+                                max_wait_s=(
+                                    self._reprime_max_wait_s
+                                    if is_reprime
+                                    else self._prebuffer_max_wait_s
+                                ),
+                            )
+                        logger.info(
+                            "playout_prebuffer_wait waited_ms=%d since_dry_ms=%d",
+                            int((time.monotonic() - _wait_started) * 1000),
+                            int(max(time.time() - self._dry_at, 0.0) * 1000)
+                            if self._dry_at
+                            else -1,
+                        )
                     if interruption_generation != self._interruption_generation:
                         continue
                     if self._interrupted_event.is_set() or self._pushed_duration == 0:
@@ -500,8 +550,9 @@ class _ParticipantAudioOutput(io.AudioOutput):
                     if self._fade_in_remaining > 0:
                         frame = self._apply_fade_in(frame)
                     self._fade_ring_push(frame)
+                dry_at = time.time() + self._audio_source.queued_duration + frame.duration
                 await self._audio_source.capture_frame(frame)
-                self._dry_at = time.time() + self._audio_source.queued_duration
+                self._dry_at = dry_at
             finally:
                 self._forwarding_idle.set()
 
