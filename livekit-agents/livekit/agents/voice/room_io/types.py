@@ -94,9 +94,11 @@ class AudioOutputOptions:
     """voxai: fade the audio out over this window on pause/interrupt instead of
     cutting instantly. 0 (default) keeps the stock clear_queue behavior."""
     prebuffer_ms: int = 0
-    """voxai: collect this much audio at the start of each answer (and after the playout
-    queue runs dry) before playing it, so unevenly streamed audio does not leave gaps.
+    """voxai: collect this much audio at the start of each answer before playing it.
     Playback starts this much later. 0 (default) plays frames as they arrive."""
+    reprime_ms: int = 0
+    """voxai: collect this much audio after the playout queue runs dry mid-answer.
+    0 (default) plays the next frame as soon as it arrives."""
 
 
 @dataclass
