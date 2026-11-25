@@ -488,3 +488,105 @@ def test_gate_applies_a_lowering_that_arrived_before_the_message() -> None:
     gate.bind_message(2, other)
     gate.lower_end(2, 9.2)
     assert other.metrics["stopped_speaking_at"] == 9.1  # a value that was not stretched stays
+
+
+def _turn_with_new_sound(
+    ar: AudioRecognition, *, burst: tuple[float, float] | None, active: float | None = None
+) -> AudioRecognition:
+    ar._confirmed_turns = {4: _ConfirmedTurn(4, [(15.6, 17.45), (19.26, 20.90)], 20.90)}
+    ar._completed_vad_bursts = deque([burst] if burst else [])
+    ar._active_vad_speech_started_at = active
+    ar._last_confirmed_end = 20.90
+    return ar
+
+
+async def test_final_running_far_into_a_new_sound_goes_to_the_normal_path() -> None:
+    ar = _turn_with_new_sound(_recognition(aligned=False), burst=(22.1, 23.35))
+    late, normal = await _send(ar, _final("번호", span=(19.42, 22.90)))
+    assert late == []
+    assert normal == 1
+    # the turn record stays open for its later records
+    assert 4 in ar._confirmed_turns
+    ar._hooks.on_turn_released.assert_not_called()
+
+
+async def test_a_small_overflow_stays_a_late_final() -> None:
+    ar = _turn_with_new_sound(_recognition(aligned=False), burst=(22.1, 23.35))
+    late, normal = await _send(ar, _final("번호", span=(19.42, 22.15)))
+    assert [t for t, _ in late] == [4]
+    assert normal == 0
+
+
+async def test_an_overflow_past_the_margin_is_new_speech() -> None:
+    ar = _turn_with_new_sound(_recognition(aligned=False), burst=(22.1, 23.35))
+    late, normal = await _send(ar, _final("번호", span=(19.42, 22.28)))
+    assert late == []
+    assert normal == 1
+
+
+async def test_no_new_sound_keeps_the_late_final() -> None:
+    ar = _turn_with_new_sound(_recognition(aligned=False), burst=None)
+    late, normal = await _send(ar, _final("번호", span=(19.42, 22.90)))
+    assert [t for t, _ in late] == [4]
+    assert normal == 0
+
+
+async def test_an_open_new_sound_counts_like_a_finished_one() -> None:
+    ar = _turn_with_new_sound(_recognition(aligned=False), burst=None, active=22.1)
+    late, normal = await _send(ar, _final("번호", span=(19.42, 22.90)))
+    assert late == []
+    assert normal == 1
+
+
+async def test_the_margin_compares_raw_times_not_rounded_ones() -> None:
+    # 0.1504 s over: above the margin, though it rounds to 0.150
+    ar = _turn_with_new_sound(_recognition(aligned=False), burst=(22.1, 23.35))
+    late, normal = await _send(ar, _final("번호", span=(19.42, 22.2504)))
+    assert late == []
+    assert normal == 1
+
+
+async def test_exactly_the_margin_is_still_a_late_final() -> None:
+    ar = _turn_with_new_sound(_recognition(aligned=False), burst=(22.0, 23.35))
+    late, normal = await _send(ar, _final("번호", span=(19.42, 22.15)))
+    assert [t for t, _ in late] == [4]
+    assert normal == 0
+
+
+async def test_a_burst_that_began_before_the_turn_ended_is_not_a_new_sound() -> None:
+    # open when the turn was committed, closed afterwards: it keeps its old start
+    ar = _turn_with_new_sound(_recognition(aligned=False), burst=(20.0, 22.5))
+    late, normal = await _send(ar, _final("번호", span=(19.42, 22.40)))
+    assert [t for t, _ in late] == [4]
+    assert normal == 0
+    ar._active_vad_speech_started_at = 20.5
+    late, normal = await _send(ar, _final("번호", span=(19.42, 22.40)))
+    assert [t for t, _ in late] == [4, 4]
+    assert normal == 0
+
+
+async def test_real_path_gives_the_new_sound_one_pending_transcript_and_later_tail_stays_late() -> (
+    None
+):
+    ar = _turn_with_new_sound(_recognition(aligned=False), burst=(22.1, 23.35))
+    del ar._process_stt_event  # run the real transcript accumulation
+    ar._hooks.retrieve_chat_ctx.return_value = MagicMock()
+    ar._run_eou_detection = MagicMock()  # type: ignore[method-assign]
+    ar._check_user_turn_limit = MagicMock()  # type: ignore[method-assign]
+    await ar._on_stt_event(_final("번호는", span=(19.42, 22.90)))
+    assert ar._audio_transcript.strip() == "번호는"
+    ar._hooks.on_late_final.assert_not_called()
+    ar._run_eou_detection.assert_called_once()
+    # a following final of the old turn is still recorded as its own message, not appended
+    await ar._on_stt_event(_final("입니다", span=(19.5, 20.5)))
+    assert [c.kwargs["turn_id"] for c in ar._hooks.on_late_final.call_args_list] == [4]
+    assert ar._audio_transcript.strip() == "번호는"
+    ar._run_eou_detection.assert_called_once()
+
+
+async def test_exactly_the_margin_survives_float_subtraction_error() -> None:
+    # 22.35 - 22.2 is 0.15000000000000213 in floats
+    ar = _turn_with_new_sound(_recognition(aligned=False), burst=(22.2, 23.35))
+    late, normal = await _send(ar, _final("번호", span=(19.42, 22.35)))
+    assert [t for t, _ in late] == [4]
+    assert normal == 0

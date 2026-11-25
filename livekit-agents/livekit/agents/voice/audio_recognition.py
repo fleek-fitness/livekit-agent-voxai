@@ -317,6 +317,10 @@ _MAX_CONFIRMED_TURNS = 16
 # a message end may be extended to the end of its VAD segment by at most this much; a longer
 # tail is taken as trailing noise and the final's own end is kept
 _MAX_SPAN_END_EXTENSION = 1.0
+# a late final that runs this far (seconds) into a sound that began after its turn closed is new speech
+LATE_FINAL_NEW_SOUND_MARGIN = 0.15
+# float slack so a span ending exactly one margin past the sound start is not pushed over by rounding
+_LATE_FINAL_MARGIN_EPSILON = 1e-6
 
 
 def _extend_span_end(
@@ -2066,12 +2070,37 @@ class AudioRecognition:
         if own_span is None:
             return False
 
+        overflow: float | None = None
+        if owner is not None:
+            # only sounds that began after this turn ended count as new: a burst that was open
+            # when the turn was committed and closed afterwards still carries its old start.
+            # The turn record stays open so later records of the same turn keep their reference.
+            new_sounds = [b[0] for b in self._completed_vad_bursts or () if b[0] >= owner.end]
+            if active is not None and active >= owner.end:
+                new_sounds.append(active)
+            if new_sounds:
+                overflow = own_span[1] - min(new_sounds)
+                if overflow > LATE_FINAL_NEW_SOUND_MARGIN + _LATE_FINAL_MARGIN_EPSILON:
+                    logger.info(
+                        "late final routed as new turn",
+                        extra={
+                            "turn_id": owner.turn_id,
+                            "span": own_span,
+                            "overflow": round(overflow, 3),
+                        },
+                    )
+                    return False
+
         # same end rule as a committed turn: the segments of its own turn, else the pending ones
         pool = owner.segments if owner is not None else list(self._completed_vad_bursts or ())
         own_span = _extend_span_end(own_span, pool)
         logger.info(
             "late final recorded as its own message",
-            extra={"turn_id": owner.turn_id if owner else None, "span": own_span},
+            extra={
+                "turn_id": owner.turn_id if owner else None,
+                "span": own_span,
+                "overflow": round(overflow, 3) if overflow is not None else None,
+            },
         )
         restore_end: float | None = None
         if (
