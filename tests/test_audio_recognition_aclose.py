@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from livekit.agents.voice.audio_recognition import AudioRecognition
+from livekit.agents.voice.audio_recognition import AudioRecognition, _HeldSegments
 
 pytestmark = [pytest.mark.unit, pytest.mark.virtual_time, pytest.mark.no_concurrent]
 
@@ -14,6 +14,7 @@ class TestAudioRecognitionAclose:
         """Create an AudioRecognition instance with mocked dependencies."""
         with patch.object(AudioRecognition, "__init__", lambda self, *args, **kwargs: None):
             audio_recognition = AudioRecognition.__new__(AudioRecognition)
+            audio_recognition._held_segments = _HeldSegments()
 
         # Initialize required attributes manually
         audio_recognition._session = MagicMock()
@@ -252,3 +253,41 @@ class TestAudioRecognitionAclose:
         timeout_handle.cancel.assert_called_once()
         assert audio_recognition._user_turn_span is None
         assert audio_recognition._user_turn_start is None
+
+    async def test_aclose_clears_backchannel_boundary_timer(self):
+        audio_recognition = self._create_audio_recognition()
+        timer = MagicMock()
+        audio_recognition._backchannel_boundary_timer = timer
+        audio_recognition._backchannel_boundary_callback = MagicMock()
+
+        await audio_recognition._aclose()
+
+        timer.cancel.assert_called_once()
+        assert audio_recognition._backchannel_boundary_timer is None
+        assert audio_recognition._backchannel_boundary_callback is None
+
+    async def test_aclose_bounds_and_reaps_hung_eou(self, monkeypatch):
+        from livekit.agents.voice import audio_recognition as module
+
+        monkeypatch.setattr(module, "_END_OF_TURN_CLOSE_TIMEOUT", 0.01)
+        recognition = self._create_audio_recognition()
+        started = asyncio.Event()
+        cleaned = asyncio.Event()
+
+        async def hung_eou():
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleaned.set()
+
+        task = asyncio.create_task(hung_eou())
+        await started.wait()
+        recognition._end_of_turn_task = task
+        timer = MagicMock()
+        recognition._backchannel_boundary_timer = timer
+        await recognition._aclose()
+
+        assert task.cancelled()
+        assert cleaned.is_set()
+        timer.cancel.assert_called_once()
