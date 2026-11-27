@@ -100,6 +100,7 @@ def _activity_for_end_of_turn(
     activity._scheduling_paused = False
     activity._new_turns_blocked = False
     activity._preemptive_generation = None
+    activity._preflight_candidates = []
     activity._user_turn_completed_atask = None
     activity._user_speech_started_during_interruptible_agent_speech = True
     activity._dynamic_interruption = SimpleNamespace(
