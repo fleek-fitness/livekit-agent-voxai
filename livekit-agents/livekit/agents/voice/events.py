@@ -300,6 +300,7 @@ EventTypes = Literal[
     "agent_false_interruption",
     "overlapping_speech",
     "preemptive_generation_outcome",
+    "preflight_final_compare",
     "function_tools_executed",
     "metrics_collected",
     "session_usage_updated",
@@ -429,10 +430,31 @@ class PreemptiveGenerationOutcomeEvent(BaseModel):
     """Transcript source that created the speculative generation."""
 
     speech_id: str | None = None
+    early_tts: bool = False
+    """Whether synthesis was set to start before the speech was scheduled."""
+
     transcript_match: bool | None = None
     chat_ctx_match: bool | None = None
     tools_match: bool | None = None
     tool_choice_match: bool | None = None
+    created_at: float = Field(default_factory=time.time)
+
+
+class PreflightFinalCompareEvent(BaseModel):
+    """How a preflight transcript that started a generation differs from the turn's final one.
+
+    Emitted once per preflight generation when the user turn is committed, including
+    generations that were discarded before then.
+    """
+
+    type: Literal["preflight_final_compare"] = "preflight_final_compare"
+    speech_id: str
+    diff: Literal["same", "whitespace_only", "punctuation_only", "changed"]
+    """``punctuation_only`` means that only punctuation, possibly along with spacing,
+    differs. A difference in case, question marks, ``%`` or punctuation between digits is
+    ``changed``, even if the generation was kept. Transcripts that differ only in Unicode
+    composition are the ``same``."""
+
     created_at: float = Field(default_factory=time.time)
 
 
@@ -634,6 +656,7 @@ AgentEvent = Annotated[
     | MetricsCollectedEvent
     | SessionUsageUpdatedEvent
     | PreemptiveGenerationOutcomeEvent
+    | PreflightFinalCompareEvent
     | ConversationItemAddedEvent
     | FunctionToolsExecutedEvent
     | SpeechCreatedEvent

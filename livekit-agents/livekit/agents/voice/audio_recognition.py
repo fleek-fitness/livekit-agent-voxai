@@ -4,6 +4,7 @@ import asyncio
 import json
 import math
 import time
+import unicodedata
 from collections import deque
 from collections.abc import AsyncIterable, Callable, Iterable
 from dataclasses import dataclass, replace
@@ -132,6 +133,57 @@ class _PreemptiveGenerationInfo:
     transcript_confidence: float
     started_speaking_at: float | None
     trigger_source: Literal["preflight", "final_transcript"] = "final_transcript"
+
+
+@dataclass
+class _PreflightStaleInfo:
+    new_transcript: str
+    """Transcript of the turn so far, including the latest interim transcript."""
+
+
+def _normalize_preflight_transcript(transcript: str, *, casefold: bool = True) -> str:
+    """Reduce a transcript to the characters that distinguish it from another one.
+
+    Applies NFC and, unless disabled, case folding, then drops whitespace and punctuation.
+    Question marks, ``%`` and ``.``, ``,`` or ``:`` between two digits are kept: they change
+    the meaning.
+    """
+    text = unicodedata.normalize("NFC", transcript)
+    if casefold:
+        text = text.casefold()
+    text = "".join(text.split())
+    return "".join(
+        char
+        for i, char in enumerate(text)
+        if not unicodedata.category(char).startswith("P")
+        or char in "?\uff1f%"
+        or (char in ".,:" and 0 < i < len(text) - 1 and (text[i - 1] + text[i + 1]).isdecimal())
+    )
+
+
+def _normalized_preflight_match(first: str, second: str) -> bool:
+    if first == second:
+        return True
+
+    normalized = _normalize_preflight_transcript(first)
+    return bool(normalized) and normalized == _normalize_preflight_transcript(second)
+
+
+def _preflight_transcript_diff(
+    preflight: str, final: str
+) -> Literal["same", "whitespace_only", "punctuation_only", "changed"]:
+    preflight = unicodedata.normalize("NFC", preflight)
+    final = unicodedata.normalize("NFC", final)
+    if preflight == final:
+        return "same"
+    if "".join(preflight.split()) == "".join(final.split()):
+        return "whitespace_only"
+
+    # case is kept here: a change of case is not a change of punctuation
+    stripped = _normalize_preflight_transcript(preflight, casefold=False)
+    if stripped and stripped == _normalize_preflight_transcript(final, casefold=False):
+        return "punctuation_only"
+    return "changed"
 
 
 @dataclass
@@ -296,6 +348,10 @@ class RecognitionHooks(Protocol):
     def on_eot_prediction(self, ev: EotPredictionEvent) -> None: ...
     def on_agent_backchannel_opportunity(self, ev: _AgentBackchannelOpportunityEvent) -> None: ...
     def on_preemptive_generation(self, info: _PreemptiveGenerationInfo) -> None: ...
+    def on_preflight_stale(self, info: _PreflightStaleInfo) -> bool: ...
+    def on_final_after_preflight(
+        self, preflight_transcript: str, final_transcript: str
+    ) -> bool: ...
     def on_user_turn_exceeded(self, ev: UserTurnExceededEvent) -> None: ...
     def retrieve_chat_ctx(self) -> llm.ChatContext: ...
 
@@ -1849,6 +1905,10 @@ class AudioRecognition:
             self._audio_transcript = self._audio_transcript.lstrip()
             self._final_transcript_confidence.append(confidence)
             transcript_changed = self._audio_transcript != self._audio_preflight_transcript
+            if transcript_changed and self._audio_preflight_transcript:
+                transcript_changed = not self._hooks.on_final_after_preflight(
+                    self._audio_preflight_transcript, self._audio_transcript
+                )
             self._audio_interim_transcript = ""
             self._audio_preflight_transcript = ""
 
@@ -1957,6 +2017,13 @@ class AudioRecognition:
                 else None,
             )
             self._audio_interim_transcript = ev.alternatives[0].text
+
+            if self._audio_preflight_transcript and self._audio_interim_transcript:
+                if self._hooks.on_preflight_stale(
+                    _PreflightStaleInfo(new_transcript=self._current_transcript.lstrip())
+                ):
+                    # nothing is left to match: the next final must start a new generation
+                    self._audio_preflight_transcript = ""
 
         elif ev.type == stt.SpeechEventType.END_OF_SPEECH and self._turn_detection_mode == "stt":
             with tracer.use_span(self._ensure_user_turn_span()):
