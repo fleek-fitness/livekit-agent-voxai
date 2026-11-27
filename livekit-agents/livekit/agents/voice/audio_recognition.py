@@ -141,13 +141,17 @@ class _PreflightStaleInfo:
     """Transcript of the turn so far, including the latest interim transcript."""
 
 
-def _normalize_preflight_transcript(transcript: str) -> str:
+def _normalize_preflight_transcript(transcript: str, *, casefold: bool = True) -> str:
     """Reduce a transcript to the characters that distinguish it from another one.
 
-    Applies NFC and case folding, then drops whitespace and punctuation. Question marks,
-    ``%`` and ``.``, ``,`` or ``:`` between two digits are kept: they change the meaning.
+    Applies NFC and, unless disabled, case folding, then drops whitespace and punctuation.
+    Question marks, ``%`` and ``.``, ``,`` or ``:`` between two digits are kept: they change
+    the meaning.
     """
-    text = "".join(unicodedata.normalize("NFC", transcript).casefold().split())
+    text = unicodedata.normalize("NFC", transcript)
+    if casefold:
+        text = text.casefold()
+    text = "".join(text.split())
     return "".join(
         char
         for i, char in enumerate(text)
@@ -168,11 +172,16 @@ def _normalized_preflight_match(first: str, second: str) -> bool:
 def _preflight_transcript_diff(
     preflight: str, final: str
 ) -> Literal["same", "whitespace_only", "punctuation_only", "changed"]:
+    preflight = unicodedata.normalize("NFC", preflight)
+    final = unicodedata.normalize("NFC", final)
     if preflight == final:
         return "same"
     if "".join(preflight.split()) == "".join(final.split()):
         return "whitespace_only"
-    if _normalized_preflight_match(preflight, final):
+
+    # case is kept here: a change of case is not a change of punctuation
+    stripped = _normalize_preflight_transcript(preflight, casefold=False)
+    if stripped and stripped == _normalize_preflight_transcript(final, casefold=False):
         return "punctuation_only"
     return "changed"
 

@@ -2763,7 +2763,12 @@ class AgentActivity(RecognitionHooks):
         """
         opts = self.preemptive_generation_opts
         preemptive = self._preemptive_generation
-        if not opts.get("cancel_on_preflight_stale") or preemptive is None:
+        if (
+            not opts.get("cancel_on_preflight_stale")
+            or preemptive is None
+            # a preflight that started nothing leaves an earlier final's generation in place
+            or preemptive.info.trigger_source != "preflight"
+        ):
             return False
 
         match = (
@@ -2778,10 +2783,11 @@ class AgentActivity(RecognitionHooks):
         return True
 
     def on_final_after_preflight(self, preflight_transcript: str, final_transcript: str) -> bool:
-        """Decide whether a final transcript that differs from the preflight one can be ignored.
+        """Match a final transcript that differs from the preflight one to its generation.
 
         Returns:
-            Whether the final transcript counts as unchanged.
+            Whether the active preflight generation was kept for the final transcript. If
+            not, the final transcript counts as changed.
         """
         if not self.preemptive_generation_opts.get("normalize_preflight_transcript"):
             return False
@@ -2789,12 +2795,16 @@ class AgentActivity(RecognitionHooks):
             return False
 
         preemptive = self._preemptive_generation
-        if preemptive is not None and _normalized_preflight_match(
-            preemptive.info.new_transcript, final_transcript
+        if (
+            preemptive is None
+            or preemptive.info.trigger_source != "preflight"
+            or not _normalized_preflight_match(preemptive.info.new_transcript, final_transcript)
         ):
-            # the reuse check at the end of the turn compares words, which whitespace
-            # changes: move the generation to the transcript it has been matched with
-            preemptive.info = replace(preemptive.info, new_transcript=final_transcript)
+            return False
+
+        # the reuse check at the end of the turn compares words, which whitespace
+        # changes: move the generation to the transcript it has been matched with
+        preemptive.info = replace(preemptive.info, new_transcript=final_transcript)
         return True
 
     def _emit_preflight_final_compare(self, final_transcript: str) -> None:

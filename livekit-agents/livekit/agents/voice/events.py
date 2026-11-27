@@ -450,8 +450,10 @@ class PreflightFinalCompareEvent(BaseModel):
     type: Literal["preflight_final_compare"] = "preflight_final_compare"
     speech_id: str
     diff: Literal["same", "whitespace_only", "punctuation_only", "changed"]
-    """``punctuation_only`` also covers case and Unicode composition differences; a
-    difference in question marks, ``%`` or punctuation between digits is ``changed``."""
+    """``punctuation_only`` means that only punctuation, possibly along with spacing,
+    differs. A difference in case, question marks, ``%`` or punctuation between digits is
+    ``changed``, even if the generation was kept. Transcripts that differ only in Unicode
+    composition are the ``same``."""
 
     created_at: float = Field(default_factory=time.time)
 

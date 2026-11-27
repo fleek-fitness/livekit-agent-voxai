@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import unicodedata
 from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -31,6 +32,7 @@ from livekit.agents.voice.events import (
     PreemptiveGenerationOutcomeEvent,
     PreflightFinalCompareEvent,
 )
+from livekit.agents.voice.speech_handle import SpeechHandle
 from livekit.agents.voice.turn import PreemptiveGenerationOptions
 
 from .fake_io import FakeAudioOutput
@@ -205,7 +207,7 @@ async def test_equivalent_interim_then_same_final_reuses_the_candidate() -> None
 
 @pytest.mark.parametrize(
     ("preflight", "final"),
-    [("네", "네."), ("6 개요", "6개요.")],
+    [("네", "네."), ("6 개요", "6개요."), ("ABC", "abc")],
 )
 async def test_normalized_final_reuses_the_preflight_candidate(preflight: str, final: str) -> None:
     async with _harness({"normalize_preflight_transcript": True}) as h:
@@ -244,6 +246,47 @@ async def test_final_that_does_not_match_starts_a_new_candidate(
         assert replacement is not None and replacement is not candidate
         assert replacement.info.trigger_source == "final_transcript"
         assert replacement.info.new_transcript == final
+
+
+async def test_final_after_a_skipped_preflight_starts_a_candidate() -> None:
+    async with _harness({"normalize_preflight_transcript": True}) as h:
+        # the agent is speaking: the preflight starts nothing
+        h.activity._current_speech = SpeechHandle.create()
+        await h.preflight("6 개요")
+        assert h.activity._preemptive_generation is None
+        h.activity._current_speech = None
+
+        await h.final("6개요.")
+
+        candidate = h.activity._preemptive_generation
+        assert candidate is not None
+        assert candidate.info.trigger_source == "final_transcript"
+        assert candidate.info.new_transcript == "6개요."
+        assert h.generation_count == 1
+
+
+async def test_skipped_preflight_leaves_the_earlier_final_candidate_alone() -> None:
+    async with _harness(
+        {"cancel_on_preflight_stale": True, "normalize_preflight_transcript": True}
+    ) as h:
+        await h.final("내일")
+        earlier = h.activity._preemptive_generation
+        assert earlier is not None
+
+        h.activity._current_speech = SpeechHandle.create()
+        await h.preflight("세 시")
+        await h.interim("세 시 반")
+        assert h.activity._preemptive_generation is earlier
+        assert h.outcomes == []
+        h.activity._current_speech = None
+
+        # no preflight generation matches this final, so it starts its own
+        await h.final("세 시.")
+
+        candidate = h.activity._preemptive_generation
+        assert candidate is not None and candidate is not earlier
+        assert candidate.info.new_transcript == "내일 세 시."
+        assert h.generation_count == 2
 
 
 @pytest.mark.parametrize(
@@ -346,8 +389,11 @@ async def test_compare_candidates_are_dropped_when_the_turn_is_cleared() -> None
         ("6 개요", "6개요", "whitespace_only"),
         ("네.", "네", "punctuation_only"),
         ("6 개요", "6개요.", "punctuation_only"),
-        ("Hello, there", "hello there.", "punctuation_only"),
-        ("café", "café", "punctuation_only"),
+        ("Hello, there", "Hello there.", "punctuation_only"),
+        ("6개요", "6개요.", "punctuation_only"),
+        ("café", unicodedata.normalize("NFD", "café"), "same"),
+        ("ABC", "abc", "changed"),
+        ("Hello, there", "hello there.", "changed"),
         ("3.5", "3.5.", "punctuation_only"),
         ("네", "네?", "changed"),
         ("네", "네？", "changed"),
@@ -361,4 +407,25 @@ async def test_compare_candidates_are_dropped_when_the_turn_is_cleared() -> None
 )
 def test_preflight_transcript_diff(preflight: str, final: str, diff: str) -> None:
     assert _preflight_transcript_diff(preflight, final) == diff
-    assert _normalized_preflight_match(preflight, final) is (diff != "changed")
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "match"),
+    [
+        ("ABC", "abc", True),
+        ("Hello, there", "hello there.", True),
+        ("6 개요", "6개요.", True),
+        ("café", unicodedata.normalize("NFD", "café"), True),
+        ("3.5", "3.5.", True),
+        ("네", "네?", False),
+        ("네", "네\uff1f", False),
+        ("3.5", "35", False),
+        ("1,000", "1000", False),
+        ("3:30", "330", False),
+        ("5%", "5", False),
+        ("내일 세 시", "내일 세 시 예약할게요", False),
+        (".", "!", False),
+    ],
+)
+def test_normalized_preflight_match(first: str, second: str, match: bool) -> None:
+    assert _normalized_preflight_match(first, second) is match
