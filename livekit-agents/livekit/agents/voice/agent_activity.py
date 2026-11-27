@@ -8,7 +8,7 @@ import json
 import string
 import time
 from collections.abc import AsyncGenerator, AsyncIterable, Coroutine, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal
 
 from opentelemetry import context as otel_context, trace
@@ -61,7 +61,10 @@ from .audio_recognition import (
     AudioRecognition,
     RecognitionHooks,
     _EndOfTurnInfo,
+    _normalized_preflight_match,
     _PreemptiveGenerationInfo,
+    _preflight_transcript_diff,
+    _PreflightStaleInfo,
     _STTPipeline,
 )
 from .dynamic_interruption import DynamicInterruptionManager
@@ -75,6 +78,7 @@ from .events import (
     FunctionToolsExecutedEvent,
     MetricsCollectedEvent,
     PreemptiveGenerationOutcomeEvent,
+    PreflightFinalCompareEvent,
     SessionUsageUpdatedEvent,
     SpeechCreatedEvent,
     UserInputTranscribedEvent,
@@ -245,6 +249,8 @@ class _PreemptiveGeneration:
     tools: list[llm.Tool | llm.Toolset]
     tool_choice: llm.ToolChoice | None
     created_at: float
+    early_tts: bool = False
+    """Whether synthesis was set to start before the speech was scheduled."""
 
 
 @dataclass
@@ -296,6 +302,9 @@ class AgentActivity(RecognitionHooks):
 
         self._preemptive_generation: _PreemptiveGeneration | None = None
         self._preemptive_generation_count: int = 0
+        # (speech_id, transcript) of every preflight generation of the current user turn,
+        # kept for measurement even after the generation itself is gone
+        self._preflight_candidates: list[tuple[str, str]] = []
         self._authorization_allowed = asyncio.Event()
         self._authorization_allowed.set()
 
@@ -1322,6 +1331,7 @@ class AgentActivity(RecognitionHooks):
         # end. drop it here rather than in the callers: the flag above is what stops a new
         # one from being created, and it is only true from this point on.
         self._cancel_preemptive_generation()
+        self._preflight_candidates.clear()
         if blocked_tasks:
             self._add_drain_blocked_tasks(blocked_tasks)
         self._wake_up_scheduling_task()
@@ -1682,6 +1692,7 @@ class AgentActivity(RecognitionHooks):
         allow_interruptions: NotGivenOr[bool] = NOT_GIVEN,
         schedule_speech: bool = True,
         input_details: InputDetails = DEFAULT_INPUT_DETAILS,
+        _early_tts: bool | None = None,
     ) -> SpeechHandle:
         if self._rt_turn_detection_enabled and allow_interruptions is False:
             logger.warning(
@@ -1760,6 +1771,7 @@ class AgentActivity(RecognitionHooks):
                         else self._tool_choice
                     ),
                     _previous_user_metrics=user_metrics,
+                    _early_tts=_early_tts,
                 ),
                 speech_handle=handle,
                 name="AgentActivity.pipeline_reply",
@@ -1802,6 +1814,7 @@ class AgentActivity(RecognitionHooks):
                 preemptive_lead_time=max(time.time() - preemptive.created_at, 0.0),
                 trigger_source=getattr(preemptive.info, "trigger_source", "unknown"),
                 speech_id=getattr(preemptive.speech_handle, "id", None),
+                early_tts=preemptive.early_tts,
                 transcript_match=transcript_match,
                 chat_ctx_match=chat_ctx_match,
                 tools_match=tools_match,
@@ -1913,6 +1926,7 @@ class AgentActivity(RecognitionHooks):
         return future
 
     def clear_user_turn(self) -> None:
+        self._preflight_candidates.clear()
         if self._audio_recognition:
             self._audio_recognition._clear_user_turn()
 
@@ -2702,13 +2716,21 @@ class AgentActivity(RecognitionHooks):
         )
 
         chat_ctx = self._agent.chat_ctx.copy()
+        early_tts = (
+            self._session.output.audio_enabled
+            and self._session.output.audio is not None
+            and self._early_tts_enabled(info.trigger_source)
+        )
         speech_handle = self._generate_reply(
             # we need to send in the original user_message because metrics are injected later on
             user_message=user_message,
             chat_ctx=chat_ctx,
             schedule_speech=False,
             input_details=InputDetails(modality="audio"),
+            _early_tts=early_tts,
         )
+        if info.trigger_source == "preflight":
+            self._preflight_candidates.append((speech_handle.id, info.new_transcript))
 
         self._preemptive_generation = _PreemptiveGeneration(
             speech_handle=speech_handle,
@@ -2718,7 +2740,73 @@ class AgentActivity(RecognitionHooks):
             tools=self.tools.copy(),
             tool_choice=self._tool_choice,
             created_at=time.time(),
+            early_tts=early_tts,
         )
+
+    def _early_tts_enabled(
+        self, trigger_source: Literal["preflight", "final_transcript"] | None = None
+    ) -> bool:
+        opts = self.preemptive_generation_opts
+        if not opts["enabled"]:
+            return False
+        if trigger_source == "preflight":
+            preflight_tts = opts.get("preflight_tts")
+            if preflight_tts is not None:
+                return preflight_tts
+        return opts["preemptive_tts"]
+
+    def on_preflight_stale(self, info: _PreflightStaleInfo) -> bool:
+        """Cancel the speculative generation if the user's words moved past it.
+
+        Returns:
+            Whether a generation was cancelled.
+        """
+        opts = self.preemptive_generation_opts
+        preemptive = self._preemptive_generation
+        if not opts.get("cancel_on_preflight_stale") or preemptive is None:
+            return False
+
+        match = (
+            _normalized_preflight_match
+            if opts.get("normalize_preflight_transcript")
+            else _transcripts_equivalent
+        )
+        if match(preemptive.info.new_transcript, info.new_transcript):
+            return False
+
+        self._cancel_preemptive_generation(reason="preflight_stale")
+        return True
+
+    def on_final_after_preflight(self, preflight_transcript: str, final_transcript: str) -> bool:
+        """Decide whether a final transcript that differs from the preflight one can be ignored.
+
+        Returns:
+            Whether the final transcript counts as unchanged.
+        """
+        if not self.preemptive_generation_opts.get("normalize_preflight_transcript"):
+            return False
+        if not _normalized_preflight_match(preflight_transcript, final_transcript):
+            return False
+
+        preemptive = self._preemptive_generation
+        if preemptive is not None and _normalized_preflight_match(
+            preemptive.info.new_transcript, final_transcript
+        ):
+            # the reuse check at the end of the turn compares words, which whitespace
+            # changes: move the generation to the transcript it has been matched with
+            preemptive.info = replace(preemptive.info, new_transcript=final_transcript)
+        return True
+
+    def _emit_preflight_final_compare(self, final_transcript: str) -> None:
+        candidates, self._preflight_candidates = self._preflight_candidates, []
+        for speech_id, preflight_transcript in candidates:
+            self._session.emit(
+                "preflight_final_compare",
+                PreflightFinalCompareEvent(
+                    speech_id=speech_id,
+                    diff=_preflight_transcript_diff(preflight_transcript, final_transcript),
+                ),
+            )
 
     def on_eot_prediction(self, ev: EotPredictionEvent) -> None:
         if (host := self._session._session_host) is not None:
@@ -2924,6 +3012,12 @@ class AgentActivity(RecognitionHooks):
         )
 
     def on_end_of_turn(self, info: _EndOfTurnInfo) -> bool:
+        committed = self._handle_end_of_turn(info)
+        if committed:
+            self._emit_preflight_final_compare(info.new_transcript)
+        return committed
+
+    def _handle_end_of_turn(self, info: _EndOfTurnInfo) -> bool:
         # IMPORTANT: This method is sync to avoid it being cancelled by the AudioRecognition
         # We explicitly create a new task here
 
@@ -3764,6 +3858,7 @@ class AgentActivity(RecognitionHooks):
         new_message: llm.ChatMessage | None = None,
         instructions: str | Instructions | None = None,
         _previous_user_metrics: llm.MetricsReport | None = None,
+        _early_tts: bool | None = None,
     ) -> None:
         with tracer.start_as_current_span(
             "agent_turn", context=self._session._root_span_context
@@ -3790,6 +3885,7 @@ class AgentActivity(RecognitionHooks):
                     new_message=new_message,
                     instructions=instructions,
                     _previous_user_metrics=_previous_user_metrics,
+                    _early_tts=_early_tts,
                 )
             finally:
                 otel_metrics.record_invoke_agent_duration(
@@ -3806,6 +3902,7 @@ class AgentActivity(RecognitionHooks):
         new_message: llm.ChatMessage | None = None,
         instructions: str | Instructions | None = None,
         _previous_user_metrics: llm.MetricsReport | None = None,
+        _early_tts: bool | None = None,
     ) -> None:
         from .agent import ModelSettings
 
@@ -4030,12 +4127,9 @@ class AgentActivity(RecognitionHooks):
 
         # start synthesis preemptively (before the speech is scheduled) when enabled;
         # otherwise it starts right after scheduling below
-        preemptive_opts = self.preemptive_generation_opts
         synthesize_task: asyncio.Task[None] | None = None
-        if (
-            audio_output is not None
-            and preemptive_opts["enabled"]
-            and preemptive_opts["preemptive_tts"]
+        if audio_output is not None and (
+            self._early_tts_enabled() if _early_tts is None else _early_tts
         ):
             synthesize_task = asyncio.create_task(
                 _produce_segments(), name="AgentActivity.pipeline_reply.produce_segments"

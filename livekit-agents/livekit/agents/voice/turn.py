@@ -219,12 +219,33 @@ class PreemptiveGenerationOptions(TypedDict, total=False):
     """Maximum number of preemptive generation attempts per user turn.
     The counter resets when the turn completes. Defaults to ``3``."""
 
+    cancel_on_preflight_stale: bool
+    """Whether to cancel a speculative generation as soon as an interim transcript
+    that follows a preflight transcript no longer matches it, instead of keeping
+    it until the final transcript. The discard reason is ``preflight_stale``.
+    Defaults to ``False``."""
+
+    preflight_tts: bool | None
+    """Overrides ``preemptive_tts`` for generations started by a preflight
+    transcript. Generations started by a final transcript always follow
+    ``preemptive_tts``. Defaults to ``None``, which follows ``preemptive_tts``."""
+
+    normalize_preflight_transcript: bool
+    """Whether to ignore case, whitespace, Unicode composition and punctuation when
+    comparing a preflight transcript with the transcripts that follow it. Question
+    marks, ``%`` and ``.``, ``,`` or ``:`` between digits still count. A final
+    transcript that matches keeps the preflight generation, and the same comparison
+    decides whether it is stale. Defaults to ``False``."""
+
 
 _PREEMPTIVE_GENERATION_DEFAULTS: PreemptiveGenerationOptions = {
     "enabled": True,
     "preemptive_tts": False,
     "max_speech_duration": 10.0,
     "max_retries": 3,
+    "cancel_on_preflight_stale": False,
+    "preflight_tts": None,
+    "normalize_preflight_transcript": False,
 }
 
 
