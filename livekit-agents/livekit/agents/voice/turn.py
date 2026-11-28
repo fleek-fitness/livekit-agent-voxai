@@ -237,6 +237,12 @@ class PreemptiveGenerationOptions(TypedDict, total=False):
     transcript that matches keeps the preflight generation, and the same comparison
     decides whether it is stale. Defaults to ``False``."""
 
+    preflight_stale_ignores_prefix: bool
+    """Whether an interim transcript whose normalized words are a prefix of the preflight
+    transcript leaves the preflight generation in place when ``cancel_on_preflight_stale``
+    is on, as a transcript that lags the source of the preflight does. Defaults to
+    ``False``."""
+
 
 _PREEMPTIVE_GENERATION_DEFAULTS: PreemptiveGenerationOptions = {
     "enabled": True,
@@ -246,6 +252,7 @@ _PREEMPTIVE_GENERATION_DEFAULTS: PreemptiveGenerationOptions = {
     "cancel_on_preflight_stale": False,
     "preflight_tts": None,
     "normalize_preflight_transcript": False,
+    "preflight_stale_ignores_prefix": False,
 }
 
 

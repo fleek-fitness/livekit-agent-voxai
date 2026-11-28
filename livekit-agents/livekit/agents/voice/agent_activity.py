@@ -61,6 +61,7 @@ from .audio_recognition import (
     AudioRecognition,
     RecognitionHooks,
     _EndOfTurnInfo,
+    _normalize_preflight_transcript,
     _normalized_preflight_match,
     _PreemptiveGenerationInfo,
     _preflight_transcript_diff,
@@ -2777,6 +2778,11 @@ class AgentActivity(RecognitionHooks):
             else _transcripts_equivalent
         )
         if match(preemptive.info.new_transcript, info.new_transcript):
+            return False
+        if opts.get("preflight_stale_ignores_prefix") and _normalize_preflight_transcript(
+            preemptive.info.new_transcript
+        ).startswith(_normalize_preflight_transcript(info.new_transcript)):
+            # the words heard so far still lead to the preflight
             return False
 
         self._cancel_preemptive_generation(reason="preflight_stale")

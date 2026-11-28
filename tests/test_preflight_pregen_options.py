@@ -429,3 +429,29 @@ def test_preflight_transcript_diff(preflight: str, final: str, diff: str) -> Non
 )
 def test_normalized_preflight_match(first: str, second: str, match: bool) -> None:
     assert _normalized_preflight_match(first, second) is match
+
+
+@pytest.mark.parametrize("ignore_prefix", [True, False])
+async def test_lagging_interim_that_is_a_prefix_keeps_the_candidate(ignore_prefix: bool) -> None:
+    async with _harness(
+        {
+            "cancel_on_preflight_stale": True,
+            "normalize_preflight_transcript": True,
+            "preflight_stale_ignores_prefix": ignore_prefix,
+        }
+    ) as h:
+        await h.preflight("내일 세 시 예약할게요")
+        candidate = h.activity._preemptive_generation
+
+        await h.interim("내일 세 시 예약")
+
+        if ignore_prefix:
+            assert h.activity._preemptive_generation is candidate
+            assert h.outcomes == []
+            # words past the preflight still make it stale
+            await h.interim("내일 세 시 예약할게요 그리고")
+            assert h.activity._preemptive_generation is None
+            assert h.outcomes[-1].reason == "preflight_stale"
+        else:
+            assert h.activity._preemptive_generation is None
+            assert h.outcomes[-1].reason == "preflight_stale"
